@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "habituation-analysis"
+version = "0.1.0"
+description = "GUI for habituation experiment browsing, pupil metrics, and day-wise statistics"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "pandas",
+  "matplotlib",
+  "scipy",
+  "opencv-python",
+  "PyQt5",
+]
+
+[project.scripts]
+habituation-analysis = "habituation_analysis.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["habituation_analysis*"]
