@@ -905,7 +905,7 @@ class MetricsTab(QWidget):
     def _plot_lock_state(self, ax, lock_t: np.ndarray, lock_state: np.ndarray, empty_message: str = "No lock state available") -> bool:
         ax.set_ylim(-0.2, 1.2)
         ax.set_yticks([0.0, 1.0])
-        ax.set_yticklabels(["Unlocked", "Locked"])
+        ax.set_yticklabels(["Locked", "Unlocked"])
         if lock_t.size and lock_state.size:
             n = min(lock_t.size, lock_state.size)
             lock_t = np.asarray(lock_t[:n], dtype=float)
