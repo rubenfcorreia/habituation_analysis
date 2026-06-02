@@ -63,6 +63,7 @@ class LoadedSession:
     qc: np.ndarray
     in_eye: np.ndarray
     brake_raw: np.ndarray
+    brake_t: np.ndarray
     wheel_pos: np.ndarray
     locomotion: np.ndarray
     locomotion_t: np.ndarray
@@ -120,9 +121,11 @@ class TaskThread(QtCore.QThread):
 
 class TraceCanvas(FigureCanvas):
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(10, 8), constrained_layout=True)
-        self.pupil_ax = self.figure.add_subplot(211)
-        self.loc_ax = self.figure.add_subplot(212, sharex=self.pupil_ax)
+        self.figure = Figure(figsize=(10, 9.1), constrained_layout=True)
+        grid = self.figure.add_gridspec(3, 1, height_ratios=[3.5, 2.45, 0.55])
+        self.pupil_ax = self.figure.add_subplot(grid[0])
+        self.loc_ax = self.figure.add_subplot(grid[1], sharex=self.pupil_ax)
+        self.lock_ax = self.figure.add_subplot(grid[2], sharex=self.pupil_ax)
         super().__init__(self.figure)
         self.setParent(parent)
 
@@ -394,11 +397,14 @@ class MetricsTab(QWidget):
         self._clear_cursor_lines()
         pupil_ax = self.canvas.pupil_ax
         loc_ax = self.canvas.loc_ax
+        lock_ax = self.canvas.lock_ax
         pupil_ax.clear()
         loc_ax.clear()
+        lock_ax.clear()
         style_axes(pupil_ax, title="Pupil dynamics", ylabel="z-scored radius")
-        style_axes(loc_ax, title="Locomotion", xlabel="Time (s)", ylabel="Wheel speed")
-        for ax in (pupil_ax, loc_ax):
+        style_axes(loc_ax, title="Locomotion", ylabel="Wheel speed")
+        style_axes(lock_ax, title="Lock state", xlabel="Time (s)", ylabel="Lock state")
+        for ax in (pupil_ax, loc_ax, lock_ax):
             ax.text(
                 0.5,
                 0.5,
@@ -516,6 +522,19 @@ class MetricsTab(QWidget):
         except Exception:
             pass
         self._locomotion_threshold_line = None
+
+    def _make_threshold_lines(self, ax):
+        self._threshold_lines = []
+        for idx, value in enumerate(self._threshold_values):
+            line = DraggableHLine(
+                ax,
+                value,
+                color=BOUNDARY_COLORS[idx],
+                linestyle="--",
+                linewidth=2.0,
+                on_changed=lambda y, i=idx: self._on_threshold_line_moved(i, y),
+            )
+            self._threshold_lines.append(line)
 
     def _make_locomotion_threshold_line(self, ax):
         self._locomotion_threshold_line = DraggableHLine(
@@ -726,6 +745,7 @@ class MetricsTab(QWidget):
                 qc=np.asarray(bundle.qc, dtype=float),
                 in_eye=np.asarray(bundle.in_eye, dtype=bool),
                 brake_raw=np.asarray(bundle.brake_raw, dtype=float),
+                brake_t=np.asarray(bundle.brake_t, dtype=float),
                 wheel_pos=np.asarray(bundle.wheel_pos, dtype=float),
                 locomotion=np.asarray(bundle.locomotion, dtype=float),
                 locomotion_t=np.asarray(bundle.locomotion_t, dtype=float),
@@ -740,10 +760,14 @@ class MetricsTab(QWidget):
             )
         except Exception:
             try:
-                locomotion_t, brake_raw, wheel_pos, locomotion = self.store._load_locomotion_trace(summary.animal_id, summary.exp_id)
+                brake_t, brake_raw = self.store._load_lock_trace(summary.animal_id, summary.exp_id)
+            except Exception:
+                brake_t = np.array([], dtype=float)
+                brake_raw = np.array([], dtype=float)
+            try:
+                locomotion_t, _, wheel_pos, locomotion = self.store._load_locomotion_trace(summary.animal_id, summary.exp_id)
             except Exception:
                 locomotion_t = np.array([], dtype=float)
-                brake_raw = np.array([], dtype=float)
                 wheel_pos = np.array([], dtype=float)
                 locomotion = np.array([], dtype=float)
             frame_t = self._video_time_axis(summary, frame_count=summary.video_frame_count)
@@ -759,6 +783,7 @@ class MetricsTab(QWidget):
                 qc=np.array([], dtype=float),
                 in_eye=np.zeros((0, 1), dtype=bool),
                 brake_raw=np.asarray(brake_raw, dtype=float),
+                brake_t=np.asarray(brake_t, dtype=float),
                 wheel_pos=np.asarray(wheel_pos, dtype=float),
                 locomotion=np.asarray(locomotion, dtype=float),
                 locomotion_t=np.asarray(locomotion_t, dtype=float),
@@ -772,26 +797,30 @@ class MetricsTab(QWidget):
                 has_pupil=False,
             )
 
-    def _build_scope_trace(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[tuple[float, float, str]], list[str]]:
+    def _build_scope_trace(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[tuple[float, float, str]], list[str]]:
         if not self._scope_sessions:
             empty = np.array([], dtype=float)
-            return empty, empty, empty, empty, [], []
+            return empty, empty, empty, empty, empty, empty, [], []
         pupil_t_parts: list[np.ndarray] = []
         z_parts: list[np.ndarray] = []
         loc_t_parts: list[np.ndarray] = []
         loc_parts: list[np.ndarray] = []
+        lock_t_parts: list[np.ndarray] = []
+        lock_parts: list[np.ndarray] = []
         spans: list[tuple[float, float, str]] = []
         labels: list[str] = []
         offset = 0.0
         for summary in self._scope_sessions:
             payload = self._load_session_payload(summary)
             labels.append(summary.exp_id)
-            if payload.t.size == 0 and payload.locomotion_t.size == 0:
+            if payload.t.size == 0 and payload.locomotion_t.size == 0 and payload.brake_t.size == 0:
                 continue
             pupil_t = np.asarray(payload.t, dtype=float)
             loc_t = np.asarray(payload.locomotion_t, dtype=float)
+            lock_t = np.asarray(payload.brake_t, dtype=float)
             radius = np.asarray(payload.radius, dtype=float)
             locomotion = np.asarray(payload.locomotion, dtype=float)
+            lock_state = np.asarray(payload.brake_raw, dtype=float)
             if radius.size:
                 n = min(pupil_t.size, radius.size)
                 pupil_t = pupil_t[:n]
@@ -811,26 +840,43 @@ class MetricsTab(QWidget):
             else:
                 loc_t = np.array([], dtype=float)
                 locomotion = np.array([], dtype=float)
+            if lock_state.size and lock_t.size:
+                k = min(lock_t.size, lock_state.size)
+                lock_t = lock_t[:k]
+                lock_state = lock_state[:k]
+            else:
+                lock_t = np.array([], dtype=float)
+                lock_state = np.array([], dtype=float)
             pupil_t_shift = pupil_t + offset
             loc_t_shift = loc_t + offset
+            lock_t_shift = lock_t + offset
             pupil_t_parts.append(pupil_t_shift)
             z_parts.append(z)
             if loc_t_shift.size:
                 loc_t_parts.append(loc_t_shift)
                 loc_parts.append(locomotion)
+            if lock_t_shift.size:
+                lock_t_parts.append(lock_t_shift)
+                lock_parts.append(lock_state)
             session_duration = float(summary.duration_sec)
             if session_duration <= 0.0:
-                session_duration = max(float(pupil_t[-1]) if pupil_t.size else 0.0, float(loc_t[-1]) if loc_t.size else 0.0)
+                session_duration = max(
+                    float(pupil_t[-1]) if pupil_t.size else 0.0,
+                    float(loc_t[-1]) if loc_t.size else 0.0,
+                    float(lock_t[-1]) if lock_t.size else 0.0,
+                )
             spans.append((float(offset), float(offset + session_duration), summary.exp_id))
             offset += session_duration + 30.0
-        if not pupil_t_parts and not loc_t_parts:
+        if not pupil_t_parts and not loc_t_parts and not lock_t_parts:
             empty = np.array([], dtype=float)
-            return empty, empty, empty, empty, spans, labels
+            return empty, empty, empty, empty, empty, empty, spans, labels
         pupil_t_out = np.concatenate(pupil_t_parts) if pupil_t_parts else np.array([], dtype=float)
         z_out = np.concatenate(z_parts) if z_parts else np.array([], dtype=float)
         loc_t_out = np.concatenate(loc_t_parts) if loc_t_parts else np.array([], dtype=float)
         loc_out = np.concatenate(loc_parts) if loc_parts else np.array([], dtype=float)
-        return pupil_t_out, z_out, loc_t_out, loc_out, spans, labels
+        lock_t_out = np.concatenate(lock_t_parts) if lock_t_parts else np.array([], dtype=float)
+        lock_out = np.concatenate(lock_parts) if lock_parts else np.array([], dtype=float)
+        return pupil_t_out, z_out, loc_t_out, loc_out, lock_t_out, lock_out, spans, labels
 
     def _clear_cursor_lines(self):
         for line in self._cursor_lines:
@@ -840,9 +886,9 @@ class MetricsTab(QWidget):
                 pass
         self._cursor_lines = []
 
-    def _make_cursor_lines(self, pupil_ax, loc_ax):
+    def _make_cursor_lines(self, *axes):
         self._clear_cursor_lines()
-        for ax in (pupil_ax, loc_ax):
+        for ax in axes:
             line = ax.axvline(0.0, color="tab:cyan", linestyle="-", linewidth=1.6, alpha=0.85, zorder=30)
             self._cursor_lines.append(line)
 
@@ -856,16 +902,35 @@ class MetricsTab(QWidget):
                 pass
         self.canvas.draw_idle()
 
+    def _plot_lock_state(self, ax, lock_t: np.ndarray, lock_state: np.ndarray, empty_message: str = "No lock state available") -> bool:
+        ax.set_ylim(-0.2, 1.2)
+        ax.set_yticks([0.0, 1.0])
+        ax.set_yticklabels(["Unlocked", "Locked"])
+        if lock_t.size and lock_state.size:
+            n = min(lock_t.size, lock_state.size)
+            lock_t = np.asarray(lock_t[:n], dtype=float)
+            lock_state = np.asarray(lock_state[:n], dtype=float)
+            finite = np.isfinite(lock_t) & np.isfinite(lock_state)
+            if np.any(finite):
+                values = np.where(lock_state[finite] > 0.5, 1.0, 0.0)
+                ax.step(lock_t[finite], values, where="post", color="tab:purple", linewidth=1.3, label="lock state")
+                return True
+        ax.text(0.5, 0.5, empty_message, transform=ax.transAxes, ha="center", va="center")
+        return False
+
     def _draw_plots(self):
         self._clear_threshold_lines()
         self._clear_locomotion_threshold_line()
         self._clear_cursor_lines()
         pupil_ax = self.canvas.pupil_ax
         loc_ax = self.canvas.loc_ax
+        lock_ax = self.canvas.lock_ax
         pupil_ax.clear()
         loc_ax.clear()
+        lock_ax.clear()
         style_axes(pupil_ax, title="Pupil dynamics", ylabel="z-scored radius")
-        style_axes(loc_ax, title="Locomotion", xlabel="Time (s)", ylabel="Wheel speed")
+        style_axes(loc_ax, title="Locomotion", ylabel="Wheel speed")
+        style_axes(lock_ax, title="Lock state", xlabel="Time (s)", ylabel="Lock state")
         if not self._metrics_available():
             self._show_unavailable_state()
             return
@@ -887,8 +952,8 @@ class MetricsTab(QWidget):
                     z_plot[~visible] = np.nan
                 z_plot[~np.isfinite(z_plot)] = np.nan
                 pupil_ax.plot(payload.t[: z_plot.size], z_plot, color="black", linewidth=1.5, label="pupil z-score")
-                for start, end in self.store.load_manual_masks(summary.exp_id):
-                    pupil_ax.axvspan(start, end, color="tab:red", alpha=0.15)
+                for start_t, end_t in self.store.load_manual_masks(summary.exp_id):
+                    pupil_ax.axvspan(start_t, end_t, color="tab:red", alpha=0.15)
             else:
                 pupil_ax.text(
                     0.5,
@@ -903,60 +968,53 @@ class MetricsTab(QWidget):
                 loc_n = min(loc_t.size, payload.locomotion.size)
                 if loc_n:
                     loc_ax.plot(loc_t[:loc_n], payload.locomotion[:loc_n], color="tab:blue", linewidth=1.5, label="locomotion")
-                self._make_locomotion_threshold_line(loc_ax)
+                loc_thr = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
+                loc_ax.axhline(loc_thr, color="tab:red", linestyle="--", linewidth=1.5, label="threshold")
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data", transform=loc_ax.transAxes, ha="center", va="center")
+            self._plot_lock_state(lock_ax, np.asarray(payload.brake_t, dtype=float), np.asarray(payload.brake_raw, dtype=float))
             pupil_ax.set_title(f"Pupil dynamics - {summary.exp_id}", pad=10)
             loc_ax.set_title(f"Locomotion - {summary.exp_id}", pad=10)
+            lock_ax.set_title(f"Lock state - {summary.exp_id}", pad=10)
             self._update_timebase_warning(summary, payload)
             if self.timebase_warning.isVisible() and payload.t.size:
                 video_end = float(payload.t[-1])
-                for ax in (pupil_ax, loc_ax):
+                for ax in (pupil_ax, loc_ax, lock_ax):
                     ax.axvline(video_end, color="0.45", linestyle="--", linewidth=1.1, alpha=0.8, label="video end")
             if payload.t.size:
-                self._make_cursor_lines(pupil_ax, loc_ax)
+                self._make_cursor_lines(pupil_ax, loc_ax, lock_ax)
                 self._set_cursor_position(float(payload.t[0]))
             if payload.has_pupil and payload.radius.size:
                 self._make_threshold_lines(pupil_ax)
             else:
                 self._threshold_lines = []
         else:
-            pupil_t, z, loc_t, loc, spans, labels = self._build_scope_trace()
+            pupil_t, z, loc_t, loc, lock_t, lock, spans, labels = self._build_scope_trace()
             if pupil_t.size and z.size:
                 pupil_ax.plot(pupil_t[: z.size], z, color="black", linewidth=1.2)
             else:
                 pupil_ax.text(0.5, 0.5, "No pupil data to display", transform=pupil_ax.transAxes, ha="center", va="center")
             if loc_t.size and loc.size:
                 loc_ax.plot(loc_t[: loc.size], loc, color="tab:blue", linewidth=1.2)
-                self._make_locomotion_threshold_line(loc_ax)
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data to display", transform=loc_ax.transAxes, ha="center", va="center")
-            for start, end, label in spans:
-                pupil_ax.axvline(start, color="0.65", linestyle=":", linewidth=0.8)
-                loc_ax.axvline(start, color="0.65", linestyle=":", linewidth=0.8)
+            self._plot_lock_state(lock_ax, lock_t, lock)
+            for start_t, end_t, label in spans:
+                pupil_ax.axvline(start_t, color="0.65", linestyle=":", linewidth=0.8)
+                loc_ax.axvline(start_t, color="0.65", linestyle=":", linewidth=0.8)
+                lock_ax.axvline(start_t, color="0.65", linestyle=":", linewidth=0.8)
                 if len(spans) <= 20:
-                    pupil_ax.text(start, 0.98, label, transform=pupil_ax.get_xaxis_transform(), rotation=90, fontsize=8, va="top")
+                    pupil_ax.text(start_t, 0.98, label, transform=pupil_ax.get_xaxis_transform(), rotation=90, fontsize=8, va="top")
             pupil_ax.set_title(f"Pupil dynamics - {self.animal_id} overall", pad=10)
             loc_ax.set_title(f"Locomotion - {self.animal_id} overall", pad=10)
+            lock_ax.set_title(f"Lock state - {self.animal_id} overall", pad=10)
             self._update_timebase_warning(None, None)
             self._make_threshold_lines(pupil_ax)
 
         self._refresh_axis_legend(pupil_ax)
         self._refresh_axis_legend(loc_ax)
+        self._refresh_axis_legend(lock_ax)
         self.canvas.draw_idle()
-
-    def _make_threshold_lines(self, ax):
-        self._threshold_lines = []
-        for idx, value in enumerate(self._threshold_values):
-            line = DraggableHLine(
-                ax,
-                value,
-                color=BOUNDARY_COLORS[idx],
-                linestyle="--",
-                linewidth=2.0,
-                on_changed=lambda y, i=idx: self._on_threshold_line_moved(i, y),
-            )
-            self._threshold_lines.append(line)
 
     def _refresh_axis_legend(self, ax):
         handles, labels = ax.get_legend_handles_labels()

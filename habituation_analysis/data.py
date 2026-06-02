@@ -29,7 +29,7 @@ FACE_MOTION_CACHE_DIR = GUI_OUTPUT_ROOT / "face_motion_cache"
 STATS_DIR = GUI_OUTPUT_ROOT / "stats"
 APP_STATE_PATH = GUI_OUTPUT_ROOT / "app_state.json"
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d+_[A-Za-z0-9]+$")
 
 
@@ -301,6 +301,7 @@ class SessionBundle:
     qc: np.ndarray
     in_eye: np.ndarray
     brake_raw: np.ndarray
+    brake_t: np.ndarray
     wheel_pos: np.ndarray
     locomotion: np.ndarray
     locomotion_t: np.ndarray
@@ -597,6 +598,7 @@ class HabituationStore:
                         qc=np.asarray(cached["qc"], dtype=float),
                         in_eye=np.asarray(cached["in_eye"], dtype=bool),
                         brake_raw=np.asarray(cached["brake_raw"], dtype=float),
+                        brake_t=np.asarray(cached.get("brake_t", []), dtype=float),
                         wheel_pos=np.asarray(cached["wheel_pos"], dtype=float),
                         locomotion=np.asarray(cached["locomotion"], dtype=float),
                         locomotion_t=np.asarray(cached["locomotion_t"], dtype=float),
@@ -636,13 +638,18 @@ class HabituationStore:
         pupilX = np.asarray(eye.get("pupilX", []), dtype=float)
         pupilY = np.asarray(eye.get("pupilY", []), dtype=float)
 
+        try:
+            brake_t, brake_raw = self._load_lock_trace(summary.animal_id, summary.exp_id)
+        except Exception:
+            brake_t = np.array([], dtype=float)
+            brake_raw = np.array([], dtype=float)
         wheel_trace = self._load_existing_wheel_trace(summary.animal_id, summary.exp_id)
         if wheel_trace is None:
-            locomotion_t, brake_raw, wheel_pos, locomotion = self._load_locomotion_trace(
+            locomotion_t, _, wheel_pos, locomotion = self._load_locomotion_trace(
                 summary.animal_id, summary.exp_id
             )
         else:
-            locomotion_t, brake_raw, wheel_pos, locomotion = wheel_trace
+            locomotion_t, _, wheel_pos, locomotion = wheel_trace
         frame_count = int(summary.video_frame_count or radius.shape[0] or 0)
         frame_t = _video_time_axis(summary, frame_count=frame_count)
         if frame_t.size == 0 and radius.size:
@@ -674,6 +681,7 @@ class HabituationStore:
             qc=qc.astype(np.float32),
             in_eye=in_eye.astype(bool),
             brake_raw=brake_raw.astype(np.float32),
+            brake_t=brake_t.astype(np.float64),
             wheel_pos=wheel_pos.astype(np.float32),
             locomotion=locomotion.astype(np.float32),
             locomotion_t=locomotion_t.astype(np.float32),
@@ -696,6 +704,7 @@ class HabituationStore:
             "qc": bundle.qc.astype(np.float32),
             "in_eye": bundle.in_eye.astype(bool),
             "brake_raw": bundle.brake_raw.astype(np.float32),
+            "brake_t": bundle.brake_t.astype(np.float64),
             "wheel_pos": bundle.wheel_pos.astype(np.float32),
             "locomotion": bundle.locomotion.astype(np.float32),
             "locomotion_t": bundle.locomotion_t.astype(np.float32),
@@ -747,7 +756,7 @@ class HabituationStore:
         brake_raw = np.zeros(n, dtype=float)
         return wheel_t[:n].astype(float), brake_raw, wheel_pos[:n].astype(float), wheel_speed[:n].astype(float)
 
-    def _load_locomotion_trace(self, animal_id: str, exp_id: str):
+    def _load_raw_locomotion_csv(self, animal_id: str, exp_id: str):
         csv_path = resolve_locomotion_csv(self.remote_root, animal_id, exp_id)
         if csv_path is None or not csv_path.exists():
             raise FileNotFoundError(f"Missing locomotion CSV for {exp_id}")
@@ -771,7 +780,7 @@ class HabituationStore:
                     wheel_pos_raw[i] = np.nan
         valid = np.isfinite(timestamps) & np.isfinite(wheel_pos_raw)
         if not np.any(valid):
-            return np.array([], dtype=float), brake_raw[:0], np.array([], dtype=float), np.array([], dtype=float)
+            return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=float)
         timestamps = timestamps[valid]
         brake_raw = brake_raw[valid]
         wheel_pos_raw = wheel_pos_raw[valid]
@@ -779,6 +788,16 @@ class HabituationStore:
         timestamps = timestamps[order]
         brake_raw = brake_raw[order]
         wheel_pos_raw = wheel_pos_raw[order]
+        return timestamps.astype(float), brake_raw.astype(float), wheel_pos_raw.astype(float)
+
+    def _load_lock_trace(self, animal_id: str, exp_id: str) -> tuple[np.ndarray, np.ndarray]:
+        timestamps, brake_raw, _ = self._load_raw_locomotion_csv(animal_id, exp_id)
+        return timestamps.astype(float), brake_raw.astype(float)
+
+    def _load_locomotion_trace(self, animal_id: str, exp_id: str):
+        timestamps, brake_raw, wheel_pos_raw = self._load_raw_locomotion_csv(animal_id, exp_id)
+        if timestamps.size == 0:
+            return np.array([], dtype=float), brake_raw[:0], np.array([], dtype=float), np.array([], dtype=float)
 
         wheel_pos = np.asarray(wheel_pos_raw, dtype=float)
         if wheel_pos.size >= 2:
