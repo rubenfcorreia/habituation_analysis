@@ -210,6 +210,7 @@ class MetricsTab(QWidget):
         self.view_mode = "Overall"
         self._updating_controls = False
         self._threshold_lines: list[DraggableHLine] = []
+        self._locomotion_threshold_line: DraggableHLine | None = None
         self._cursor_lines: list = []
         self._zscore_distribution = np.array([], dtype=float)
         self._scope_cache_key: str | None = None
@@ -389,6 +390,7 @@ class MetricsTab(QWidget):
         self._current_session = None
         self._current_payload = None
         self._clear_threshold_lines()
+        self._clear_locomotion_threshold_line()
         self._clear_cursor_lines()
         pupil_ax = self.canvas.pupil_ax
         loc_ax = self.canvas.loc_ax
@@ -506,6 +508,27 @@ class MetricsTab(QWidget):
                 pass
         self._threshold_lines = []
 
+    def _clear_locomotion_threshold_line(self):
+        if self._locomotion_threshold_line is None:
+            return
+        try:
+            self._locomotion_threshold_line.disconnect()
+        except Exception:
+            pass
+        self._locomotion_threshold_line = None
+
+    def _make_locomotion_threshold_line(self, ax):
+        self._locomotion_threshold_line = DraggableHLine(
+            ax,
+            float(self.locomotion_spin.value()),
+            color="tab:red",
+            linestyle="--",
+            linewidth=2.0,
+            label="threshold",
+            tolerance_px=10,
+            on_changed=self._on_locomotion_threshold_line_moved,
+        )
+
     def _sort_thresholds_in_place(self, update_store: bool = True):
         paired = sorted(zip(self._percentile_cutoffs, self._threshold_values), key=lambda item: item[1])
         if paired:
@@ -608,6 +631,17 @@ class MetricsTab(QWidget):
     def _on_locomotion_threshold_changed(self, value: float):
         if self._updating_controls:
             return
+        self._persist_locomotion_threshold()
+        self._draw_plots()
+
+    def _on_locomotion_threshold_line_moved(self, value: float):
+        if self._updating_controls:
+            return
+        self._updating_controls = True
+        try:
+            self.locomotion_spin.setValue(float(value))
+        finally:
+            self._updating_controls = False
         self._persist_locomotion_threshold()
         self._draw_plots()
 
@@ -824,6 +858,7 @@ class MetricsTab(QWidget):
 
     def _draw_plots(self):
         self._clear_threshold_lines()
+        self._clear_locomotion_threshold_line()
         self._clear_cursor_lines()
         pupil_ax = self.canvas.pupil_ax
         loc_ax = self.canvas.loc_ax
@@ -868,8 +903,7 @@ class MetricsTab(QWidget):
                 loc_n = min(loc_t.size, payload.locomotion.size)
                 if loc_n:
                     loc_ax.plot(loc_t[:loc_n], payload.locomotion[:loc_n], color="tab:blue", linewidth=1.5, label="locomotion")
-                loc_thr = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
-                loc_ax.axhline(loc_thr, color="tab:red", linestyle="--", linewidth=1.5, label="threshold")
+                self._make_locomotion_threshold_line(loc_ax)
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data", transform=loc_ax.transAxes, ha="center", va="center")
             pupil_ax.set_title(f"Pupil dynamics - {summary.exp_id}", pad=10)
@@ -894,6 +928,7 @@ class MetricsTab(QWidget):
                 pupil_ax.text(0.5, 0.5, "No pupil data to display", transform=pupil_ax.transAxes, ha="center", va="center")
             if loc_t.size and loc.size:
                 loc_ax.plot(loc_t[: loc.size], loc, color="tab:blue", linewidth=1.2)
+                self._make_locomotion_threshold_line(loc_ax)
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data to display", transform=loc_ax.transAxes, ha="center", va="center")
             for start, end, label in spans:

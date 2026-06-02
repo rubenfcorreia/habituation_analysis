@@ -21,6 +21,7 @@ class DraggableHLine:
         color: str = "tab:red",
         linestyle: str = "--",
         linewidth: float = 2.0,
+        label: str | None = None,
         tolerance_px: int = 8,
         on_changed: Callable[[float], None] | None = None,
         is_enabled_fn: Callable[[], bool] | None = None,
@@ -33,6 +34,8 @@ class DraggableHLine:
         self.line = ax.axhline(
             y0, color=color, linestyle=linestyle, linewidth=linewidth, zorder=20
         )
+        if label is not None:
+            self.line.set_label(label)
         self._dragging = False
         self._cid_press = self.canvas.mpl_connect("button_press_event", self._on_press)
         self._cid_motion = self.canvas.mpl_connect("motion_notify_event", self._on_motion)
