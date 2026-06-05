@@ -400,6 +400,7 @@ class HabituationStore:
                 "face_motion_threshold_mad": 3.0,
                 "pupil_percentile_cutoffs": list(DEFAULT_PUPIL_PERCENTILES),
                 "pupil_percentile_signature": _pupil_percentile_signature(DEFAULT_PUPIL_PERCENTILES),
+                "pupil_missing_buffer_sec": 1.0,
                 "stats_dirty": True,
             },
             "animals": {},
@@ -412,10 +413,13 @@ class HabituationStore:
         if not isinstance(settings.get("animals"), dict):
             settings["animals"] = {}
         global_settings = settings["global"]
+        changed = False
         global_settings.setdefault("locomotion_threshold", default["global"]["locomotion_threshold"])
         global_settings.setdefault("face_motion_threshold_mad", default["global"]["face_motion_threshold_mad"])
+        if "pupil_missing_buffer_sec" not in global_settings:
+            changed = True
+        global_settings.setdefault("pupil_missing_buffer_sec", default["global"]["pupil_missing_buffer_sec"])
         global_settings.setdefault("stats_dirty", True)
-        changed = False
         legacy_global_values = global_settings.get("pupil_percentile_cutoffs", None)
         global_percentiles = _normalize_percentiles(legacy_global_values)
         if legacy_global_values != global_percentiles:
@@ -488,6 +492,24 @@ class HabituationStore:
             self.save_settings()
         return values
 
+    def global_pupil_missing_buffer_sec(self) -> float:
+        global_settings = self.settings.get("global", {})
+        value = global_settings.get("pupil_missing_buffer_sec", 1.0)
+        try:
+            return float(value)
+        except Exception:
+            return 1.0
+
+    def set_global_pupil_missing_buffer_sec(self, value: float, *, mark_stats_dirty: bool = True) -> float:
+        self.settings.setdefault("global", {})
+        buffer_sec = max(0.0, float(value))
+        self.settings["global"]["pupil_missing_buffer_sec"] = buffer_sec
+        if mark_stats_dirty:
+            self.mark_all_animals_stats_dirty()
+        else:
+            self.save_settings()
+        return buffer_sec
+
     def load_app_state(self) -> dict:
         default = {
             "selected_animal": "All",
@@ -519,6 +541,7 @@ class HabituationStore:
             "last_stats_signature": "",
             "stats_dirty": True,
             "preprocessed": False,
+            "deeplabcut_reference": False,
             "threshold_signature": "",
         }
         state = _load_json(self.session_state_path(exp_id), default)
@@ -528,6 +551,7 @@ class HabituationStore:
         state.setdefault("last_stats_signature", "")
         state.setdefault("stats_dirty", True)
         state.setdefault("preprocessed", False)
+        state.setdefault("deeplabcut_reference", False)
         state.setdefault("threshold_signature", "")
         return state
 
@@ -542,6 +566,17 @@ class HabituationStore:
         state = self.load_session_state(exp_id)
         return bool(state.get("preprocessed", False))
 
+    def is_deeplabcut_reference_session(self, exp_id: str) -> bool:
+        state = self.load_session_state(exp_id)
+        return bool(state.get("deeplabcut_reference", False))
+
+    def deeplabcut_reference_sessions(self, animal_id: str | None = None) -> list[SessionSummary]:
+        if animal_id is None or animal_id == "All":
+            sessions = self.dataset_sessions()
+        else:
+            sessions = self.sessions_for_animal(animal_id)
+        return [summary for summary in sessions if self.is_deeplabcut_reference_session(summary.exp_id)]
+
     def set_session_preprocessed(self, exp_id: str, preprocessed: bool, *, threshold_signature: str | None = None) -> None:
         state = self.load_session_state(exp_id)
         state["preprocessed"] = bool(preprocessed)
@@ -549,6 +584,12 @@ class HabituationStore:
             threshold_signature = self.pupil_percentile_signature()
         state["threshold_signature"] = str(threshold_signature)
         self.save_session_state(exp_id, state)
+
+    def set_session_deeplabcut_reference(self, exp_id: str, reference: bool) -> None:
+        state = self.load_session_state(exp_id)
+        state["deeplabcut_reference"] = bool(reference)
+        self.save_session_state(exp_id, state)
+        self.mark_all_animals_stats_dirty()
 
     def _current_source_signature(self, summary: SessionSummary) -> dict:
         paths = resolve_session_paths(
@@ -1018,10 +1059,29 @@ class HabituationStore:
         sessions = [s for s in self.dataset_sessions() if s.animal_id == animal_id]
         return sorted(sessions, key=lambda s: s.sort_key)
 
-    def update_dataset(self, progress_cb: Callable[[float, str], None] | None = None) -> DatasetIndex:
+    def update_dataset(
+        self,
+        progress_cb: Callable[[float, str], None] | None = None,
+        *,
+        refresh_reference_sessions: bool = False,
+    ) -> DatasetIndex:
         if progress_cb:
             progress_cb(0.0, "Scanning source tree")
         index = self.refresh_index()
+        if refresh_reference_sessions:
+            references = self.deeplabcut_reference_sessions()
+            total = max(1, len(references))
+            for idx, summary in enumerate(references):
+                if progress_cb:
+                    progress_cb(0.5 + 0.49 * (idx / total), f"Refreshing DeeplabCut reference cache {summary.exp_id}")
+                try:
+                    self.load_session_bundle(summary.exp_id, force_rebuild=True)
+                except Exception:
+                    pass
+                try:
+                    self.load_face_motion(summary.exp_id, force_recompute=True)
+                except Exception:
+                    pass
         if progress_cb:
             progress_cb(1.0, "Dataset index refreshed")
         self.mark_stats_dirty()

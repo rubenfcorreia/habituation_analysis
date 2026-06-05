@@ -14,6 +14,8 @@ from .plotting import save_figure, set_poster_style, style_axes
 
 
 STATE_LABELS = ["small", "medium", "large", "extra_large"]
+MIN_EXTRA_LARGE_MISSING_SEC = 1.0
+MANUAL_INTERVAL_BUFFER_SEC = 1.0
 
 
 @dataclass
@@ -64,18 +66,73 @@ def _visible_mask(bundle: SessionBundle, manual_masks: list[tuple[float, float]]
     return mask
 
 
+def _interval_mask(times: np.ndarray, intervals: list[tuple[float, float]] | None = None, *, pad: float = 0.0) -> np.ndarray:
+    mask = np.zeros(times.shape, dtype=bool)
+    intervals = intervals or []
+    for start, end in intervals:
+        if end <= start:
+            continue
+        mask[(times >= start - pad) & (times < end + pad)] = True
+    return mask
+
+
+def _extra_large_missing_mask(
+    bundle: SessionBundle,
+    manual_masks: list[tuple[float, float]] | None = None,
+    *,
+    min_duration_sec: float = MIN_EXTRA_LARGE_MISSING_SEC,
+    manual_buffer_sec: float = 1.0,
+) -> np.ndarray:
+    times = np.asarray(bundle.t, dtype=float)
+    if times.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    manual_mask = _interval_mask(times, manual_masks, pad=manual_buffer_sec)
+    missing = ~np.asarray(bundle.visible_mask_base, dtype=bool)
+    candidate = missing & ~manual_mask
+    extra_large = np.zeros(times.shape, dtype=bool)
+    if not np.any(candidate):
+        return extra_large
+
+    candidate_idx = np.flatnonzero(candidate)
+    if candidate_idx.size == 0:
+        return extra_large
+
+    split_points = np.where(np.diff(candidate_idx) > 1)[0] + 1
+    finite_times = times[np.isfinite(times)]
+    frame_step = float(np.nanmedian(np.diff(finite_times))) if finite_times.size > 1 else 0.0
+    if not np.isfinite(frame_step) or frame_step < 0.0:
+        frame_step = 0.0
+    for segment in np.split(candidate_idx, split_points):
+        if segment.size == 0:
+            continue
+        start_idx = int(segment[0])
+        end_idx = int(segment[-1])
+        if times.size == 1:
+            duration = 0.0
+        else:
+            duration = float(times[end_idx] - times[start_idx] + frame_step)
+        if duration >= float(min_duration_sec):
+            extra_large[segment] = True
+    return extra_large
+
+
 def _scope_sessions(store: HabituationStore, scope: str, animal_id: str):
     if scope == "All" or animal_id == "All":
         return list(store.dataset_sessions())
     return list(store.sessions_for_animal(animal_id))
 
 
+def _analysis_sessions(store: HabituationStore, scope: str, animal_id: str) -> list:
+    sessions = _scope_sessions(store, scope, animal_id)
+    return [s for s in sessions if s.has_right_pickle and not store.is_deeplabcut_reference_session(s.exp_id)]
+
+
 def compute_animal_baseline(store: HabituationStore, animal_id: str, *, scope: str | None = None) -> tuple[float, float]:
-    sessions = list(store.dataset_sessions()) if animal_id == "All" or scope == "All" else store.sessions_for_animal(animal_id)
+    analysis_scope = "All" if animal_id == "All" or scope == "All" else animal_id
+    sessions = _analysis_sessions(store, analysis_scope, animal_id)
     values = []
     for summary in sessions:
-        if not summary.has_right_pickle:
-            continue
         bundle = store.load_session_bundle(summary.exp_id)
         masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, masks)
@@ -101,7 +158,7 @@ def animal_zscores(store: HabituationStore, animal_id: str, *, mean: float | Non
     else:
         sessions = store.sessions_for_animal(animal_id)
     for summary in sessions:
-        if not summary.has_right_pickle:
+        if not summary.has_right_pickle or store.is_deeplabcut_reference_session(summary.exp_id):
             continue
         bundle = store.load_session_bundle(summary.exp_id)
         z = (bundle.radius.astype(float) - float(mean)) / float(std)
@@ -125,7 +182,12 @@ def percentile_from_value(values: np.ndarray, value: float) -> float:
     return float(100.0 * idx / max(1, finite.size))
 
 
-def classify_zscores(z: np.ndarray, thresholds: list[float], visible_mask: np.ndarray | None = None) -> np.ndarray:
+def classify_zscores(
+    z: np.ndarray,
+    thresholds: list[float],
+    visible_mask: np.ndarray | None = None,
+    extra_large_mask: np.ndarray | None = None,
+) -> np.ndarray:
     thresholds = sorted([float(t) for t in thresholds])
     state = np.full(z.shape, -1, dtype=int)
     mask = np.isfinite(z)
@@ -135,6 +197,8 @@ def classify_zscores(z: np.ndarray, thresholds: list[float], visible_mask: np.nd
     state[mask & (z >= thresholds[0]) & (z < thresholds[1])] = 1
     state[mask & (z >= thresholds[1]) & (z < thresholds[2])] = 2
     state[mask & (z >= thresholds[2])] = 3
+    if extra_large_mask is not None:
+        state[np.asarray(extra_large_mask, dtype=bool) & (state < 0)] = 3
     return state
 
 
@@ -159,10 +223,10 @@ def compute_statistics(
     percentiles: list[float],
     threshold_values: list[float],
     locomotion_threshold: float,
+    missing_buffer_sec: float = 1.0,
     progress_cb=None,
 ) -> StatisticsResult:
-    sessions = _scope_sessions(store, scope, animal_id)
-    sessions = [s for s in sessions if s.has_right_pickle]
+    sessions = _analysis_sessions(store, scope, animal_id)
     eligible = [s for s in sessions if s.duration_sec >= 1800.0]
     mean, std = compute_animal_baseline(store, animal_id, scope=scope)
 
@@ -179,12 +243,13 @@ def compute_statistics(
         bundle = store.load_session_bundle(summary.exp_id)
         manual_masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, manual_masks)
+        extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
         day = _session_day(summary)
         day_to_sessions.setdefault(day, []).append(summary.exp_id)
 
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
-        state = classify_zscores(z, threshold_values, visible)
+        state = classify_zscores(z, threshold_values, visible, extra_large_mask)
 
         valid_motion = np.isfinite(bundle.locomotion)
         locomotion_pct = float(np.nanmean((bundle.locomotion[valid_motion] > locomotion_threshold).astype(float))) if np.any(valid_motion) else float("nan")
@@ -229,9 +294,10 @@ def compute_statistics(
         bundle = store.load_session_bundle(summary.exp_id)
         manual_masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, manual_masks)
+        extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
-        state = classify_zscores(z, threshold_values, visible)
+        state = classify_zscores(z, threshold_values, visible, extra_large_mask)
         progress = np.clip((bundle.t / max(summary.duration_sec, 1e-6)) * 100.0, 0.0, 100.0)
         bins = np.clip(progress.astype(int), 0, 99)
         for b in range(100):
@@ -265,6 +331,7 @@ def compute_statistics(
             "percentiles": percentiles,
             "threshold_values": threshold_values,
             "locomotion_threshold": locomotion_threshold,
+            "missing_buffer_sec": missing_buffer_sec,
         },
         zscore_mean=float(mean),
         zscore_std=float(std),

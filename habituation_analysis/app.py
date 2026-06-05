@@ -30,6 +30,9 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
     QSplitter,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +41,7 @@ from .data import HabituationStore, SessionSummary
 from .plotting import style_axes
 from .stats import (
     STATE_LABELS,
+    _extra_large_missing_mask,
     animal_zscores,
     compute_animal_baseline,
     compute_statistics,
@@ -201,9 +205,310 @@ def merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[floa
     return [(float(s), float(e)) for s, e in merged]
 
 
+def mask_to_intervals(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
+    times = np.asarray(times, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+    if times.size == 0 or mask.size == 0:
+        return []
+    n = min(times.size, mask.size)
+    times = times[:n]
+    mask = mask[:n]
+    intervals: list[tuple[float, float]] = []
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return intervals
+    split_points = np.where(np.diff(idx) > 1)[0] + 1
+    segments = np.split(idx, split_points)
+    if times.size > 1:
+        step = float(np.nanmedian(np.diff(times[np.isfinite(times)]))) if np.sum(np.isfinite(times)) > 1 else 0.0
+    else:
+        step = 0.0
+    if not np.isfinite(step) or step < 0.0:
+        step = 0.0
+    for segment in segments:
+        if segment.size == 0:
+            continue
+        start = float(times[segment[0]])
+        end = float(times[segment[-1]] + step)
+        intervals.append((start, end))
+    return merge_intervals(intervals)
+
+
+class CollapsibleSection(QWidget):
+    def __init__(self, title: str, content: QWidget, parent=None, *, expanded: bool = False):
+        super().__init__(parent)
+        self._content = content
+        self._toggle = QToolButton(self)
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._toggle.toggled.connect(self._on_toggled)
+
+        self._content.setVisible(expanded)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self._toggle)
+        layout.addWidget(self._content)
+
+    def _on_toggled(self, checked: bool):
+        self._content.setVisible(bool(checked))
+        self._toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+
+class ExperimentIndexTab(QWidget):
+    sessionActivated = pyqtSignal(str, str)
+
+    def __init__(self, store: HabituationStore, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self._selected_animal = "All"
+        self._selected_exp_id = ""
+        self._current_signature = self.store.pupil_percentile_signature()
+
+        self._hint = QLabel("Double-click an expID to open it in the session browser.", self)
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet("color: #666666; font-size: 11px;")
+
+        self.tree = QTreeWidget(self)
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Experiment", "Status"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.tree.setUniformRowHeights(True)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._hint)
+        layout.addWidget(self.tree, stretch=1)
+
+        self.refresh()
+
+    def refresh(self):
+        self._current_signature = self.store.pupil_percentile_signature()
+        previous_animal = self._selected_animal
+        previous_exp_id = self._selected_exp_id
+
+        self.tree.clear()
+        animals = self.store.animals()
+        for animal in animals:
+            sessions = self.store.sessions_for_animal(animal)
+            if not sessions:
+                continue
+            ready_count = 0
+            stale_count = 0
+            parent = QTreeWidgetItem([f"{animal}", ""])
+            parent_font = parent.font(0)
+            parent_font.setBold(True)
+            parent.setFont(0, parent_font)
+            parent.setFont(1, parent_font)
+            parent.setData(0, Qt.UserRole, {"kind": "animal", "animal_id": animal})
+            parent.setToolTip(0, f"{animal} sessions")
+            for summary in sessions:
+                state = self.store.load_session_state(summary.exp_id)
+                preprocessed = bool(state.get("preprocessed", False))
+                stored_sig = str(state.get("threshold_signature", ""))
+                checked = preprocessed and stored_sig == self._current_signature
+                if checked:
+                    status = "Pre-processed"
+                    ready_count += 1
+                elif preprocessed:
+                    status = "Marked, thresholds changed"
+                    stale_count += 1
+                else:
+                    status = "Not pre-processed"
+                child = QTreeWidgetItem([summary.exp_id, status])
+                child.setData(0, Qt.UserRole, {"kind": "session", "animal_id": animal, "exp_id": summary.exp_id})
+                child.setToolTip(0, summary.exp_id)
+                child.setToolTip(1, status)
+                if checked:
+                    color = QtGui.QColor("#1b5e20")
+                    font = child.font(0)
+                    font.setBold(True)
+                    child.setFont(0, font)
+                    child.setFont(1, font)
+                elif preprocessed:
+                    color = QtGui.QColor("#b26a00")
+                else:
+                    color = QtGui.QColor("#666666")
+                child.setForeground(0, QtGui.QBrush(color))
+                child.setForeground(1, QtGui.QBrush(color))
+                parent.addChild(child)
+            parent.setText(0, f"{animal} ({ready_count}/{len(sessions)} pre-processed)")
+            if stale_count:
+                parent.setText(1, f"{stale_count} stale")
+            self.tree.addTopLevelItem(parent)
+            parent.setExpanded(animal == previous_animal)
+
+        self.tree.resizeColumnToContents(0)
+        self.tree.resizeColumnToContents(1)
+        self._select_current_item(previous_animal, previous_exp_id)
+
+    def set_current_selection(self, animal_id: str, exp_id: str):
+        self._selected_animal = animal_id or "All"
+        self._selected_exp_id = exp_id or ""
+        if self.tree.topLevelItemCount():
+            self._select_current_item(self._selected_animal, self._selected_exp_id)
+
+    def _select_current_item(self, animal_id: str, exp_id: str):
+        found = None
+        for i in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(i)
+            data = parent.data(0, Qt.UserRole) or {}
+            if data.get("animal_id") != animal_id:
+                continue
+            parent.setExpanded(True)
+            if not exp_id:
+                found = parent
+                break
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                child_data = child.data(0, Qt.UserRole) or {}
+                if child_data.get("exp_id") == exp_id:
+                    found = child
+                    break
+            if found is not None:
+                break
+        if found is not None:
+            self.tree.setCurrentItem(found)
+            self.tree.scrollToItem(found)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("kind") == "animal":
+            item.setExpanded(not item.isExpanded())
+            return
+        if data.get("kind") != "session":
+            return
+        animal_id = str(data.get("animal_id", ""))
+        exp_id = str(data.get("exp_id", ""))
+        if animal_id and exp_id:
+            self.sessionActivated.emit(animal_id, exp_id)
+
+
+class DeeplabcutReferenceTab(QWidget):
+    sessionActivated = pyqtSignal(str, str)
+
+    def __init__(self, store: HabituationStore, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self._selected_animal = "All"
+        self._selected_exp_id = ""
+        self._copy_text = "No DeeplabCut reference sessions found."
+
+        self._hint = QLabel(
+            "These expIDs are manually marked as DeeplabCut references and are excluded from statistics.",
+            self,
+        )
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet("color: #666666; font-size: 11px;")
+
+        self.copy_btn = QPushButton("Copy list", self)
+        self.copy_btn.clicked.connect(self._copy_list)
+
+        self.tree = QTreeWidget(self)
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Experiment", "Note"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.tree.setUniformRowHeights(True)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._hint)
+        layout.addWidget(self.copy_btn, alignment=Qt.AlignLeft)
+        layout.addWidget(self.tree, stretch=1)
+
+        self.refresh()
+
+    def refresh(self):
+        previous_animal = self._selected_animal
+        previous_exp_id = self._selected_exp_id
+        lines: list[str] = []
+
+        self.tree.clear()
+        for animal in self.store.animals():
+            sessions = self.store.deeplabcut_reference_sessions(animal)
+            if not sessions:
+                continue
+            parent = QTreeWidgetItem([animal, f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}"])
+            parent_font = parent.font(0)
+            parent_font.setBold(True)
+            parent.setFont(0, parent_font)
+            parent.setFont(1, parent_font)
+            parent.setData(0, Qt.UserRole, {"kind": "animal", "animal_id": animal})
+            parent.setToolTip(0, f"{animal} reference sessions")
+            lines.append(animal)
+            for summary in sessions:
+                child = QTreeWidgetItem([summary.exp_id, "Reference only"])
+                child.setData(0, Qt.UserRole, {"kind": "session", "animal_id": animal, "exp_id": summary.exp_id})
+                child.setToolTip(0, summary.exp_id)
+                child.setToolTip(1, "Excluded from statistics")
+                color = QtGui.QColor("#1b5e20")
+                font = child.font(0)
+                font.setBold(True)
+                child.setFont(0, font)
+                child.setFont(1, font)
+                child.setForeground(0, QtGui.QBrush(color))
+                child.setForeground(1, QtGui.QBrush(color))
+                parent.addChild(child)
+                lines.append(f"  {summary.exp_id}")
+            parent.setExpanded(animal == previous_animal)
+            self.tree.addTopLevelItem(parent)
+
+        self._copy_text = "\n".join(lines) if lines else "No DeeplabCut reference sessions found."
+        self.tree.resizeColumnToContents(0)
+        self.tree.resizeColumnToContents(1)
+        self._select_current_item(previous_animal, previous_exp_id)
+
+    def _copy_list(self):
+        QApplication.clipboard().setText(self._copy_text)
+
+    def _select_current_item(self, animal_id: str, exp_id: str):
+        found = None
+        for i in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(i)
+            data = parent.data(0, Qt.UserRole) or {}
+            if data.get("animal_id") != animal_id:
+                continue
+            parent.setExpanded(True)
+            if not exp_id:
+                found = parent
+                break
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                child_data = child.data(0, Qt.UserRole) or {}
+                if child_data.get("exp_id") == exp_id:
+                    found = child
+                    break
+            if found is not None:
+                break
+        if found is not None:
+            self.tree.setCurrentItem(found)
+            self.tree.scrollToItem(found)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("kind") == "animal":
+            item.setExpanded(not item.isExpanded())
+            return
+        if data.get("kind") != "session":
+            return
+        animal_id = str(data.get("animal_id", ""))
+        exp_id = str(data.get("exp_id", ""))
+        if animal_id and exp_id:
+            self._selected_animal = animal_id
+            self._selected_exp_id = exp_id
+            self.sessionActivated.emit(animal_id, exp_id)
+
+
 class MetricsTab(QWidget):
     thresholds_changed = pyqtSignal()
     masks_changed = pyqtSignal()
+    session_state_changed = pyqtSignal()
 
     def __init__(self, store: HabituationStore, parent=None):
         super().__init__(parent)
@@ -262,6 +567,10 @@ class MetricsTab(QWidget):
         self.preprocessed_check.toggled.connect(self._on_preprocessed_toggled)
         self.preprocessed_check.setToolTip("Mark this expID as pre-processed under the current shared pupil percentiles.")
 
+        self.reference_check = QCheckBox("DLC reference", self)
+        self.reference_check.toggled.connect(self._on_reference_toggled)
+        self.reference_check.setToolTip("Mark this expID as a DeeplabCut reference session. This is independent of not-visible pupil intervals.")
+
         self.threshold_group = QGroupBox("Pupil thresholds (shared percentiles)", self)
         threshold_layout = QGridLayout(self.threshold_group)
         threshold_layout.addWidget(QLabel("Boundary"), 0, 0)
@@ -281,6 +590,20 @@ class MetricsTab(QWidget):
             vlabel = QLabel("--", self.threshold_group)
             self.value_labels.append(vlabel)
             threshold_layout.addWidget(vlabel, row, 2)
+
+        threshold_layout.addWidget(QLabel("Missing pupil buffer (s)", self.threshold_group), 4, 0)
+        self.missing_buffer_spin = QDoubleSpinBox(self.threshold_group)
+        self.missing_buffer_spin.setRange(0.0, 60.0)
+        self.missing_buffer_spin.setDecimals(2)
+        self.missing_buffer_spin.setSingleStep(0.1)
+        self.missing_buffer_spin.setToolTip(
+            "Gap length outside manual not-visible intervals before missing pupil detections count as extra-large."
+        )
+        self.missing_buffer_spin.valueChanged.connect(self._on_missing_buffer_changed)
+        threshold_layout.addWidget(self.missing_buffer_spin, 4, 1)
+        buffer_hint = QLabel("Sustained gaps only", self.threshold_group)
+        buffer_hint.setStyleSheet("color: #666666; font-size: 11px;")
+        threshold_layout.addWidget(buffer_hint, 4, 2)
 
         self.threshold_hint = QLabel("Shared percentiles, animal-specific absolute values.", self)
         self.threshold_hint.setWordWrap(True)
@@ -311,9 +634,21 @@ class MetricsTab(QWidget):
         left_layout.addLayout(controls_box)
         left_layout.addWidget(self.canvas, stretch=1)
 
+        self.experiment_index = ExperimentIndexTab(self.store, self)
+        self.index_section = CollapsibleSection("Experiment Index", self.experiment_index, self, expanded=False)
+        self.reference_sessions = DeeplabcutReferenceTab(self.store, self)
+        self.reference_section = CollapsibleSection("DLC reference sessions", self.reference_sessions, self, expanded=False)
+
+        self.reference_group = QGroupBox("DeeplabCut reference", self)
+        reference_layout = QVBoxLayout(self.reference_group)
+        reference_layout.addWidget(self.reference_check)
+        reference_hint = QLabel("Mark this session as a manual reference for DeeplabCut training.", self.reference_group)
+        reference_hint.setWordWrap(True)
+        reference_hint.setStyleSheet("color: #666666; font-size: 11px;")
+        reference_layout.addWidget(reference_hint)
+
         self.mask_group = QGroupBox("Not visible pupil intervals", self)
         mask_layout = QVBoxLayout(self.mask_group)
-        mask_layout.addWidget(self.preprocessed_check)
         mask_layout.addWidget(self.video_widget)
         mask_layout.addWidget(self.video_time_label)
         button_row = QHBoxLayout()
@@ -327,6 +662,9 @@ class MetricsTab(QWidget):
 
         right_panel = QWidget(self)
         right_layout = QVBoxLayout(right_panel)
+        right_layout.addWidget(self.index_section)
+        right_layout.addWidget(self.reference_section)
+        right_layout.addWidget(self.reference_group)
         right_layout.addWidget(self.mask_group, stretch=1)
 
         splitter = QSplitter(Qt.Horizontal, self)
@@ -350,6 +688,8 @@ class MetricsTab(QWidget):
 
     def refresh(self):
         self._scope_sessions = self._sessions_for_scope()
+        self.experiment_index.refresh()
+        self.reference_sessions.refresh()
         if not self._metrics_available():
             self._show_unavailable_state()
             self._update_video()
@@ -362,6 +702,7 @@ class MetricsTab(QWidget):
         self._apply_state_to_controls()
         self._refresh_interval_list()
         self._refresh_preprocessed_checkbox()
+        self._refresh_reference_checkbox()
         self._draw_plots()
         self._update_video()
         self._update_dirty_label()
@@ -389,6 +730,8 @@ class MetricsTab(QWidget):
         self.mask_group.setEnabled(False)
         if hasattr(self, "preprocessed_check"):
             self.preprocessed_check.setEnabled(False)
+        if hasattr(self, "reference_check"):
+            self.reference_check.setEnabled(False)
         self._update_timebase_warning(None, None)
         self._current_session = None
         self._current_payload = None
@@ -457,7 +800,9 @@ class MetricsTab(QWidget):
             f"Scope: {self.animal_id} | View: {self.view_mode} | Sessions with pupil data: {n_sessions}/{len(self._scope_sessions)}"
         )
         self._baseline_label.setText(
-            f"Shared pupil percentiles: {', '.join(f'{v:.1f}%' for v in self._percentile_cutoffs)} | Pupil baseline mean={self._zscore_mean:.3f}, std={self._zscore_std:.3f}"
+            f"Shared pupil percentiles: {', '.join(f'{v:.1f}%' for v in self._percentile_cutoffs)} | "
+            f"Missing pupil buffer={self.store.global_pupil_missing_buffer_sec():.2f} s | "
+            f"Pupil baseline mean={self._zscore_mean:.3f}, std={self._zscore_std:.3f}"
         )
         if self.view_mode == "Session" and self.exp_id:
             self._session_label.setText(f"Focused expID: {self.exp_id}")
@@ -472,6 +817,7 @@ class MetricsTab(QWidget):
             for spin, pct in zip(self.percentile_spins, self._percentile_cutoffs):
                 spin.setValue(float(pct))
             self.locomotion_spin.setValue(float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35)))
+            self.missing_buffer_spin.setValue(float(self.store.global_pupil_missing_buffer_sec()))
             self._refresh_threshold_value_labels()
             self._update_threshold_lines()
         finally:
@@ -584,6 +930,11 @@ class MetricsTab(QWidget):
         self.thresholds_changed.emit()
         self._update_dirty_label()
 
+    def _persist_missing_buffer(self):
+        self.store.set_global_pupil_missing_buffer_sec(self.missing_buffer_spin.value())
+        self.thresholds_changed.emit()
+        self._update_dirty_label()
+
     def _update_dirty_label(self):
         dirty = self.store.is_animal_dirty(self._animal_settings_key()) or self.store.is_stats_dirty()
         self._dirty_label.setText("Statistics need to be rerun for this scope." if dirty else "Statistics are clean")
@@ -664,6 +1015,11 @@ class MetricsTab(QWidget):
         self._persist_locomotion_threshold()
         self._draw_plots()
 
+    def _on_missing_buffer_changed(self, value: float):
+        if self._updating_controls:
+            return
+        self._persist_missing_buffer()
+
     def _current_percentile_signature(self) -> str:
         return self.store.pupil_percentile_signature(self._percentile_cutoffs)
 
@@ -713,11 +1069,41 @@ class MetricsTab(QWidget):
             tip = "Mark this expID as pre-processed for the current shared pupil percentiles."
         self.preprocessed_check.setToolTip(tip)
 
+    def _refresh_reference_checkbox(self):
+        if not hasattr(self, "reference_check"):
+            return
+        if self.view_mode != "Session" or not self.exp_id:
+            self.reference_check.blockSignals(True)
+            self.reference_check.setChecked(False)
+            self.reference_check.blockSignals(False)
+            self.reference_check.setEnabled(False)
+            self.reference_check.setToolTip("Available only for a specific expID.")
+            return
+        state = self.store.load_session_state(self.exp_id)
+        reference = bool(state.get("deeplabcut_reference", False))
+        self.reference_check.blockSignals(True)
+        self.reference_check.setChecked(reference)
+        self.reference_check.blockSignals(False)
+        self.reference_check.setEnabled(True)
+        if reference:
+            tip = "This expID is marked as a DeeplabCut reference session."
+        else:
+            tip = "Mark this expID as a DeeplabCut reference session."
+        self.reference_check.setToolTip(tip)
+
     def _on_preprocessed_toggled(self, checked: bool):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
         self.store.set_session_preprocessed(self.exp_id, bool(checked), threshold_signature=self._current_percentile_signature())
         self._refresh_preprocessed_checkbox()
+        self.session_state_changed.emit()
+
+    def _on_reference_toggled(self, checked: bool):
+        if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
+            return
+        self.store.set_session_deeplabcut_reference(self.exp_id, bool(checked))
+        self._refresh_reference_checkbox()
+        self.session_state_changed.emit()
 
     def _video_time_axis(self, summary: SessionSummary, frame_count: int | None = None) -> np.ndarray:
         n = int(frame_count if frame_count is not None else (summary.video_frame_count or 0))
@@ -952,8 +1338,26 @@ class MetricsTab(QWidget):
                     z_plot[~visible] = np.nan
                 z_plot[~np.isfinite(z_plot)] = np.nan
                 pupil_ax.plot(payload.t[: z_plot.size], z_plot, color="black", linewidth=1.5, label="pupil z-score")
-                for start_t, end_t in self.store.load_manual_masks(summary.exp_id):
+                manual_masks = self.store.load_manual_masks(summary.exp_id)
+                for start_t, end_t in manual_masks:
                     pupil_ax.axvspan(start_t, end_t, color="tab:red", alpha=0.15)
+                extra_large_mask = _extra_large_missing_mask(
+                    payload,
+                    manual_masks,
+                    manual_buffer_sec=self.store.global_pupil_missing_buffer_sec(),
+                )
+                extra_large_intervals = mask_to_intervals(payload.t, extra_large_mask)
+                for idx, (start_t, end_t) in enumerate(extra_large_intervals):
+                    pupil_ax.axvspan(
+                        start_t,
+                        end_t,
+                        facecolor="gold",
+                        alpha=0.20,
+                        hatch="//",
+                        edgecolor="darkgoldenrod",
+                        linewidth=0.0,
+                        label="inferred extra-large missing" if idx == 0 else None,
+                    )
             else:
                 pupil_ax.text(
                     0.5,
@@ -1198,7 +1602,7 @@ class StatisticsTab(QWidget):
         self._worker.start()
 
     def _build_statistics_job(self, scope: str):
-        percentiles, threshold_values, locomotion_threshold = self._current_threshold_inputs()
+        percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = self._current_threshold_inputs()
 
         def job(progress_cb):
             result = compute_statistics(
@@ -1208,6 +1612,7 @@ class StatisticsTab(QWidget):
                 percentiles=percentiles,
                 threshold_values=threshold_values,
                 locomotion_threshold=locomotion_threshold,
+                missing_buffer_sec=missing_buffer_sec,
                 progress_cb=progress_cb,
             )
             result_paths = save_statistics_outputs(self.store, result)
@@ -1218,6 +1623,7 @@ class StatisticsTab(QWidget):
     def _current_threshold_inputs(self):
         global_percentiles = self.store.global_pupil_percentile_cutoffs()
         locomotion_threshold = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
+        missing_buffer_sec = float(self.store.global_pupil_missing_buffer_sec())
         if self.parent() is not None:
             main_window = self.window()
             metrics = getattr(main_window, "metrics_tab", None)
@@ -1232,6 +1638,7 @@ class StatisticsTab(QWidget):
                     list(metrics._percentile_cutoffs),
                     list(metrics._threshold_values),
                     locomotion_threshold,
+                    float(metrics.missing_buffer_spin.value()),
                 )
 
         if self.animal_id == "All":
@@ -1240,7 +1647,7 @@ class StatisticsTab(QWidget):
             pooled = [values[np.isfinite(values)] for values in zmap.values() if np.any(np.isfinite(values))]
             distribution = np.concatenate(pooled) if pooled else np.array([], dtype=float)
             threshold_values = percentile_threshold_values(distribution, global_percentiles) if distribution.size else [0.0, 0.0, 0.0]
-            return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold
+            return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
 
         settings = self.store.get_animal_settings(self.animal_id)
         threshold_values = settings.get("threshold_values", [0.0, 0.5, 1.0])
@@ -1255,7 +1662,7 @@ class StatisticsTab(QWidget):
             settings["threshold_values"] = [float(v) for v in threshold_values]
             settings["threshold_signature"] = global_signature
             self.store.set_animal_settings(self.animal_id, settings)
-        return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold
+        return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
 
     def _on_progress(self, fraction: float, message: str):
         self._status_label.setText(f"{message} ({fraction * 100.0:.0f}%)")
@@ -1299,6 +1706,7 @@ class StatisticsTab(QWidget):
             f"Baseline mean/std: {result.zscore_mean:.4f} / {result.zscore_std:.4f}",
             f"Thresholds: percentiles={result.thresholds.get('percentiles', [])} | values={result.thresholds.get('threshold_values', [])}",
             f"Locomotion threshold: {result.thresholds.get('locomotion_threshold', float('nan'))}",
+            f"Missing pupil buffer: {result.thresholds.get('missing_buffer_sec', float('nan')):.2f} s",
             "",
             "Day-wise locomotion fraction:",
         ]
@@ -1382,8 +1790,15 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         central.setLayout(main_layout)
         self.setCentralWidget(central)
 
+        self.metrics_tab.experiment_index.sessionActivated.connect(self._open_index_session)
+        self.metrics_tab.reference_sessions.sessionActivated.connect(self._open_index_session)
         self.metrics_tab.thresholds_changed.connect(self._on_scope_changed)
+        self.metrics_tab.thresholds_changed.connect(self.metrics_tab.experiment_index.refresh)
+        self.metrics_tab.thresholds_changed.connect(self.metrics_tab.reference_sessions.refresh)
         self.metrics_tab.masks_changed.connect(self._on_scope_changed)
+        self.metrics_tab.masks_changed.connect(self.metrics_tab.reference_sessions.refresh)
+        self.metrics_tab.session_state_changed.connect(self.metrics_tab.experiment_index.refresh)
+        self.metrics_tab.session_state_changed.connect(self.metrics_tab.reference_sessions.refresh)
 
         self._populate_browser(initial=True)
         self._apply_saved_state()
@@ -1554,6 +1969,7 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         exp_id = self._current_exp_id()
         self.metrics_tab.set_selection(animal, exp_id, view)
         self.statistics_tab.set_context(animal, view)
+        self.metrics_tab.experiment_index.set_current_selection(animal, exp_id)
         self.status_label.setText(
             f"Selected scope: {animal} | Selection: {self._current_selection_label()} | View: {view} | Output: {self.store.source_root / 'gui_output'}"
         )
@@ -1571,6 +1987,21 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
             preferred = current_exp if current_exp in {s.exp_id for s in sessions} else (sessions[0].exp_id if sessions else "")
             self._populate_exp_combo(animal, preferred, prefer_overall=prefer_overall)
             self._sync_browser_state()
+        finally:
+            self._updating_browser = False
+
+    def _open_index_session(self, animal_id: str, exp_id: str):
+        self._updating_browser = True
+        try:
+            if animal_id in [self.animal_combo.itemText(i) for i in range(self.animal_combo.count())]:
+                self.animal_combo.setCurrentText(animal_id)
+            self._last_session_exp_id = exp_id
+            self.app_state["selected_animal"] = animal_id
+            self.app_state["selected_exp_id"] = exp_id
+            self.app_state["view_mode"] = "Session"
+            self._populate_exp_combo(animal_id, exp_id, prefer_overall=False)
+            self._sync_browser_state()
+            self.tabs.setCurrentIndex(0)
         finally:
             self._updating_browser = False
 
@@ -1599,8 +2030,22 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.update_btn.setEnabled(False)
         self.statusBar().showMessage("Refreshing dataset index...")
 
+        box = QMessageBox(self)
+        box.setWindowTitle("Refresh dataset")
+        box.setText("Refresh the dataset index?")
+        box.setInformativeText(
+            "You can also rebuild DeeplabCut reference session caches from source instead of reusing the cached data."
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Yes)
+        refresh_reference_checkbox = QCheckBox("Also refresh DeeplabCut reference session caches", box)
+        box.setCheckBox(refresh_reference_checkbox)
+        if box.exec_() != QMessageBox.Yes:
+            return
+        refresh_reference_sessions = refresh_reference_checkbox.isChecked()
+
         def job(progress_cb):
-            return self.store.update_dataset(progress_cb)
+            return self.store.update_dataset(progress_cb, refresh_reference_sessions=refresh_reference_sessions)
 
         self._worker = TaskThread(job, self)
         self._worker.progress.connect(self._on_dataset_progress)
@@ -1628,7 +2073,8 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Operation failed")
 
     def _on_tab_changed(self, index: int):
-        if index == 1:
+        widget = self.tabs.widget(index)
+        if widget is self.statistics_tab:
             self.statistics_tab.set_context(self._current_animal(), self._current_view_mode())
             if not self._stats_prompted_for_entry:
                 self._stats_prompted_for_entry = True
