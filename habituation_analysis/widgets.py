@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtWidgets import QLabel, QPushButton, QSlider, QHBoxLayout, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QLabel, QPushButton, QSlider, QComboBox, QHBoxLayout, QVBoxLayout, QWidget
 
 
 class DraggableHLine:
@@ -114,6 +114,8 @@ class VideoPlayerWidget(QWidget):
         self._frame_index = 0
         self._playing = False
         self._fps = 10.0
+        self._playback_speed = 1.0
+        self._speed_options = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
 
@@ -121,9 +123,20 @@ class VideoPlayerWidget(QWidget):
         self.play_btn.setCheckable(True)
         self.play_btn.toggled.connect(self._toggle_play)
         self.prev_btn = QPushButton("<")
+        self.prev_btn.setAutoRepeat(True)
+        self.prev_btn.setAutoRepeatDelay(300)
+        self.prev_btn.setAutoRepeatInterval(50)
         self.prev_btn.clicked.connect(lambda: self.seek(self._frame_index - 1))
         self.next_btn = QPushButton(">")
+        self.next_btn.setAutoRepeat(True)
+        self.next_btn.setAutoRepeatDelay(300)
+        self.next_btn.setAutoRepeatInterval(50)
         self.next_btn.clicked.connect(lambda: self.seek(self._frame_index + 1))
+        self.speed_combo = QComboBox()
+        for speed in self._speed_options:
+            self.speed_combo.addItem(f"{speed:g}x", speed)
+        self.speed_combo.setCurrentIndex(self._speed_options.index(1.0))
+        self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._slider_changed)
@@ -134,6 +147,8 @@ class VideoPlayerWidget(QWidget):
         controls.addWidget(self.prev_btn)
         controls.addWidget(self.play_btn)
         controls.addWidget(self.next_btn)
+        controls.addWidget(QLabel("Speed"))
+        controls.addWidget(self.speed_combo)
         controls.addWidget(self.current_label)
         controls.addWidget(self.total_label)
 
@@ -158,6 +173,7 @@ class VideoPlayerWidget(QWidget):
         self.video_label.setText("No video loaded")
         self.current_label.setText("0.0 s")
         self.total_label.setText("/ 0.0 s")
+        self.pause()
 
     def set_video(self, video_path: str | None, timestamps: np.ndarray | None, overlay=None):
         self.close_video()
@@ -174,6 +190,7 @@ class VideoPlayerWidget(QWidget):
         fps = float(self._capture.get(cv2.CAP_PROP_FPS) or 0.0)
         if fps > 0:
             self._fps = fps
+        self._apply_playback_speed()
         frame_count = int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if frame_count <= 0 and self.timestamps.size:
             frame_count = int(self.timestamps.size)
@@ -211,11 +228,15 @@ class VideoPlayerWidget(QWidget):
         self.play_btn.blockSignals(False)
         self._timer.stop()
 
+    def _apply_playback_speed(self):
+        if self._playing:
+            interval = int(round(1000.0 / max(self._fps * self._playback_speed, 1e-6)))
+            self._timer.start(max(20, interval))
+
     def _toggle_play(self, checked: bool):
         self._playing = bool(checked)
         if checked:
-            interval = int(round(1000.0 / max(self._fps, 1.0)))
-            self._timer.start(max(20, interval))
+            self._apply_playback_speed()
             self.play_btn.setText("Pause")
         else:
             self._timer.stop()
@@ -230,6 +251,14 @@ class VideoPlayerWidget(QWidget):
             self.pause()
             return
         self.seek(next_idx)
+
+    def _on_speed_changed(self, index: int):
+        speed = self.speed_combo.itemData(index)
+        try:
+            self._playback_speed = float(speed)
+        except Exception:
+            self._playback_speed = 1.0
+        self._apply_playback_speed()
 
     def _slider_changed(self, value: int):
         if value != self._frame_index:

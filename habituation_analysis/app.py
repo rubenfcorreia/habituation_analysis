@@ -300,6 +300,8 @@ class ExperimentIndexTab(QWidget):
                 continue
             ready_count = 0
             stale_count = 0
+            reference_count = 0
+            considered_count = 0
             parent = QTreeWidgetItem([f"{animal}", ""])
             parent_font = parent.font(0)
             parent_font.setBold(True)
@@ -310,36 +312,46 @@ class ExperimentIndexTab(QWidget):
             for summary in sessions:
                 state = self.store.load_session_state(summary.exp_id)
                 preprocessed = bool(state.get("preprocessed", False))
+                reference = bool(state.get("deeplabcut_reference", False))
                 stored_sig = str(state.get("threshold_signature", ""))
                 checked = preprocessed and stored_sig == self._current_signature
-                if checked:
-                    status = "Pre-processed"
-                    ready_count += 1
-                elif preprocessed:
-                    status = "Marked, thresholds changed"
-                    stale_count += 1
+                if reference:
+                    status = "Add for DLC model"
+                    reference_count += 1
+                    color = QtGui.QColor("#5c6bc0")
                 else:
-                    status = "Not pre-processed"
+                    considered_count += 1
+                    if checked:
+                        status = "Pre-processed"
+                        ready_count += 1
+                        color = QtGui.QColor("#1b5e20")
+                    elif preprocessed:
+                        status = "Marked, thresholds changed"
+                        stale_count += 1
+                        color = QtGui.QColor("#b26a00")
+                    else:
+                        status = "Not pre-processed"
+                        color = QtGui.QColor("#666666")
                 child = QTreeWidgetItem([summary.exp_id, status])
                 child.setData(0, Qt.UserRole, {"kind": "session", "animal_id": animal, "exp_id": summary.exp_id})
                 child.setToolTip(0, summary.exp_id)
                 child.setToolTip(1, status)
-                if checked:
-                    color = QtGui.QColor("#1b5e20")
+                if checked and not reference:
                     font = child.font(0)
                     font.setBold(True)
                     child.setFont(0, font)
                     child.setFont(1, font)
-                elif preprocessed:
-                    color = QtGui.QColor("#b26a00")
-                else:
-                    color = QtGui.QColor("#666666")
                 child.setForeground(0, QtGui.QBrush(color))
                 child.setForeground(1, QtGui.QBrush(color))
                 parent.addChild(child)
-            parent.setText(0, f"{animal} ({ready_count}/{len(sessions)} pre-processed)")
+            parent.setText(0, f"{animal} ({ready_count}/{considered_count} pre-processed)")
+            status_bits = []
             if stale_count:
-                parent.setText(1, f"{stale_count} stale")
+                status_bits.append(f"{stale_count} stale")
+            if reference_count:
+                status_bits.append(f"{reference_count} refs excluded")
+            if status_bits:
+                parent.setText(1, ", ".join(status_bits))
             self.tree.addTopLevelItem(parent)
             parent.setExpanded(animal == previous_animal)
 
@@ -397,10 +409,10 @@ class DeeplabcutReferenceTab(QWidget):
         self.store = store
         self._selected_animal = "All"
         self._selected_exp_id = ""
-        self._copy_text = "No DeeplabCut reference sessions found."
+        self._copy_text = "No sessions for the DLC model found."
 
         self._hint = QLabel(
-            "These expIDs are manually marked as DeeplabCut references and are excluded from statistics.",
+            "These expIDs are manually marked for the DLC model and are excluded from statistics.",
             self,
         )
         self._hint.setWordWrap(True)
@@ -440,7 +452,7 @@ class DeeplabcutReferenceTab(QWidget):
             parent.setFont(0, parent_font)
             parent.setFont(1, parent_font)
             parent.setData(0, Qt.UserRole, {"kind": "animal", "animal_id": animal})
-            parent.setToolTip(0, f"{animal} reference sessions")
+            parent.setToolTip(0, f"{animal} sessions for the DLC model")
             lines.append(animal)
             for summary in sessions:
                 child = QTreeWidgetItem([summary.exp_id, "Reference only"])
@@ -459,7 +471,7 @@ class DeeplabcutReferenceTab(QWidget):
             parent.setExpanded(animal == previous_animal)
             self.tree.addTopLevelItem(parent)
 
-        self._copy_text = "\n".join(lines) if lines else "No DeeplabCut reference sessions found."
+        self._copy_text = "\n".join(lines) if lines else "No sessions for the DLC model found."
         self.tree.resizeColumnToContents(0)
         self.tree.resizeColumnToContents(1)
         self._select_current_item(previous_animal, previous_exp_id)
@@ -567,9 +579,9 @@ class MetricsTab(QWidget):
         self.preprocessed_check.toggled.connect(self._on_preprocessed_toggled)
         self.preprocessed_check.setToolTip("Mark this expID as pre-processed under the current shared pupil percentiles.")
 
-        self.reference_check = QCheckBox("DLC reference", self)
+        self.reference_check = QCheckBox("Add for DLC model", self)
         self.reference_check.toggled.connect(self._on_reference_toggled)
-        self.reference_check.setToolTip("Mark this expID as a DeeplabCut reference session. This is independent of not-visible pupil intervals.")
+        self.reference_check.setToolTip("Mark this expID for DLC model use. This is independent of not-visible pupil intervals.")
 
         self.threshold_group = QGroupBox("Pupil thresholds (shared percentiles)", self)
         threshold_layout = QGridLayout(self.threshold_group)
@@ -637,10 +649,11 @@ class MetricsTab(QWidget):
         self.experiment_index = ExperimentIndexTab(self.store, self)
         self.index_section = CollapsibleSection("Experiment Index", self.experiment_index, self, expanded=False)
         self.reference_sessions = DeeplabcutReferenceTab(self.store, self)
-        self.reference_section = CollapsibleSection("DLC reference sessions", self.reference_sessions, self, expanded=False)
+        self.reference_section = CollapsibleSection("Add for DLC model", self.reference_sessions, self, expanded=False)
 
-        self.reference_group = QGroupBox("DeeplabCut reference", self)
+        self.reference_group = QGroupBox("Session markers", self)
         reference_layout = QVBoxLayout(self.reference_group)
+        reference_layout.addWidget(self.preprocessed_check)
         reference_layout.addWidget(self.reference_check)
         reference_hint = QLabel("Mark this session as a manual reference for DeeplabCut training.", self.reference_group)
         reference_hint.setWordWrap(True)
@@ -1086,9 +1099,9 @@ class MetricsTab(QWidget):
         self.reference_check.blockSignals(False)
         self.reference_check.setEnabled(True)
         if reference:
-            tip = "This expID is marked as a DeeplabCut reference session."
+            tip = "This expID is marked for DLC model use."
         else:
-            tip = "Mark this expID as a DeeplabCut reference session."
+            tip = "Mark this expID for DLC model use."
         self.reference_check.setToolTip(tip)
 
     def _on_preprocessed_toggled(self, checked: bool):
@@ -2034,11 +2047,11 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         box.setWindowTitle("Refresh dataset")
         box.setText("Refresh the dataset index?")
         box.setInformativeText(
-            "You can also rebuild DeeplabCut reference session caches from source instead of reusing the cached data."
+            "You can also rebuild DLC model caches from source instead of reusing the cached data."
         )
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
         box.setDefaultButton(QMessageBox.Yes)
-        refresh_reference_checkbox = QCheckBox("Also refresh DeeplabCut reference session caches", box)
+        refresh_reference_checkbox = QCheckBox("Also refresh Add for DLC model caches", box)
         box.setCheckBox(refresh_reference_checkbox)
         if box.exec_() != QMessageBox.Yes:
             return
