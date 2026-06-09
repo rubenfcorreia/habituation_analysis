@@ -5,6 +5,8 @@ from typing import Callable, Iterable
 
 import cv2
 import numpy as np
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QLabel, QPushButton, QSlider, QComboBox, QHBoxLayout, QVBoxLayout, QWidget
@@ -346,3 +348,179 @@ class VideoPlayerWidget(QWidget):
             t = frame_index / max(self._fps, 1e-6)
         self.current_label.setText(f"{t:.1f} s")
 
+
+
+class TracePanZoomCanvas(FigureCanvas):
+    """Matplotlib canvas with shared x-axis zoom and drag-pan support."""
+
+    def __init__(self, parent=None):
+        self.figure = Figure(figsize=(10, 9.1), constrained_layout=True)
+        grid = self.figure.add_gridspec(3, 1, height_ratios=[3.5, 2.45, 0.55])
+        self.pupil_ax = self.figure.add_subplot(grid[0])
+        self.loc_ax = self.figure.add_subplot(grid[1], sharex=self.pupil_ax)
+        self.lock_ax = self.figure.add_subplot(grid[2], sharex=self.pupil_ax)
+        super().__init__(self.figure)
+        self.setParent(parent)
+
+        self._trace_axes = (self.pupil_ax, self.loc_ax, self.lock_ax)
+        self._data_xlim: tuple[float, float] | None = None
+        self._view_xlim: tuple[float, float] | None = None
+        self._min_span = 1e-3
+        self._pan_active = False
+        self._pan_press_xdata: float | None = None
+        self._pan_start_xlim: tuple[float, float] | None = None
+        self._pan_blocker: Callable[[object], bool] | None = None
+
+        self._cid_press = self.mpl_connect('button_press_event', self._on_press)
+        self._cid_motion = self.mpl_connect('motion_notify_event', self._on_motion)
+        self._cid_release = self.mpl_connect('button_release_event', self._on_release)
+        self._cid_scroll = self.mpl_connect('scroll_event', self._on_scroll)
+
+    def set_pan_blocker(self, callback: Callable[[object], bool] | None):
+        self._pan_blocker = callback
+
+    def clear_limits(self):
+        self._data_xlim = None
+        self._view_xlim = None
+
+    def set_x_bounds(self, xmin: float, xmax: float, *, reset_view: bool = False):
+        if not np.isfinite(xmin) or not np.isfinite(xmax):
+            return
+        left = float(min(xmin, xmax))
+        right = float(max(xmin, xmax))
+        if right <= left:
+            right = left + 1.0
+        self._data_xlim = (left, right)
+        if reset_view or self._view_xlim is None:
+            self._view_xlim = (left, right)
+        else:
+            self._view_xlim = self._clamp_xlim(*self._view_xlim)
+
+    def _effective_xlim(self) -> tuple[float, float] | None:
+        return self._view_xlim or self._data_xlim
+
+    def _clamp_xlim(self, left: float, right: float) -> tuple[float, float]:
+        if self._data_xlim is None:
+            return float(left), float(right)
+        data_left, data_right = self._data_xlim
+        if not np.isfinite(data_left) or not np.isfinite(data_right) or data_right <= data_left:
+            return float(left), float(right)
+        data_span = data_right - data_left
+        span = max(float(right) - float(left), self._min_span)
+        if span >= data_span:
+            return float(data_left), float(data_right)
+        left = min(max(float(left), data_left), data_right - span)
+        right = left + span
+        return float(left), float(right)
+
+    def apply_view(self):
+        xlim = self._effective_xlim()
+        if xlim is None:
+            return
+        left, right = self._clamp_xlim(*xlim)
+        self._view_xlim = (left, right)
+        for ax in self._trace_axes:
+            ax.set_xlim(left, right)
+        self.draw_idle()
+
+    def reset_zoom(self):
+        if self._data_xlim is None:
+            return
+        self._view_xlim = self._data_xlim
+        self.apply_view()
+
+    def zoom(self, factor: float):
+        if factor <= 0:
+            return
+        xlim = self._effective_xlim()
+        if xlim is None:
+            return
+        left, right = xlim
+        center = 0.5 * (left + right)
+        span = max((right - left) * float(factor), self._min_span)
+        self._view_xlim = self._clamp_xlim(center - span / 2.0, center + span / 2.0)
+        self.apply_view()
+
+    def pan(self, delta_x: float):
+        xlim = self._effective_xlim()
+        if xlim is None:
+            return
+        left, right = xlim
+        self._view_xlim = self._clamp_xlim(left + float(delta_x), right + float(delta_x))
+        self.apply_view()
+
+    def _on_scroll(self, event):
+        if event.inaxes not in self._trace_axes or event.xdata is None:
+            return
+        if self._pan_blocker is not None:
+            try:
+                if self._pan_blocker(event):
+                    return
+            except Exception:
+                pass
+        xlim = self._effective_xlim()
+        if xlim is None:
+            return
+        step = getattr(event, "step", None)
+        if step is None:
+            button = getattr(event, "button", None)
+            if button == "up":
+                step = 1.0
+            elif button == "down":
+                step = -1.0
+            else:
+                return
+        try:
+            step = float(step)
+        except Exception:
+            return
+        if step == 0.0:
+            return
+        zoom_in_factor = 0.8
+        if step > 0:
+            factor = zoom_in_factor ** step
+        else:
+            factor = (1.0 / zoom_in_factor) ** abs(step)
+        left, right = xlim
+        span = max(right - left, self._min_span)
+        new_span = max(span * factor, self._min_span)
+        anchor = float(event.xdata)
+        rel = (anchor - left) / span if span > 0 else 0.5
+        new_left = anchor - rel * new_span
+        new_right = new_left + new_span
+        self._view_xlim = self._clamp_xlim(new_left, new_right)
+        self.apply_view()
+
+    def _on_press(self, event):
+        if event.button != 1 or event.inaxes not in self._trace_axes:
+            return
+        if self._pan_blocker is not None:
+            try:
+                if self._pan_blocker(event):
+                    return
+            except Exception:
+                pass
+        if event.xdata is None:
+            return
+        xlim = self._effective_xlim()
+        if xlim is None:
+            return
+        self._pan_active = True
+        self._pan_press_xdata = float(event.xdata)
+        self._pan_start_xlim = (float(xlim[0]), float(xlim[1]))
+
+    def _on_motion(self, event):
+        if not self._pan_active or self._pan_press_xdata is None or self._pan_start_xlim is None:
+            return
+        if event.xdata is None:
+            return
+        delta_x = float(event.xdata) - self._pan_press_xdata
+        start_left, start_right = self._pan_start_xlim
+        self._view_xlim = self._clamp_xlim(start_left + delta_x, start_right + delta_x)
+        self.apply_view()
+
+    def _on_release(self, event):
+        if event.button == 1:
+            self._pan_active = False
+            self._pan_press_xdata = None
+            self._pan_start_xlim = None

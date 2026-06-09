@@ -49,7 +49,7 @@ from .stats import (
     percentile_threshold_values,
     save_statistics_outputs,
 )
-from .widgets import DraggableHLine, VideoPlayerWidget
+from .widgets import DraggableHLine, TracePanZoomCanvas, VideoPlayerWidget
 
 
 BOUNDARY_NAMES = ["small/medium", "medium/large", "large/extra-large"]
@@ -123,16 +123,9 @@ class TaskThread(QtCore.QThread):
         self.result_ready.emit(result)
 
 
-class TraceCanvas(FigureCanvas):
+class TraceCanvas(TracePanZoomCanvas):
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(10, 9.1), constrained_layout=True)
-        grid = self.figure.add_gridspec(3, 1, height_ratios=[3.5, 2.45, 0.55])
-        self.pupil_ax = self.figure.add_subplot(grid[0])
-        self.loc_ax = self.figure.add_subplot(grid[1], sharex=self.pupil_ax)
-        self.lock_ax = self.figure.add_subplot(grid[2], sharex=self.pupil_ax)
-        super().__init__(self.figure)
-        self.setParent(parent)
-
+        super().__init__(parent)
 
 
 class LoadingWindow(QWidget):
@@ -301,6 +294,7 @@ class ExperimentIndexTab(QWidget):
             ready_count = 0
             stale_count = 0
             reference_count = 0
+            do_not_use_count = 0
             considered_count = 0
             parent = QTreeWidgetItem([f"{animal}", ""])
             parent_font = parent.font(0)
@@ -313,12 +307,17 @@ class ExperimentIndexTab(QWidget):
                 state = self.store.load_session_state(summary.exp_id)
                 preprocessed = bool(state.get("preprocessed", False))
                 reference = bool(state.get("deeplabcut_reference", False))
+                do_not_use = bool(state.get("do_not_use", False))
                 stored_sig = str(state.get("threshold_signature", ""))
                 checked = preprocessed and stored_sig == self._current_signature
                 if reference:
                     status = "Add for DLC model"
                     reference_count += 1
                     color = QtGui.QColor("#5c6bc0")
+                elif do_not_use:
+                    status = "Do not use"
+                    do_not_use_count += 1
+                    color = QtGui.QColor("#b00020")
                 else:
                     considered_count += 1
                     if checked:
@@ -336,7 +335,7 @@ class ExperimentIndexTab(QWidget):
                 child.setData(0, Qt.UserRole, {"kind": "session", "animal_id": animal, "exp_id": summary.exp_id})
                 child.setToolTip(0, summary.exp_id)
                 child.setToolTip(1, status)
-                if checked and not reference:
+                if checked and not reference and not do_not_use:
                     font = child.font(0)
                     font.setBold(True)
                     child.setFont(0, font)
@@ -348,6 +347,8 @@ class ExperimentIndexTab(QWidget):
             status_bits = []
             if stale_count:
                 status_bits.append(f"{stale_count} stale")
+            if do_not_use_count:
+                status_bits.append(f"{do_not_use_count} do-not-use")
             if reference_count:
                 status_bits.append(f"{reference_count} refs excluded")
             if status_bits:
@@ -409,69 +410,7 @@ class DeeplabcutReferenceTab(QWidget):
         self.store = store
         self._selected_animal = "All"
         self._selected_exp_id = ""
-        self._copy_text = "No sessions for the DLC model found."
-
-        self._hint = QLabel(
-            "These expIDs are manually marked for the DLC model and are excluded from statistics.",
-            self,
-        )
-        self._hint.setWordWrap(True)
-        self._hint.setStyleSheet("color: #666666; font-size: 11px;")
-
-        self.copy_btn = QPushButton("Copy list", self)
-        self.copy_btn.clicked.connect(self._copy_list)
-
-        self.tree = QTreeWidget(self)
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Experiment", "Note"])
-        self.tree.setAlternatingRowColors(True)
-        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.tree.setUniformRowHeights(True)
-        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(self._hint)
-        layout.addWidget(self.copy_btn, alignment=Qt.AlignLeft)
-        layout.addWidget(self.tree, stretch=1)
-
-        self.refresh()
-
-    def refresh(self):
-        previous_animal = self._selected_animal
-        previous_exp_id = self._selected_exp_id
-        lines: list[str] = []
-
-        self.tree.clear()
-        for animal in self.store.animals():
-            sessions = self.store.deeplabcut_reference_sessions(animal)
-            if not sessions:
-                continue
-            parent = QTreeWidgetItem([animal, f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}"])
-            parent_font = parent.font(0)
-            parent_font.setBold(True)
-            parent.setFont(0, parent_font)
-            parent.setFont(1, parent_font)
-            parent.setData(0, Qt.UserRole, {"kind": "animal", "animal_id": animal})
-            parent.setToolTip(0, f"{animal} sessions for the DLC model")
-            lines.append(animal)
-            for summary in sessions:
-                child = QTreeWidgetItem([summary.exp_id, "Reference only"])
-                child.setData(0, Qt.UserRole, {"kind": "session", "animal_id": animal, "exp_id": summary.exp_id})
-                child.setToolTip(0, summary.exp_id)
-                child.setToolTip(1, "Excluded from statistics")
-                color = QtGui.QColor("#1b5e20")
-                font = child.font(0)
-                font.setBold(True)
-                child.setFont(0, font)
-                child.setFont(1, font)
-                child.setForeground(0, QtGui.QBrush(color))
-                child.setForeground(1, QtGui.QBrush(color))
-                parent.addChild(child)
-                lines.append(f"  {summary.exp_id}")
-            parent.setExpanded(animal == previous_animal)
-            self.tree.addTopLevelItem(parent)
-
-        self._copy_text = "\n".join(lines) if lines else "No sessions for the DLC model found."
+        self._copy_text = "\n".join(lines) if lines else "No sessions marked do not use found."
         self.tree.resizeColumnToContents(0)
         self.tree.resizeColumnToContents(1)
         self._select_current_item(previous_animal, previous_exp_id)
@@ -542,6 +481,7 @@ class MetricsTab(QWidget):
         self._current_session: SessionSummary | None = None
         self._current_payload: LoadedSession | None = None
         self._pending_mask_start: float | None = None
+        self._reset_trace_view_pending = True
         self._dirty_label = QLabel("Statistics are clean")
         self._scope_label = QLabel("")
         self._scope_label.setWordWrap(True)
@@ -555,8 +495,16 @@ class MetricsTab(QWidget):
         self.timebase_warning.setVisible(False)
 
         self.canvas = TraceCanvas(self)
+        self.canvas.set_pan_blocker(self._should_block_trace_pan)
         self.canvas.pupil_ax.set_title("Pupil dynamics", pad=10)
         self.canvas.loc_ax.set_title("Locomotion", pad=10)
+
+        self.zoom_in_btn = QPushButton("Zoom in", self)
+        self.zoom_out_btn = QPushButton("Zoom out", self)
+        self.reset_zoom_btn = QPushButton("Reset zoom", self)
+        self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom(0.8))
+        self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom(1.25))
+        self.reset_zoom_btn.clicked.connect(self._reset_trace_zoom_view)
 
         self.video_widget = VideoPlayerWidget(self)
         self.video_widget.time_changed.connect(self._on_video_time_changed)
@@ -574,6 +522,10 @@ class MetricsTab(QWidget):
         self.delete_btn.clicked.connect(self._delete_selected_interval)
         self.clear_btn.clicked.connect(self._clear_intervals)
         self.save_btn.clicked.connect(self._save_intervals)
+
+        self.do_not_use_check = QCheckBox("Do not use", self)
+        self.do_not_use_check.toggled.connect(self._on_do_not_use_toggled)
+        self.do_not_use_check.setToolTip("Mark this expID as excluded from statistics.")
 
         self.preprocessed_check = QCheckBox("Pre-processed", self)
         self.preprocessed_check.toggled.connect(self._on_preprocessed_toggled)
@@ -644,6 +596,12 @@ class MetricsTab(QWidget):
         left_panel = QWidget(self)
         left_layout = QVBoxLayout(left_panel)
         left_layout.addLayout(controls_box)
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(self.zoom_in_btn)
+        zoom_row.addWidget(self.zoom_out_btn)
+        zoom_row.addWidget(self.reset_zoom_btn)
+        zoom_row.addStretch(1)
+        left_layout.addLayout(zoom_row)
         left_layout.addWidget(self.canvas, stretch=1)
 
         self.experiment_index = ExperimentIndexTab(self.store, self)
@@ -653,9 +611,10 @@ class MetricsTab(QWidget):
 
         self.reference_group = QGroupBox("Session markers", self)
         reference_layout = QVBoxLayout(self.reference_group)
+        reference_layout.addWidget(self.do_not_use_check)
         reference_layout.addWidget(self.preprocessed_check)
         reference_layout.addWidget(self.reference_check)
-        reference_hint = QLabel("Mark this session as a manual reference for DeeplabCut training.", self.reference_group)
+        reference_hint = QLabel("Mark this session as excluded from statistics or as a manual reference for DeeplabCut training.", self.reference_group)
         reference_hint.setWordWrap(True)
         reference_hint.setStyleSheet("color: #666666; font-size: 11px;")
         reference_layout.addWidget(reference_hint)
@@ -696,6 +655,7 @@ class MetricsTab(QWidget):
         self.animal_id = animal_id
         self.exp_id = exp_id
         self.view_mode = view_mode
+        self._reset_trace_view_pending = changed or not self._metrics_available()
         if changed or not self._metrics_available():
             self.refresh()
 
@@ -711,9 +671,13 @@ class MetricsTab(QWidget):
         self.threshold_group.setEnabled(True)
         self.locomotion_group.setEnabled(True)
         self.mask_group.setEnabled(True)
+        self.zoom_in_btn.setEnabled(True)
+        self.zoom_out_btn.setEnabled(True)
+        self.reset_zoom_btn.setEnabled(True)
         self._load_animal_state(force_reload=False)
         self._apply_state_to_controls()
         self._refresh_interval_list()
+        self._refresh_do_not_use_checkbox()
         self._refresh_preprocessed_checkbox()
         self._refresh_reference_checkbox()
         self._draw_plots()
@@ -741,6 +705,11 @@ class MetricsTab(QWidget):
         self.threshold_group.setEnabled(False)
         self.locomotion_group.setEnabled(False)
         self.mask_group.setEnabled(False)
+        self.zoom_in_btn.setEnabled(False)
+        self.zoom_out_btn.setEnabled(False)
+        self.reset_zoom_btn.setEnabled(False)
+        if hasattr(self, "do_not_use_check"):
+            self.do_not_use_check.setEnabled(False)
         if hasattr(self, "preprocessed_check"):
             self.preprocessed_check.setEnabled(False)
         if hasattr(self, "reference_check"):
@@ -1082,6 +1051,28 @@ class MetricsTab(QWidget):
             tip = "Mark this expID as pre-processed for the current shared pupil percentiles."
         self.preprocessed_check.setToolTip(tip)
 
+    def _refresh_do_not_use_checkbox(self):
+        if not hasattr(self, "do_not_use_check"):
+            return
+        if self.view_mode != "Session" or not self.exp_id:
+            self.do_not_use_check.blockSignals(True)
+            self.do_not_use_check.setChecked(False)
+            self.do_not_use_check.blockSignals(False)
+            self.do_not_use_check.setEnabled(False)
+            self.do_not_use_check.setToolTip("Available only for a specific expID.")
+            return
+        state = self.store.load_session_state(self.exp_id)
+        do_not_use = bool(state.get("do_not_use", False))
+        self.do_not_use_check.blockSignals(True)
+        self.do_not_use_check.setChecked(do_not_use)
+        self.do_not_use_check.blockSignals(False)
+        self.do_not_use_check.setEnabled(True)
+        if do_not_use:
+            tip = "This expID is excluded from statistics."
+        else:
+            tip = "Mark this expID as excluded from statistics."
+        self.do_not_use_check.setToolTip(tip)
+
     def _refresh_reference_checkbox(self):
         if not hasattr(self, "reference_check"):
             return
@@ -1104,6 +1095,13 @@ class MetricsTab(QWidget):
             tip = "Mark this expID for DLC model use."
         self.reference_check.setToolTip(tip)
 
+    def _on_do_not_use_toggled(self, checked: bool):
+        if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
+            return
+        self.store.set_session_do_not_use(self.exp_id, bool(checked))
+        self._refresh_do_not_use_checkbox()
+        self.session_state_changed.emit()
+
     def _on_preprocessed_toggled(self, checked: bool):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
@@ -1117,6 +1115,60 @@ class MetricsTab(QWidget):
         self.store.set_session_deeplabcut_reference(self.exp_id, bool(checked))
         self._refresh_reference_checkbox()
         self.session_state_changed.emit()
+
+    def _reset_trace_zoom_view(self):
+        self._reset_trace_view_pending = True
+        self.canvas.reset_zoom()
+
+    def _should_block_trace_pan(self, event) -> bool:
+        if self.view_mode != "Session":
+            return False
+        for line in getattr(self, "_threshold_lines", []):
+            try:
+                if line._is_near_line(event):
+                    return True
+            except Exception:
+                pass
+        line = getattr(self, "_locomotion_threshold_line", None)
+        if line is not None:
+            try:
+                if line._is_near_line(event):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _trace_bounds_from_arrays(self, *arrays: np.ndarray) -> tuple[float, float] | None:
+        finite_parts = []
+        for arr in arrays:
+            if arr is None:
+                continue
+            values = np.asarray(arr, dtype=float).reshape(-1)
+            values = values[np.isfinite(values)]
+            if values.size:
+                finite_parts.append(values)
+        if not finite_parts:
+            return None
+        combined = np.concatenate(finite_parts)
+        if combined.size == 0:
+            return None
+        xmin = float(np.nanmin(combined))
+        xmax = float(np.nanmax(combined))
+        if not np.isfinite(xmin) or not np.isfinite(xmax):
+            return None
+        if xmax <= xmin:
+            xmax = xmin + 1.0
+        return xmin, xmax
+
+    def _apply_trace_bounds(self, bounds: tuple[float, float] | None):
+        if bounds is None:
+            self.canvas.clear_limits()
+            self._reset_trace_view_pending = False
+            return
+        xmin, xmax = bounds
+        self.canvas.set_x_bounds(xmin, xmax, reset_view=self._reset_trace_view_pending)
+        self.canvas.apply_view()
+        self._reset_trace_view_pending = False
 
     def _video_time_axis(self, summary: SessionSummary, frame_count: int | None = None) -> np.ndarray:
         n = int(frame_count if frame_count is not None else (summary.video_frame_count or 0))
@@ -1334,6 +1386,7 @@ class MetricsTab(QWidget):
             self._show_unavailable_state()
             return
 
+        bounds = None
         if self.view_mode == "Session":
             summary = self.store.get_session_summary(self.exp_id)
             if summary is None:
@@ -1405,6 +1458,7 @@ class MetricsTab(QWidget):
                 self._make_threshold_lines(pupil_ax)
             else:
                 self._threshold_lines = []
+            bounds = self._trace_bounds_from_arrays(payload.t, payload.locomotion_t, payload.brake_t)
         else:
             pupil_t, z, loc_t, loc, lock_t, lock, spans, labels = self._build_scope_trace()
             if pupil_t.size and z.size:
@@ -1427,10 +1481,12 @@ class MetricsTab(QWidget):
             lock_ax.set_title(f"Lock state - {self.animal_id} overall", pad=10)
             self._update_timebase_warning(None, None)
             self._make_threshold_lines(pupil_ax)
+            bounds = self._trace_bounds_from_arrays(pupil_t, loc_t, lock_t)
 
         self._refresh_axis_legend(pupil_ax)
         self._refresh_axis_legend(loc_ax)
         self._refresh_axis_legend(lock_ax)
+        self._apply_trace_bounds(bounds)
         self.canvas.draw_idle()
 
     def _refresh_axis_legend(self, ax):
@@ -1871,13 +1927,20 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.exp_combo.setItemData(0, overall_tooltip, Qt.ToolTipRole)
         if animal != "All":
             for summary in sessions:
+                state = self.store.load_session_state(summary.exp_id)
                 label = summary.exp_id
+                item_brush = None
                 if not summary.has_right_pickle:
                     label += " [no pupil]"
                 elif not summary.has_right_video:
                     label += " [no video]"
+                if bool(state.get("do_not_use", False)):
+                    label += " [do not use]"
+                    item_brush = QtGui.QBrush(QtGui.QColor("#b00020"))
                 self.exp_combo.addItem(label, {"kind": "session", "exp_id": summary.exp_id})
                 idx = self.exp_combo.count() - 1
+                if item_brush is not None:
+                    self.exp_combo.setItemData(idx, item_brush, Qt.ForegroundRole)
                 tooltip = "\n".join(
                     [
                         summary.exp_id,

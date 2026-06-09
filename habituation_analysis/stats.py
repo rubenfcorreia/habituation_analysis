@@ -125,7 +125,11 @@ def _scope_sessions(store: HabituationStore, scope: str, animal_id: str):
 
 def _analysis_sessions(store: HabituationStore, scope: str, animal_id: str) -> list:
     sessions = _scope_sessions(store, scope, animal_id)
-    return [s for s in sessions if s.has_right_pickle and not store.is_deeplabcut_reference_session(s.exp_id)]
+    return [
+        s
+        for s in sessions
+        if s.has_right_pickle and not store.is_deeplabcut_reference_session(s.exp_id) and not store.is_session_do_not_use(s.exp_id)
+    ]
 
 
 def compute_animal_baseline(store: HabituationStore, animal_id: str, *, scope: str | None = None) -> tuple[float, float]:
@@ -158,7 +162,11 @@ def animal_zscores(store: HabituationStore, animal_id: str, *, mean: float | Non
     else:
         sessions = store.sessions_for_animal(animal_id)
     for summary in sessions:
-        if not summary.has_right_pickle or store.is_deeplabcut_reference_session(summary.exp_id):
+        if (
+            not summary.has_right_pickle
+            or store.is_deeplabcut_reference_session(summary.exp_id)
+            or store.is_session_do_not_use(summary.exp_id)
+        ):
             continue
         bundle = store.load_session_bundle(summary.exp_id)
         z = (bundle.radius.astype(float) - float(mean)) / float(std)

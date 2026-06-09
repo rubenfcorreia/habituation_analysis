@@ -30,6 +30,7 @@ STATS_DIR = GUI_OUTPUT_ROOT / "stats"
 APP_STATE_PATH = GUI_OUTPUT_ROOT / "app_state.json"
 
 CACHE_VERSION = 7
+MIN_ANALYSIS_SESSION_DURATION_SEC = 1800.0
 SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d+_[A-Za-z0-9]+$")
 
 
@@ -536,23 +537,33 @@ class HabituationStore:
         return FACE_MOTION_CACHE_DIR / f"{exp_id}_face_motion.pkl"
 
     def load_session_state(self, exp_id: str) -> dict:
+        path = self.session_state_path(exp_id)
         default = {
             "manual_masks": [],
             "last_stats_signature": "",
             "stats_dirty": True,
             "preprocessed": False,
             "deeplabcut_reference": False,
+            "do_not_use": False,
             "threshold_signature": "",
         }
-        state = _load_json(self.session_state_path(exp_id), default)
+        state = _load_json(path, default)
         if not isinstance(state, dict):
-            state = default
+            state = {}
+        had_do_not_use = "do_not_use" in state
         state.setdefault("manual_masks", [])
         state.setdefault("last_stats_signature", "")
         state.setdefault("stats_dirty", True)
         state.setdefault("preprocessed", False)
         state.setdefault("deeplabcut_reference", False)
+        state.setdefault("do_not_use", False)
         state.setdefault("threshold_signature", "")
+        if not had_do_not_use:
+            summary = self.get_session_summary(exp_id)
+            if summary is not None and float(summary.duration_sec or 0.0) < MIN_ANALYSIS_SESSION_DURATION_SEC:
+                state["do_not_use"] = True
+                _save_json(path, state)
+                self.mark_all_animals_stats_dirty()
         return state
 
     def save_session_state(self, exp_id: str, state: dict) -> None:
@@ -570,12 +581,27 @@ class HabituationStore:
         state = self.load_session_state(exp_id)
         return bool(state.get("deeplabcut_reference", False))
 
+    def is_session_do_not_use(self, exp_id: str) -> bool:
+        state = self.load_session_state(exp_id)
+        return bool(state.get("do_not_use", False))
+
     def deeplabcut_reference_sessions(self, animal_id: str | None = None) -> list[SessionSummary]:
         if animal_id is None or animal_id == "All":
             sessions = self.dataset_sessions()
         else:
             sessions = self.sessions_for_animal(animal_id)
         return [summary for summary in sessions if self.is_deeplabcut_reference_session(summary.exp_id)]
+
+    def do_not_use_sessions(self, animal_id: str | None = None) -> list[SessionSummary]:
+        if animal_id is None or animal_id == "All":
+            sessions = self.dataset_sessions()
+        else:
+            sessions = self.sessions_for_animal(animal_id)
+        return [
+            summary
+            for summary in sessions
+            if self.is_session_do_not_use(summary.exp_id) and not self.is_deeplabcut_reference_session(summary.exp_id)
+        ]
 
     def set_session_preprocessed(self, exp_id: str, preprocessed: bool, *, threshold_signature: str | None = None) -> None:
         state = self.load_session_state(exp_id)
@@ -588,6 +614,12 @@ class HabituationStore:
     def set_session_deeplabcut_reference(self, exp_id: str, reference: bool) -> None:
         state = self.load_session_state(exp_id)
         state["deeplabcut_reference"] = bool(reference)
+        self.save_session_state(exp_id, state)
+        self.mark_all_animals_stats_dirty()
+
+    def set_session_do_not_use(self, exp_id: str, do_not_use: bool) -> None:
+        state = self.load_session_state(exp_id)
+        state["do_not_use"] = bool(do_not_use)
         self.save_session_state(exp_id, state)
         self.mark_all_animals_stats_dirty()
 
