@@ -410,7 +410,69 @@ class DeeplabcutReferenceTab(QWidget):
         self.store = store
         self._selected_animal = "All"
         self._selected_exp_id = ""
-        self._copy_text = "\n".join(lines) if lines else "No sessions marked do not use found."
+        self._copy_text = "No sessions for the DLC model found."
+
+        self._hint = QLabel(
+            "These expIDs are manually marked for the DLC model and are excluded from statistics.",
+            self,
+        )
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet("color: #666666; font-size: 11px;")
+
+        self.copy_btn = QPushButton("Copy list", self)
+        self.copy_btn.clicked.connect(self._copy_list)
+
+        self.tree = QTreeWidget(self)
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Experiment", "Note"])
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.tree.setUniformRowHeights(True)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._hint)
+        layout.addWidget(self.copy_btn, alignment=Qt.AlignLeft)
+        layout.addWidget(self.tree, stretch=1)
+
+        self.refresh()
+
+    def refresh(self):
+        previous_animal = self._selected_animal
+        previous_exp_id = self._selected_exp_id
+        lines: list[str] = []
+
+        self.tree.clear()
+        for animal in self.store.animals():
+            sessions = self.store.deeplabcut_reference_sessions(animal)
+            if not sessions:
+                continue
+            parent = QTreeWidgetItem([animal, f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}"])
+            parent_font = parent.font(0)
+            parent_font.setBold(True)
+            parent.setFont(0, parent_font)
+            parent.setFont(1, parent_font)
+            parent.setData(0, Qt.UserRole, {"kind": "animal", "animal_id": animal})
+            parent.setToolTip(0, f"{animal} sessions for the DLC model")
+            lines.append(animal)
+            for summary in sessions:
+                child = QTreeWidgetItem([summary.exp_id, "Reference only"])
+                child.setData(0, Qt.UserRole, {"kind": "session", "animal_id": animal, "exp_id": summary.exp_id})
+                child.setToolTip(0, summary.exp_id)
+                child.setToolTip(1, "Excluded from statistics")
+                color = QtGui.QColor("#1b5e20")
+                font = child.font(0)
+                font.setBold(True)
+                child.setFont(0, font)
+                child.setFont(1, font)
+                child.setForeground(0, QtGui.QBrush(color))
+                child.setForeground(1, QtGui.QBrush(color))
+                parent.addChild(child)
+                lines.append(f"  {summary.exp_id}")
+            parent.setExpanded(animal == previous_animal)
+            self.tree.addTopLevelItem(parent)
+
+        self._copy_text = "\n".join(lines) if lines else "No sessions for the DLC model found."
         self.tree.resizeColumnToContents(0)
         self.tree.resizeColumnToContents(1)
         self._select_current_item(previous_animal, previous_exp_id)
