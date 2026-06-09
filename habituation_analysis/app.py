@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QPlainTextEdit,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QToolButton,
     QTreeWidget,
@@ -656,6 +657,7 @@ class MetricsTab(QWidget):
         controls_box.addStretch(1)
 
         left_panel = QWidget(self)
+        left_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_panel)
         left_layout.addLayout(controls_box)
         zoom_row = QHBoxLayout()
@@ -695,6 +697,7 @@ class MetricsTab(QWidget):
         mask_layout.addWidget(self.save_btn)
 
         right_panel = QWidget(self)
+        right_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self.index_section)
         right_layout.addWidget(self.reference_section)
@@ -702,10 +705,14 @@ class MetricsTab(QWidget):
         right_layout.addWidget(self.mask_group, stretch=1)
 
         splitter = QSplitter(Qt.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setOpaqueResize(True)
+        splitter.setHandleWidth(8)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        splitter.setSizes([1150, 650])
 
         layout = QVBoxLayout(self)
         layout.addWidget(splitter)
@@ -1667,7 +1674,8 @@ class StatisticsTab(QWidget):
 
         self.figure_label = QLabel("No statistics figure yet.", self)
         self.figure_label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        self.figure_label.setMinimumSize(800, 600)
+        self.figure_label.setMinimumSize(0, 0)
+        self.figure_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.figure_scroll = QScrollArea(self)
         self.figure_scroll.setWidgetResizable(True)
         self.figure_scroll.setWidget(self.figure_label)
@@ -1861,7 +1869,8 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Habituation Analysis")
-        self.resize(1700, 1100)
+        self.resize(1720, 1080)
+        self.setMinimumSize(1280, 820)
         self.store = HabituationStore()
         self.index = self.store.load_index(prefer_cache=True)
         self.app_state = self.store.load_app_state()

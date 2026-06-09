@@ -375,6 +375,8 @@ class TracePanZoomCanvas(FigureCanvas):
         self._cid_motion = self.mpl_connect('motion_notify_event', self._on_motion)
         self._cid_release = self.mpl_connect('button_release_event', self._on_release)
         self._cid_scroll = self.mpl_connect('scroll_event', self._on_scroll)
+        self._cid_axes_enter = self.mpl_connect('axes_enter_event', self._on_axes_enter)
+        self._cid_figure_leave = self.mpl_connect('figure_leave_event', self._on_figure_leave)
 
     def set_pan_blocker(self, callback: Callable[[object], bool] | None):
         self._pan_blocker = callback
@@ -449,6 +451,38 @@ class TracePanZoomCanvas(FigureCanvas):
         self._view_xlim = self._clamp_xlim(left + float(delta_x), right + float(delta_x))
         self.apply_view()
 
+    def _set_cursor(self, cursor_shape):
+        try:
+            self.setCursor(cursor_shape)
+        except Exception:
+            pass
+
+    def _can_pan_here(self, event) -> bool:
+        if event.inaxes not in self._trace_axes or event.xdata is None:
+            return False
+        if self._pan_blocker is not None:
+            try:
+                return not bool(self._pan_blocker(event))
+            except Exception:
+                return True
+        return True
+
+    def _update_cursor(self, event=None, *, dragging: bool = False):
+        if dragging:
+            self._set_cursor(Qt.ClosedHandCursor)
+            return
+        if event is not None and self._can_pan_here(event):
+            self._set_cursor(Qt.OpenHandCursor)
+        else:
+            self._set_cursor(Qt.ArrowCursor)
+
+    def _on_axes_enter(self, event):
+        self._update_cursor(event)
+
+    def _on_figure_leave(self, event):
+        if not self._pan_active:
+            self._set_cursor(Qt.ArrowCursor)
+
     def _on_scroll(self, event):
         if event.inaxes not in self._trace_axes or event.xdata is None:
             return
@@ -497,6 +531,7 @@ class TracePanZoomCanvas(FigureCanvas):
         if self._pan_blocker is not None:
             try:
                 if self._pan_blocker(event):
+                    self._update_cursor(event)
                     return
             except Exception:
                 pass
@@ -508,9 +543,11 @@ class TracePanZoomCanvas(FigureCanvas):
         self._pan_active = True
         self._pan_press_xdata = float(event.xdata)
         self._pan_start_xlim = (float(xlim[0]), float(xlim[1]))
+        self._set_cursor(Qt.ClosedHandCursor)
 
     def _on_motion(self, event):
         if not self._pan_active or self._pan_press_xdata is None or self._pan_start_xlim is None:
+            self._update_cursor(event)
             return
         if event.xdata is None:
             return
@@ -518,9 +555,11 @@ class TracePanZoomCanvas(FigureCanvas):
         start_left, start_right = self._pan_start_xlim
         self._view_xlim = self._clamp_xlim(start_left + delta_x, start_right + delta_x)
         self.apply_view()
+        self._set_cursor(Qt.ClosedHandCursor)
 
     def _on_release(self, event):
         if event.button == 1:
             self._pan_active = False
             self._pan_press_xdata = None
             self._pan_start_xlim = None
+            self._update_cursor(event)
