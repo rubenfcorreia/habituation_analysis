@@ -600,25 +600,34 @@ class MetricsTab(QWidget):
 
         self.threshold_group = QGroupBox("Pupil thresholds (shared percentiles)", self)
         threshold_layout = QGridLayout(self.threshold_group)
-        threshold_layout.addWidget(QLabel("Boundary"), 0, 0)
-        threshold_layout.addWidget(QLabel("Shared percentile"), 0, 1)
-        threshold_layout.addWidget(QLabel("Absolute z-score"), 0, 2)
+        self.percentile_lock_check = QCheckBox("Unlock shared percentiles", self.threshold_group)
+        self.percentile_lock_check.toggled.connect(self._on_percentile_lock_toggled)
+        self.percentile_lock_check.setToolTip(
+            "Enable direct typing in the shared percentile fields. Dragging threshold lines stays available either way."
+        )
+        threshold_layout.addWidget(self.percentile_lock_check, 0, 0, 1, 3)
+        threshold_layout.addWidget(QLabel("Boundary"), 1, 0)
+        threshold_layout.addWidget(QLabel("Shared percentile"), 1, 1)
+        threshold_layout.addWidget(QLabel("Absolute z-score"), 1, 2)
         self.percentile_spins: list[QDoubleSpinBox] = []
         self.value_labels: list[QLabel] = []
-        for row, name in enumerate(BOUNDARY_NAMES, start=1):
+        for idx, name in enumerate(BOUNDARY_NAMES):
+            row = idx + 2
             threshold_layout.addWidget(QLabel(name), row, 0)
             pspin = QDoubleSpinBox(self.threshold_group)
             pspin.setRange(0.0, 100.0)
             pspin.setDecimals(1)
             pspin.setSingleStep(1.0)
-            pspin.valueChanged.connect(lambda value, idx=row - 1: self._on_percentile_changed(idx, value))
+            pspin.setKeyboardTracking(False)
+            pspin.setEnabled(False)
+            pspin.valueChanged.connect(lambda value, idx=idx: self._on_percentile_changed(idx, value))
             self.percentile_spins.append(pspin)
             threshold_layout.addWidget(pspin, row, 1)
             vlabel = QLabel("--", self.threshold_group)
             self.value_labels.append(vlabel)
             threshold_layout.addWidget(vlabel, row, 2)
 
-        threshold_layout.addWidget(QLabel("Missing pupil buffer (s)", self.threshold_group), 4, 0)
+        threshold_layout.addWidget(QLabel("Missing pupil buffer (s)", self.threshold_group), 5, 0)
         self.missing_buffer_spin = QDoubleSpinBox(self.threshold_group)
         self.missing_buffer_spin.setRange(0.0, 60.0)
         self.missing_buffer_spin.setDecimals(2)
@@ -627,12 +636,12 @@ class MetricsTab(QWidget):
             "Gap length outside manual not-visible intervals before missing pupil detections count as extra-large."
         )
         self.missing_buffer_spin.valueChanged.connect(self._on_missing_buffer_changed)
-        threshold_layout.addWidget(self.missing_buffer_spin, 4, 1)
+        threshold_layout.addWidget(self.missing_buffer_spin, 5, 1)
         buffer_hint = QLabel("Sustained gaps only", self.threshold_group)
         buffer_hint.setStyleSheet("color: #666666; font-size: 11px;")
-        threshold_layout.addWidget(buffer_hint, 4, 2)
+        threshold_layout.addWidget(buffer_hint, 5, 2)
 
-        self.threshold_hint = QLabel("Shared percentiles, animal-specific absolute values.", self)
+        self.threshold_hint = QLabel("Unlock the shared percentile fields to type values. Dragging the threshold lines stays live.", self)
         self.threshold_hint.setWordWrap(True)
         self.threshold_hint.setStyleSheet("color: #666666; font-size: 11px;")
 
@@ -645,21 +654,23 @@ class MetricsTab(QWidget):
         self.locomotion_spin.valueChanged.connect(self._on_locomotion_threshold_changed)
         loc_layout.addRow("Threshold", self.locomotion_spin)
 
-        controls_box = QVBoxLayout()
-        controls_box.addWidget(self._scope_label)
-        controls_box.addWidget(self._session_label)
-        controls_box.addWidget(self.timebase_warning)
-        controls_box.addWidget(self._baseline_label)
-        controls_box.addWidget(self._dirty_label)
-        controls_box.addWidget(self.threshold_group)
-        controls_box.addWidget(self.threshold_hint)
-        controls_box.addWidget(self.locomotion_group)
-        controls_box.addStretch(1)
-
         left_panel = QWidget(self)
         left_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.addLayout(controls_box)
+        self.metrics_summary_panel = QWidget(self)
+        metrics_summary_layout = QVBoxLayout(self.metrics_summary_panel)
+        metrics_summary_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_summary_layout.addWidget(self._scope_label)
+        metrics_summary_layout.addWidget(self._session_label)
+        metrics_summary_layout.addWidget(self.timebase_warning)
+        metrics_summary_layout.addWidget(self._baseline_label)
+        metrics_summary_layout.addWidget(self._dirty_label)
+        metrics_summary_layout.addWidget(self.threshold_group)
+        metrics_summary_layout.addWidget(self.threshold_hint)
+        metrics_summary_layout.addWidget(self.locomotion_group)
+        metrics_summary_layout.addStretch(1)
+        self.metrics_summary_section = CollapsibleSection("Metrics summary", self.metrics_summary_panel, self, expanded=False)
+        left_layout.addWidget(self.metrics_summary_section)
         zoom_row = QHBoxLayout()
         zoom_row.addWidget(self.zoom_in_btn)
         zoom_row.addWidget(self.zoom_out_btn)
@@ -669,9 +680,7 @@ class MetricsTab(QWidget):
         left_layout.addWidget(self.canvas, stretch=1)
 
         self.experiment_index = ExperimentIndexTab(self.store, self)
-        self.index_section = CollapsibleSection("Experiment Index", self.experiment_index, self, expanded=False)
         self.reference_sessions = DeeplabcutReferenceTab(self.store, self)
-        self.reference_section = CollapsibleSection("Add for DLC model", self.reference_sessions, self, expanded=False)
 
         self.reference_group = QGroupBox("Session markers", self)
         reference_layout = QVBoxLayout(self.reference_group)
@@ -696,13 +705,40 @@ class MetricsTab(QWidget):
         mask_layout.addWidget(self.interval_list, stretch=1)
         mask_layout.addWidget(self.save_btn)
 
-        right_panel = QWidget(self)
-        right_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.addWidget(self.index_section)
-        right_layout.addWidget(self.reference_section)
-        right_layout.addWidget(self.reference_group)
-        right_layout.addWidget(self.mask_group, stretch=1)
+        right_controls_panel = QWidget(self)
+        right_controls_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        right_controls_layout = QVBoxLayout(right_controls_panel)
+        right_controls_layout.setContentsMargins(0, 0, 0, 0)
+        right_controls_layout.addWidget(self.mask_group, stretch=1)
+
+        index_group = QGroupBox("Experiment Index", self)
+        index_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        index_layout = QVBoxLayout(index_group)
+        index_layout.addWidget(self.experiment_index)
+
+        reference_model_group = QGroupBox("Add for DLC model", self)
+        reference_model_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        reference_model_layout = QVBoxLayout(reference_model_group)
+        reference_model_layout.addWidget(self.reference_sessions)
+
+        right_column_panel = QWidget(self)
+        right_column_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        right_column_layout = QVBoxLayout(right_column_panel)
+        right_column_layout.setContentsMargins(0, 0, 0, 0)
+        right_column_layout.addWidget(self.reference_group)
+        right_column_layout.addWidget(index_group)
+        right_column_layout.addWidget(reference_model_group)
+        right_column_layout.addStretch(1)
+
+        right_panel = QSplitter(Qt.Horizontal, self)
+        right_panel.setChildrenCollapsible(False)
+        right_panel.setOpaqueResize(True)
+        right_panel.setHandleWidth(6)
+        right_panel.addWidget(right_controls_panel)
+        right_panel.addWidget(right_column_panel)
+        right_panel.setStretchFactor(0, 2)
+        right_panel.setStretchFactor(1, 3)
+        right_panel.setSizes([320, 760])
 
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -710,14 +746,15 @@ class MetricsTab(QWidget):
         splitter.setHandleWidth(8)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([1150, 650])
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([1000, 1100])
 
         layout = QVBoxLayout(self)
         layout.addWidget(splitter)
 
         self._set_threshold_control_values(self._percentile_cutoffs, self._threshold_values)
+        self._on_percentile_lock_toggled(self.percentile_lock_check.isChecked())
 
     def set_selection(self, animal_id: str, exp_id: str, view_mode: str):
         changed = (animal_id != self.animal_id) or (exp_id != self.exp_id) or (view_mode != self.view_mode)
@@ -881,6 +918,22 @@ class MetricsTab(QWidget):
                 label.setText(f"{self._threshold_values[idx]:.3f}  ({percentile:.1f}%)")
             else:
                 label.setText("--")
+
+    def _on_percentile_lock_toggled(self, checked: bool):
+        editable = bool(checked)
+        for spin in self.percentile_spins:
+            spin.setEnabled(editable)
+            spin.setKeyboardTracking(False)
+        if editable:
+            self.percentile_lock_check.setToolTip(
+                "Shared percentiles are unlocked. Type the final values, or drag threshold lines for immediate updates."
+            )
+            self.threshold_hint.setText("Shared percentile fields are unlocked for typing. Dragging the threshold lines still works.")
+        else:
+            self.percentile_lock_check.setToolTip(
+                "Enable direct typing in the shared percentile fields. Dragging threshold lines stays available either way."
+            )
+            self.threshold_hint.setText("Unlock the shared percentile fields to type values. Dragging the threshold lines stays live.")
 
     def _set_threshold_control_values(self, percentiles: list[float], values: list[float]):
         self._updating_controls = True
@@ -1841,7 +1894,7 @@ class StatisticsTab(QWidget):
             f"Animal: {result.animal_id}",
             f"Generated at: {result.generated_at}",
             f"Sessions: {len(result.session_ids)}",
-            f"Eligible sessions (>30 min): {len(result.eligible_session_ids)}",
+            f"Eligible sessions (>30 min video): {len(result.eligible_session_ids)}",
             f"Baseline mean/std: {result.zscore_mean:.4f} / {result.zscore_std:.4f}",
             f"Thresholds: percentiles={result.thresholds.get('percentiles', [])} | values={result.thresholds.get('threshold_values', [])}",
             f"Locomotion threshold: {result.thresholds.get('locomotion_threshold', float('nan'))}",

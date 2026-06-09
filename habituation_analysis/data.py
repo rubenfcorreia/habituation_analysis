@@ -560,7 +560,7 @@ class HabituationStore:
         state.setdefault("threshold_signature", "")
         if not had_do_not_use:
             summary = self.get_session_summary(exp_id)
-            if summary is not None and float(summary.duration_sec or 0.0) < MIN_ANALYSIS_SESSION_DURATION_SEC:
+            if summary is not None and float(summary.video_duration_sec or 0.0) < MIN_ANALYSIS_SESSION_DURATION_SEC:
                 state["do_not_use"] = True
                 _save_json(path, state)
                 self.mark_all_animals_stats_dirty()

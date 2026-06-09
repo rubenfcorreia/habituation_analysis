@@ -235,7 +235,7 @@ def compute_statistics(
     progress_cb=None,
 ) -> StatisticsResult:
     sessions = _analysis_sessions(store, scope, animal_id)
-    eligible = [s for s in sessions if s.duration_sec >= 1800.0]
+    eligible = [s for s in sessions if float(s.video_duration_sec or 0.0) >= 1800.0]
     mean, std = compute_animal_baseline(store, animal_id, scope=scope)
 
     locomotion_pct_by_day: dict[str, list[float]] = {}
