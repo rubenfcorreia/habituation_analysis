@@ -1185,11 +1185,14 @@ class MetricsTab(QWidget):
             return
         state = self.store.load_session_state(self.exp_id)
         do_not_use = bool(state.get("do_not_use", False))
+        forced_do_not_use = self.store.is_session_forced_do_not_use(self.exp_id)
         self.do_not_use_check.blockSignals(True)
-        self.do_not_use_check.setChecked(do_not_use)
+        self.do_not_use_check.setChecked(do_not_use or forced_do_not_use)
         self.do_not_use_check.blockSignals(False)
-        self.do_not_use_check.setEnabled(True)
-        if do_not_use:
+        self.do_not_use_check.setEnabled(not forced_do_not_use)
+        if forced_do_not_use:
+            tip = "Sessions under 30 minutes and TEST sessions are always excluded from statistics."
+        elif do_not_use:
             tip = "This expID is excluded from statistics."
         else:
             tip = "Mark this expID as excluded from statistics."

@@ -536,6 +536,14 @@ class HabituationStore:
     def face_motion_cache_path(self, exp_id: str) -> Path:
         return FACE_MOTION_CACHE_DIR / f"{exp_id}_face_motion.pkl"
 
+    def is_session_forced_do_not_use(self, exp_id: str) -> bool:
+        summary = self.get_session_summary(exp_id)
+        if summary is None:
+            return False
+        if summary.animal_id == "TEST":
+            return True
+        return float(summary.video_duration_sec or 0.0) < MIN_ANALYSIS_SESSION_DURATION_SEC
+
     def load_session_state(self, exp_id: str) -> dict:
         path = self.session_state_path(exp_id)
         default = {
@@ -550,7 +558,6 @@ class HabituationStore:
         state = _load_json(path, default)
         if not isinstance(state, dict):
             state = {}
-        had_do_not_use = "do_not_use" in state
         state.setdefault("manual_masks", [])
         state.setdefault("last_stats_signature", "")
         state.setdefault("stats_dirty", True)
@@ -558,12 +565,11 @@ class HabituationStore:
         state.setdefault("deeplabcut_reference", False)
         state.setdefault("do_not_use", False)
         state.setdefault("threshold_signature", "")
-        if not had_do_not_use:
-            summary = self.get_session_summary(exp_id)
-            if summary is not None and float(summary.video_duration_sec or 0.0) < MIN_ANALYSIS_SESSION_DURATION_SEC:
-                state["do_not_use"] = True
-                _save_json(path, state)
-                self.mark_all_animals_stats_dirty()
+        forced_do_not_use = self.is_session_forced_do_not_use(exp_id)
+        if forced_do_not_use and not state.get("do_not_use", False):
+            state["do_not_use"] = True
+            _save_json(path, state)
+            self.mark_all_animals_stats_dirty()
         return state
 
     def save_session_state(self, exp_id: str, state: dict) -> None:
@@ -582,6 +588,8 @@ class HabituationStore:
         return bool(state.get("deeplabcut_reference", False))
 
     def is_session_do_not_use(self, exp_id: str) -> bool:
+        if self.is_session_forced_do_not_use(exp_id):
+            return True
         state = self.load_session_state(exp_id)
         return bool(state.get("do_not_use", False))
 
@@ -618,6 +626,8 @@ class HabituationStore:
         self.mark_all_animals_stats_dirty()
 
     def set_session_do_not_use(self, exp_id: str, do_not_use: bool) -> None:
+        if self.is_session_forced_do_not_use(exp_id):
+            do_not_use = True
         state = self.load_session_state(exp_id)
         state["do_not_use"] = bool(do_not_use)
         self.save_session_state(exp_id, state)
