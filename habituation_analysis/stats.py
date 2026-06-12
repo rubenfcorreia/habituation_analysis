@@ -253,9 +253,10 @@ def classify_zscores(
     thresholds: list[float],
     visible_mask: np.ndarray | None = None,
     extra_large_mask: np.ndarray | None = None,
+    not_visible_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     thresholds = sorted([float(t) for t in thresholds])
-    state = np.full(z.shape, 4, dtype=int)
+    state = np.full(z.shape, 3, dtype=int)
     mask = np.isfinite(z)
     if visible_mask is not None:
         mask &= visible_mask
@@ -264,7 +265,11 @@ def classify_zscores(
     state[mask & (z >= thresholds[1]) & (z < thresholds[2])] = 2
     state[mask & (z >= thresholds[2])] = 3
     if extra_large_mask is not None:
-        state[np.asarray(extra_large_mask, dtype=bool) & (state == 4)] = 4
+        # Promote long invisible stretches to the inferred extra-large state.
+        state[np.asarray(extra_large_mask, dtype=bool)] = 3
+    if not_visible_mask is not None:
+        # Manual not-visible intervals stay separate from inferred missing stretches.
+        state[np.asarray(not_visible_mask, dtype=bool)] = 4
     return state
 
 
@@ -374,10 +379,11 @@ def compute_statistics(
         manual_masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, manual_masks)
         extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
+        not_visible_mask = _interval_mask(np.asarray(bundle.t, dtype=float), manual_masks)
 
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
-        state = classify_zscores(z, threshold_values, visible, extra_large_mask)
+        state = classify_zscores(z, threshold_values, visible, extra_large_mask, not_visible_mask)
 
         session_label = str(session_order_map.get(summary.exp_id, 0))
 
@@ -443,9 +449,10 @@ def compute_statistics(
         manual_masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, manual_masks)
         extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
+        not_visible_mask = _interval_mask(np.asarray(bundle.t, dtype=float), manual_masks)
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
-        state = classify_zscores(z, threshold_values, visible, extra_large_mask)
+        state = classify_zscores(z, threshold_values, visible, extra_large_mask, not_visible_mask)
         progress = np.clip((bundle.t / max(store.effective_session_duration_sec(summary.exp_id), 1e-6)) * 100.0, 0.0, 100.0)
         bins = np.clip(progress.astype(int), 0, 99)
         for b in range(100):
