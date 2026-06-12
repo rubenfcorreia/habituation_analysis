@@ -51,6 +51,7 @@ from .stats import (
     percentile_threshold_values,
     save_statistics_outputs,
     statistics_panel_paths,
+    suggest_extra_large_calibration,
 )
 from .widgets import DraggableHLine, TracePanZoomCanvas, VideoPlayerWidget
 
@@ -617,6 +618,7 @@ class MetricsTab(QWidget):
         self._current_session: SessionSummary | None = None
         self._current_payload: LoadedSession | None = None
         self._pending_mask_start: float | None = None
+        self._calibration_suggestion: dict | None = None
         self._reset_trace_view_pending = True
         self._dirty_label = QLabel("Statistics are clean")
         self._scope_label = QLabel("")
@@ -662,6 +664,25 @@ class MetricsTab(QWidget):
         self.delete_btn.clicked.connect(self._delete_selected_interval)
         self.clear_btn.clicked.connect(self._clear_intervals)
         self.save_btn.clicked.connect(self._save_intervals)
+
+        self.calibration_group = QGroupBox("Extra-large calibration", self)
+        calibration_layout = QVBoxLayout(self.calibration_group)
+        self.calibration_status_label = QLabel("No calibration suggestion available yet.", self.calibration_group)
+        self.calibration_status_label.setWordWrap(True)
+        calibration_layout.addWidget(self.calibration_status_label)
+        calibration_button_row = QHBoxLayout()
+        self.confirm_calibration_btn = QPushButton("Confirm suggestion", self.calibration_group)
+        self.confirm_calibration_btn.clicked.connect(self._confirm_extra_large_calibration)
+        self.clear_calibration_btn = QPushButton("Clear calibration", self.calibration_group)
+        self.clear_calibration_btn.clicked.connect(self._clear_extra_large_calibration)
+        calibration_button_row.addWidget(self.confirm_calibration_btn)
+        calibration_button_row.addWidget(self.clear_calibration_btn)
+        calibration_button_row.addStretch(1)
+        calibration_layout.addLayout(calibration_button_row)
+        calibration_hint = QLabel("The app suggests a calibration interval automatically from big detected pupil periods. Confirm it to activate the brightness-based extra-large rule.", self.calibration_group)
+        calibration_hint.setWordWrap(True)
+        calibration_hint.setStyleSheet("color: #666666; font-size: 11px;")
+        calibration_layout.addWidget(calibration_hint)
 
         self.do_not_use_check = QCheckBox("Do not use", self)
         self.do_not_use_check.toggled.connect(self._on_do_not_use_toggled)
@@ -807,6 +828,7 @@ class MetricsTab(QWidget):
         right_controls_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         right_controls_layout = QVBoxLayout(right_controls_panel)
         right_controls_layout.setContentsMargins(0, 0, 0, 0)
+        right_controls_layout.addWidget(self.calibration_group)
         right_controls_layout.addWidget(self.mask_group, stretch=1)
 
         index_group = QGroupBox("Experiment Index", self)
@@ -926,11 +948,15 @@ class MetricsTab(QWidget):
             self.cutoff_btn.setEnabled(False)
         if hasattr(self, "clear_cutoff_btn"):
             self.clear_cutoff_btn.setEnabled(False)
+        if hasattr(self, "calibration_group"):
+            self.calibration_group.setEnabled(False)
+            self.calibration_group.setVisible(False)
         self._update_timebase_warning(None, None)
         self.movie_locomotion_warning.setText("")
         self.movie_locomotion_warning.setVisible(False)
         self._current_session = None
         self._current_payload = None
+        self._calibration_suggestion = None
         self._clear_threshold_lines()
         self._clear_locomotion_threshold_line()
         self._clear_cursor_lines()
@@ -1142,6 +1168,8 @@ class MetricsTab(QWidget):
         self.thresholds_changed.emit()
         self._refresh_preprocessed_checkbox()
         self._update_dirty_label()
+        if self.view_mode == "Session" and self._current_session is not None and self._current_payload is not None:
+            self._refresh_extra_large_calibration_controls(self._current_session, self._current_payload)
 
     def _persist_locomotion_threshold(self):
         self.store.settings.setdefault("global", {})
@@ -1826,11 +1854,20 @@ class MetricsTab(QWidget):
                 manual_masks = self.store.load_manual_masks(summary.exp_id)
                 for start_t, end_t in manual_masks:
                     pupil_ax.axvspan(start_t, end_t, color="tab:red", alpha=0.15)
-                extra_large_mask = _extra_large_missing_mask(
-                    payload,
-                    manual_masks,
-                    manual_buffer_sec=self.store.global_pupil_missing_buffer_sec(),
-                )
+                extra_large_mask = None
+                calibration = self.store.session_extra_large_calibration(summary.exp_id)
+                if calibration is not None:
+                    brightness_t, brightness = self.store.load_pupil_brightness(summary.exp_id)
+                    if brightness_t is not None and brightness is not None and brightness.size:
+                        n = min(int(payload.t.size), int(brightness.size))
+                        if n > 0:
+                            extra_large_mask = visible[:n] & np.isfinite(brightness[:n]) & (brightness[:n] >= float(calibration["threshold"]))
+                if extra_large_mask is None:
+                    extra_large_mask = _extra_large_missing_mask(
+                        payload,
+                        manual_masks,
+                        manual_buffer_sec=self.store.global_pupil_missing_buffer_sec(),
+                    )
                 extra_large_intervals = mask_to_intervals(payload.t, extra_large_mask)
                 for idx, (start_t, end_t) in enumerate(extra_large_intervals):
                     pupil_ax.axvspan(
@@ -1843,7 +1880,9 @@ class MetricsTab(QWidget):
                         linewidth=0.0,
                         label="inferred extra-large missing" if idx == 0 else None,
                     )
+                self._refresh_extra_large_calibration_controls(summary, payload, pupil_ax)
             else:
+                self._refresh_extra_large_calibration_controls(summary, payload, pupil_ax)
                 pupil_ax.text(
                     0.5,
                     0.5,
@@ -1932,6 +1971,7 @@ class MetricsTab(QWidget):
     def _update_video(self):
         show_video = self.view_mode == "Session"
         self.mask_group.setVisible(show_video)
+        self.calibration_group.setVisible(show_video)
         if not show_video:
             self.video_widget.pause()
             self.video_widget.set_video(None, None)
@@ -2014,6 +2054,93 @@ class MetricsTab(QWidget):
         self.store.save_manual_masks(self.exp_id, intervals, mark_dirty=True)
         self._refresh_interval_list()
         self.masks_changed.emit()
+        self.refresh()
+
+    def _format_extra_large_calibration_text(self, calibration: dict | None) -> str:
+        if calibration is None:
+            return "No confirmed calibration. Awaiting automatic suggestion."
+        start, end = calibration["interval"]
+        return (
+            f"Confirmed: {format_seconds(float(start))} -> {format_seconds(float(end))} | "
+            f"threshold={float(calibration['threshold']):.2f}"
+        )
+
+    def _refresh_extra_large_calibration_controls(
+        self,
+        summary: SessionSummary | None,
+        payload: LoadedSession | None,
+        pupil_ax=None,
+    ):
+        if not hasattr(self, "calibration_group"):
+            return
+        if self.view_mode != "Session" or summary is None or payload is None or not payload.has_pupil or not payload.radius.size:
+            self._calibration_suggestion = None
+            self.calibration_status_label.setText("No calibration suggestion available for this session.")
+            self.confirm_calibration_btn.setEnabled(False)
+            self.clear_calibration_btn.setEnabled(False)
+            return
+
+        confirmed = self.store.session_extra_large_calibration(summary.exp_id)
+        brightness_t, brightness = self.store.load_pupil_brightness(summary.exp_id)
+        suggestion = None
+        if brightness_t is not None and brightness is not None and brightness.size:
+            suggestion = suggest_extra_large_calibration(
+                np.asarray(payload.t, dtype=float),
+                np.asarray(payload.radius, dtype=float),
+                np.asarray(payload.visible_mask_base, dtype=bool),
+                np.asarray(brightness, dtype=float),
+                self._zscore_mean,
+                self._zscore_std,
+                self._threshold_values,
+            )
+        self._calibration_suggestion = suggestion
+
+        status_lines = []
+        status_lines.append(self._format_extra_large_calibration_text(confirmed))
+        if suggestion is None:
+            status_lines.append("Suggested: no suitable big-detected interval was found.")
+            confirm_enabled = False
+        else:
+            start, end = suggestion["interval"]
+            status_lines.append(
+                f"Suggested: {format_seconds(float(start))} -> {format_seconds(float(end))} | "
+                f"threshold={float(suggestion['threshold']):.2f} ({suggestion['selected_frames']} frames)"
+            )
+            if confirmed is not None and tuple(map(float, confirmed["interval"])) != tuple(map(float, suggestion["interval"])):
+                status_lines.append("The suggestion differs from the confirmed calibration. Confirm again to update it.")
+            elif confirmed is None:
+                status_lines.append("This suggestion is not active until you confirm it.")
+            confirm_enabled = True
+        self.calibration_status_label.setText("\n".join(status_lines))
+        self.confirm_calibration_btn.setEnabled(confirm_enabled)
+        self.clear_calibration_btn.setEnabled(confirmed is not None)
+
+        if pupil_ax is not None and summary is not None and payload is not None and payload.has_pupil and payload.radius.size:
+            if confirmed is not None:
+                start, end = confirmed["interval"]
+                pupil_ax.axvspan(start, end, color="tab:blue", alpha=0.12, label="confirmed calibration")
+            if suggestion is not None:
+                start, end = suggestion["interval"]
+                label = "suggested calibration" if confirmed is None else "suggested calibration (pending)"
+                pupil_ax.axvspan(start, end, color="tab:cyan", alpha=0.12, label=label)
+
+    def _confirm_extra_large_calibration(self):
+        if self.view_mode != "Session" or self.exp_id == "":
+            return
+        suggestion = self._calibration_suggestion
+        if not suggestion:
+            return
+        interval = suggestion["interval"]
+        threshold = suggestion["threshold"]
+        self.store.set_session_extra_large_calibration(self.exp_id, interval, threshold, confirmed=True)
+        self.session_state_changed.emit()
+        self.refresh()
+
+    def _clear_extra_large_calibration(self):
+        if self.view_mode != "Session" or self.exp_id == "":
+            return
+        self.store.clear_session_extra_large_calibration(self.exp_id)
+        self.session_state_changed.emit()
         self.refresh()
 
     def _on_video_time_changed(self, value: float):
@@ -2665,6 +2792,7 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.metrics_tab.masks_changed.connect(self.metrics_tab.reference_sessions.refresh)
         self.metrics_tab.session_state_changed.connect(self.metrics_tab.experiment_index.refresh)
         self.metrics_tab.session_state_changed.connect(self.metrics_tab.reference_sessions.refresh)
+        self.metrics_tab.session_state_changed.connect(self.statistics_tab.refresh)
 
         self._populate_browser(initial=True)
         self._apply_saved_state()

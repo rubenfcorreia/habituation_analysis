@@ -26,11 +26,12 @@ SETTINGS_PATH = GUI_OUTPUT_ROOT / "settings.json"
 SESSION_STATE_DIR = GUI_OUTPUT_ROOT / "session_state"
 SESSION_CACHE_DIR = GUI_OUTPUT_ROOT / "session_cache"
 FACE_MOTION_CACHE_DIR = GUI_OUTPUT_ROOT / "face_motion_cache"
+PUPIL_BRIGHTNESS_CACHE_DIR = GUI_OUTPUT_ROOT / "pupil_brightness_cache"
 STATS_DIR = GUI_OUTPUT_ROOT / "stats"
 APP_STATE_PATH = GUI_OUTPUT_ROOT / "app_state.json"
 
 CACHE_VERSION = 8
-STATISTICS_RESULTS_VERSION = 7
+STATISTICS_RESULTS_VERSION = 8
 MIN_ANALYSIS_SESSION_DURATION_SEC = 1800.0
 SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d+_[A-Za-z0-9]+$")
 
@@ -41,6 +42,7 @@ def ensure_output_dirs() -> None:
         SESSION_STATE_DIR,
         SESSION_CACHE_DIR,
         FACE_MOTION_CACHE_DIR,
+        PUPIL_BRIGHTNESS_CACHE_DIR,
         STATS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
@@ -645,6 +647,9 @@ class HabituationStore:
     def face_motion_cache_path(self, exp_id: str) -> Path:
         return FACE_MOTION_CACHE_DIR / f"{exp_id}_face_motion.pkl"
 
+    def pupil_brightness_cache_path(self, exp_id: str) -> Path:
+        return PUPIL_BRIGHTNESS_CACHE_DIR / f"{exp_id}_pupil_brightness.pkl"
+
     def is_session_forced_do_not_use(self, exp_id: str) -> bool:
         summary = self.get_session_summary(exp_id)
         if summary is None:
@@ -658,6 +663,9 @@ class HabituationStore:
         default = {
             "manual_masks": [],
             "manual_masks_timebase": None,
+            "extra_large_calibration_interval": None,
+            "extra_large_calibration_threshold": None,
+            "extra_large_calibration_confirmed": False,
             "last_stats_signature": "",
             "last_stats_output_dir": "",
             "stats_dirty": True,
@@ -673,6 +681,9 @@ class HabituationStore:
             state = {}
         state.setdefault("manual_masks", [])
         state.setdefault("manual_masks_timebase", None)
+        state.setdefault("extra_large_calibration_interval", None)
+        state.setdefault("extra_large_calibration_threshold", None)
+        state.setdefault("extra_large_calibration_confirmed", False)
         state.setdefault("last_stats_signature", "")
         state.setdefault("last_stats_output_dir", "")
         state.setdefault("stats_dirty", True)
@@ -697,6 +708,58 @@ class HabituationStore:
     def session_threshold_signature(self, exp_id: str) -> str:
         state = self.load_session_state(exp_id)
         return str(state.get("threshold_signature", ""))
+
+    def session_extra_large_calibration(self, exp_id: str) -> dict | None:
+        state = self.load_session_state(exp_id)
+        if not bool(state.get("extra_large_calibration_confirmed", False)):
+            return None
+        interval = state.get("extra_large_calibration_interval", None)
+        threshold = _coerce_optional_float(state.get("extra_large_calibration_threshold", None))
+        if interval is None or threshold is None:
+            return None
+        try:
+            start, end = float(interval[0]), float(interval[1])
+        except Exception:
+            return None
+        if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+            return None
+        return {
+            "interval": (float(start), float(end)),
+            "threshold": float(threshold),
+            "confirmed": True,
+        }
+
+    def set_session_extra_large_calibration(
+        self,
+        exp_id: str,
+        interval: tuple[float, float] | None,
+        threshold: float | None,
+        *,
+        confirmed: bool = True,
+    ) -> dict | None:
+        state = self.load_session_state(exp_id)
+        if interval is None or threshold is None:
+            state["extra_large_calibration_interval"] = None
+            state["extra_large_calibration_threshold"] = None
+            state["extra_large_calibration_confirmed"] = False
+        else:
+            start, end = float(interval[0]), float(interval[1])
+            if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+                state["extra_large_calibration_interval"] = None
+                state["extra_large_calibration_threshold"] = None
+                state["extra_large_calibration_confirmed"] = False
+            else:
+                state["extra_large_calibration_interval"] = [float(start), float(end)]
+                state["extra_large_calibration_threshold"] = float(threshold)
+                state["extra_large_calibration_confirmed"] = bool(confirmed)
+        state["stats_dirty"] = True
+        state["last_stats_signature"] = ""
+        self.save_session_state(exp_id, state)
+        self.mark_all_animals_stats_dirty()
+        return self.session_extra_large_calibration(exp_id)
+
+    def clear_session_extra_large_calibration(self, exp_id: str) -> None:
+        self.set_session_extra_large_calibration(exp_id, None, None)
 
     def is_session_preprocessed(self, exp_id: str) -> bool:
         state = self.load_session_state(exp_id)
@@ -1178,6 +1241,90 @@ class HabituationStore:
             t = t[:n]
         return t, motion
 
+    def load_pupil_brightness(self, exp_id: str, *, force_recompute: bool = False) -> tuple[np.ndarray | None, np.ndarray | None]:
+        summary = self.get_session_summary(exp_id)
+        if summary is None:
+            raise FileNotFoundError(f"Unknown expID: {exp_id}")
+        if not summary.has_right_video or summary.right_video is None or not Path(summary.right_video).exists():
+            return None, None
+        cache_path = self.pupil_brightness_cache_path(exp_id)
+        current_sig = self._current_source_signature(summary)
+        if not force_recompute and cache_path.exists():
+            try:
+                cached = _load_pickle(cache_path)
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("cache_version") == self.source_version
+                    and self._signature_matches(cached.get("source_signature", {}), current_sig)
+                ):
+                    return (
+                        np.asarray(cached["pupil_brightness_t"], dtype=float),
+                        np.asarray(cached["pupil_brightness"], dtype=float),
+                    )
+            except Exception:
+                pass
+        t, brightness = self._compute_pupil_brightness(summary)
+        if t is None or brightness is None:
+            return None, None
+        payload = {
+            "cache_version": self.source_version,
+            "source_signature": current_sig,
+            "pupil_brightness_t": np.asarray(t, dtype=np.float64),
+            "pupil_brightness": np.asarray(brightness, dtype=np.float32),
+        }
+        _save_pickle(cache_path, payload)
+        return np.asarray(t, dtype=float), np.asarray(brightness, dtype=float)
+
+    def _compute_pupil_brightness(self, summary: SessionSummary):
+        if summary.right_video is None or not Path(summary.right_video).exists():
+            return None, None
+        bundle = self.load_session_bundle(summary.exp_id)
+        cap = cv2.VideoCapture(summary.right_video)
+        if not cap.isOpened():
+            return None, None
+        values: list[float] = []
+        idx = 0
+        max_frames = int(bundle.t.size)
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx >= max_frames:
+                break
+            value = float("nan")
+            if idx < bundle.radius.size and idx < bundle.x.size and idx < bundle.y.size:
+                x = float(bundle.x[idx])
+                y = float(bundle.y[idx])
+                radius = float(bundle.radius[idx])
+                if np.isfinite(x) and np.isfinite(y) and np.isfinite(radius) and radius > 0.0:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    h, w = gray.shape[:2]
+                    cx = float(np.clip(x, 0.0, max(0.0, float(w - 1))))
+                    cy = float(np.clip(y, 0.0, max(0.0, float(h - 1))))
+                    r = max(1.0, float(radius))
+                    x0 = max(0, int(np.floor(cx - r)))
+                    x1 = min(w, int(np.ceil(cx + r)) + 1)
+                    y0 = max(0, int(np.floor(cy - r)))
+                    y1 = min(h, int(np.ceil(cy + r)) + 1)
+                    if x1 > x0 and y1 > y0:
+                        yy, xx = np.ogrid[y0:y1, x0:x1]
+                        mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= r ** 2
+                        region = gray[y0:y1, x0:x1]
+                        if np.any(mask):
+                            value = float(np.nanmean(region[mask]))
+            values.append(value)
+            idx += 1
+        cap.release()
+        if not values:
+            return None, None
+        brightness = np.asarray(values, dtype=float)
+        t = np.asarray(bundle.t[: brightness.size], dtype=float)
+        if brightness.size != t.size:
+            n = min(brightness.size, t.size)
+            brightness = brightness[:n]
+            t = t[:n]
+        return t, brightness
+
     def _migrate_manual_masks_to_session_timebase(
         self,
         exp_id: str,
@@ -1392,6 +1539,7 @@ class HabituationStore:
                     "analysis_cutoff_sec": self.session_analysis_cutoff_sec(summary.exp_id),
                     "do_not_use": self.is_session_do_not_use(summary.exp_id),
                     "deeplabcut_reference": self.is_deeplabcut_reference_session(summary.exp_id),
+                    "extra_large_calibration": self.session_extra_large_calibration(summary.exp_id),
                 }
                 for summary in analysis_sessions
             ],

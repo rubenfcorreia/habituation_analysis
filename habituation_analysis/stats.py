@@ -17,6 +17,7 @@ STATE_LABELS = ["small", "medium", "large", "extra_large", "not_visible"]
 STATE_COLORS = ["tab:green", "tab:purple", "tab:red", "tab:brown", "tab:gray"]
 MIN_EXTRA_LARGE_MISSING_SEC = 1.0
 MANUAL_INTERVAL_BUFFER_SEC = 1.0
+CALIBRATION_BRIGHTNESS_MARGIN = 0.10
 
 
 @dataclass
@@ -132,6 +133,112 @@ def _interval_mask(times: np.ndarray, intervals: list[tuple[float, float]] | Non
             continue
         mask[(times >= start - pad) & (times < end + pad)] = True
     return mask
+
+
+def _mask_to_intervals(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
+    times = np.asarray(times, dtype=float).reshape(-1)
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if times.size == 0 or mask.size == 0:
+        return []
+    n = min(times.size, mask.size)
+    times = times[:n]
+    mask = mask[:n]
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return []
+    split_points = np.where(np.diff(idx) > 1)[0] + 1
+    segments = np.split(idx, split_points)
+    finite_times = times[np.isfinite(times)]
+    step = float(np.nanmedian(np.diff(finite_times))) if finite_times.size > 1 else 0.0
+    if not np.isfinite(step) or step < 0.0:
+        step = 0.0
+    intervals: list[tuple[float, float]] = []
+    for segment in segments:
+        if segment.size == 0:
+            continue
+        start = float(times[segment[0]])
+        end = float(times[segment[-1]]) + step
+        intervals.append((start, end))
+    return intervals
+
+
+def _longest_interval(intervals: list[tuple[float, float]]) -> tuple[float, float] | None:
+    best: tuple[float, float] | None = None
+    best_duration = -np.inf
+    for start, end in intervals:
+        if end <= start:
+            continue
+        duration = float(end - start)
+        if duration > best_duration:
+            best = (float(start), float(end))
+            best_duration = duration
+    return best
+
+
+def suggest_extra_large_calibration(
+    times: np.ndarray,
+    radius: np.ndarray,
+    visible_mask: np.ndarray | None,
+    pupil_brightness: np.ndarray,
+    zscore_mean: float,
+    zscore_std: float,
+    threshold_values: list[float],
+    *,
+    margin_fraction: float = CALIBRATION_BRIGHTNESS_MARGIN,
+) -> dict | None:
+    times = np.asarray(times, dtype=float).reshape(-1)
+    radius = np.asarray(radius, dtype=float).reshape(-1)
+    pupil_brightness = np.asarray(pupil_brightness, dtype=float).reshape(-1)
+    if times.size == 0 or radius.size == 0 or pupil_brightness.size == 0:
+        return None
+    n = min(times.size, radius.size, pupil_brightness.size)
+    times = times[:n]
+    radius = radius[:n]
+    pupil_brightness = pupil_brightness[:n]
+    if visible_mask is None:
+        visible = np.isfinite(radius)
+    else:
+        visible = np.asarray(visible_mask, dtype=bool).reshape(-1)[:n]
+    thresholds = sorted([float(t) for t in threshold_values])
+    if len(thresholds) < 3:
+        return None
+    std = float(zscore_std)
+    if not np.isfinite(std) or std <= 0.0:
+        std = 1.0
+    z = (radius - float(zscore_mean)) / std
+    z[~np.isfinite(z)] = np.nan
+    base_mask = visible & np.isfinite(z)
+    candidate_source = "large"
+    candidate_mask = base_mask & (z >= thresholds[2])
+    if not np.any(candidate_mask):
+        finite_visible = base_mask
+        if not np.any(finite_visible):
+            return None
+        fallback = float(np.nanpercentile(z[finite_visible], 75.0))
+        if not np.isfinite(fallback):
+            return None
+        candidate_mask = finite_visible & (z >= fallback)
+        candidate_source = "upper_quartile"
+    intervals = _mask_to_intervals(times, candidate_mask)
+    interval = _longest_interval(intervals)
+    if interval is None:
+        return None
+    start, end = interval
+    cal_mask = (times >= start) & (times < end) & np.isfinite(pupil_brightness)
+    if not np.any(cal_mask):
+        return None
+    reference_mean = float(np.nanmean(pupil_brightness[cal_mask]))
+    if not np.isfinite(reference_mean):
+        return None
+    threshold = float(reference_mean * (1.0 + float(margin_fraction)))
+    return {
+        "interval": (float(start), float(end)),
+        "reference_mean": reference_mean,
+        "threshold": threshold,
+        "margin_fraction": float(margin_fraction),
+        "selected_frames": int(np.sum(cal_mask)),
+        "candidate_source": candidate_source,
+    }
 
 
 def _extra_large_missing_mask(
@@ -378,8 +485,18 @@ def compute_statistics(
         bundle = _trim_bundle_for_cutoff(store, store.load_session_bundle(summary.exp_id))
         manual_masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, manual_masks)
-        extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
         not_visible_mask = _interval_mask(np.asarray(bundle.t, dtype=float), manual_masks)
+
+        calibration = store.session_extra_large_calibration(summary.exp_id)
+        extra_large_mask = None
+        if calibration is not None:
+            brightness_t, brightness = store.load_pupil_brightness(summary.exp_id)
+            if brightness_t is not None and brightness is not None and brightness.size:
+                n = min(int(bundle.t.size), int(brightness.size))
+                if n > 0:
+                    extra_large_mask = visible[:n] & np.isfinite(brightness[:n]) & (brightness[:n] >= float(calibration["threshold"]))
+        if extra_large_mask is None:
+            extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
 
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
@@ -448,8 +565,19 @@ def compute_statistics(
         bundle = _trim_bundle_for_cutoff(store, store.load_session_bundle(summary.exp_id))
         manual_masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, manual_masks)
-        extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
         not_visible_mask = _interval_mask(np.asarray(bundle.t, dtype=float), manual_masks)
+
+        calibration = store.session_extra_large_calibration(summary.exp_id)
+        extra_large_mask = None
+        if calibration is not None:
+            brightness_t, brightness = store.load_pupil_brightness(summary.exp_id)
+            if brightness_t is not None and brightness is not None and brightness.size:
+                n = min(int(bundle.t.size), int(brightness.size))
+                if n > 0:
+                    extra_large_mask = visible[:n] & np.isfinite(brightness[:n]) & (brightness[:n] >= float(calibration["threshold"]))
+        if extra_large_mask is None:
+            extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
+
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
         state = classify_zscores(z, threshold_values, visible, extra_large_mask, not_visible_mask)
