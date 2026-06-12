@@ -2307,11 +2307,13 @@ class StatisticsTab(QWidget):
         if not animals:
             self._status_label.setText("No animals with analysis sessions were found.")
             return
+        if "All" not in animals:
+            animals.append("All")
         mode = self._ask_all_animals_mode()
         if mode is None:
             return
-        mode_label = "all animals" if mode == "all" else "animals without saved stats"
-        self._set_statistics_running(f"Running statistics for {len(animals)} animals ({mode_label})...")
+        mode_label = "all animals + overall" if mode == "all" else "animals without saved stats + overall"
+        self._set_statistics_running(f"Running statistics for {len(animals)} scopes ({mode_label})...")
         self._start_statistics_worker(self._build_all_statistics_job(animals, mode), self._on_batch_result)
 
     @staticmethod
@@ -2362,22 +2364,23 @@ class StatisticsTab(QWidget):
             for idx, animal in enumerate(animals):
                 percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = threshold_inputs[animal]
                 thresholds = self._threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec)
-                cached = load_cached_statistics_outputs(
-                    self.store,
-                    scope=animal,
-                    animal_id=animal,
-                    thresholds=thresholds,
-                )
-                if cached is not None and mode == "missing":
-                    result, result_paths = cached
-                    skipped.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
-                    progress_cb((idx + 1) / total, f"{animal}: cached statistics already exist")
-                    continue
-                if cached is not None:
-                    result, result_paths = cached
-                    outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
-                    progress_cb((idx + 1) / total, f"{animal}: loaded cached statistics")
-                    continue
+                if animal != "All":
+                    cached = load_cached_statistics_outputs(
+                        self.store,
+                        scope=animal,
+                        animal_id=animal,
+                        thresholds=thresholds,
+                    )
+                    if cached is not None and mode == "missing":
+                        result, result_paths = cached
+                        skipped.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
+                        progress_cb((idx + 1) / total, f"{animal}: cached statistics already exist")
+                        continue
+                    if cached is not None:
+                        result, result_paths = cached
+                        outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
+                        progress_cb((idx + 1) / total, f"{animal}: loaded cached statistics")
+                        continue
 
                 def animal_progress(fraction: float, message: str, *, idx=idx, animal=animal):
                     overall = (idx + float(fraction)) / total

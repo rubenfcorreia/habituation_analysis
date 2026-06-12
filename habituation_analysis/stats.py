@@ -13,7 +13,8 @@ from .data import HabituationStore, SessionBundle, analysis_cutoff_mask, apply_t
 from .plotting import save_figure, set_poster_style, style_axes
 
 
-STATE_LABELS = ["small", "medium", "large", "extra_large"]
+STATE_LABELS = ["small", "medium", "large", "extra_large", "not_visible"]
+STATE_COLORS = ["tab:green", "tab:purple", "tab:red", "tab:brown", "tab:gray"]
 MIN_EXTRA_LARGE_MISSING_SEC = 1.0
 MANUAL_INTERVAL_BUFFER_SEC = 1.0
 
@@ -66,6 +67,25 @@ class StatisticsResult:
         session_labels = list(data.get("session_labels", data.get("day_labels", [])))
         session_ids = list(data.get("session_ids", session_labels))
         eligible_session_ids = list(data.get("eligible_session_ids", session_ids))
+        state_count = len(STATE_LABELS)
+
+        def _state_map(raw: dict) -> dict[str, float]:
+            mapped = {str(label): float(raw.get(label, float("nan"))) for label in STATE_LABELS}
+            for key, value in dict(raw).items():
+                mapped.setdefault(str(key), float(value))
+            return mapped
+
+        def _pad_state_array(values) -> np.ndarray:
+            arr = np.asarray(values, dtype=float)
+            if arr.ndim != 2:
+                return np.full((state_count, 0), np.nan, dtype=float)
+            if arr.shape[0] == state_count:
+                return arr
+            padded = np.full((state_count, arr.shape[1]), np.nan, dtype=float)
+            rows = min(state_count, arr.shape[0])
+            padded[:rows, :arr.shape[1]] = arr[:rows, :]
+            return padded
+
         return cls(
             scope=str(data.get("scope", "")),
             animal_id=str(data.get("animal_id", "")),
@@ -75,19 +95,19 @@ class StatisticsResult:
             session_labels=session_labels,
             locomotion_pct_by_session={str(k): float(v) for k, v in dict(data.get("locomotion_pct_by_session", data.get("locomotion_pct_by_day", {}))).items()},
             face_motion_pct_by_session={str(k): float(v) for k, v in dict(data.get("face_motion_pct_by_session", data.get("face_motion_pct_by_day", {}))).items()},
-            face_motion_mean_by_state={str(k): float(v) for k, v in dict(data.get("face_motion_mean_by_state", {})).items()},
-            face_motion_std_by_state={str(k): float(v) for k, v in dict(data.get("face_motion_std_by_state", {})).items()},
+            face_motion_mean_by_state=_state_map(dict(data.get("face_motion_mean_by_state", {}))),
+            face_motion_std_by_state=_state_map(dict(data.get("face_motion_std_by_state", {}))),
             pupil_pct_by_session={
-                str(session): {str(label): float(val) for label, val in dict(label_dict).items()}
+                str(session): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
                 for session, label_dict in dict(data.get("pupil_pct_by_session", data.get("pupil_pct_by_day", {}))).items()
             },
             lag_by_session={
-                str(exp_id): {str(label): float(val) for label, val in dict(label_dict).items()}
+                str(exp_id): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
                 for exp_id, label_dict in dict(data.get("lag_by_session", {})).items()
             },
             progress_bins=np.asarray(data.get("progress_bins", []), dtype=float),
-            state_probability=np.asarray(data.get("state_probability", []), dtype=float),
-            state_probability_std=np.asarray(data.get("state_probability_std", []), dtype=float),
+            state_probability=_pad_state_array(data.get("state_probability", [])),
+            state_probability_std=_pad_state_array(data.get("state_probability_std", [])),
             thresholds=dict(data.get("thresholds", {})),
             zscore_mean=float(data.get("zscore_mean", 0.0)),
             zscore_std=float(data.get("zscore_std", 1.0)),
@@ -235,7 +255,7 @@ def classify_zscores(
     extra_large_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     thresholds = sorted([float(t) for t in thresholds])
-    state = np.full(z.shape, -1, dtype=int)
+    state = np.full(z.shape, 4, dtype=int)
     mask = np.isfinite(z)
     if visible_mask is not None:
         mask &= visible_mask
@@ -244,7 +264,7 @@ def classify_zscores(
     state[mask & (z >= thresholds[1]) & (z < thresholds[2])] = 2
     state[mask & (z >= thresholds[2])] = 3
     if extra_large_mask is not None:
-        state[np.asarray(extra_large_mask, dtype=bool) & (state < 0)] = 3
+        state[np.asarray(extra_large_mask, dtype=bool) & (state == 4)] = 4
     return state
 
 
@@ -414,9 +434,10 @@ def compute_statistics(
     }
 
     progress_bins = np.linspace(0, 100, 100, endpoint=False)
-    state_probability_sum = np.zeros((4, 100), dtype=float)
-    state_probability_sq_sum = np.zeros((4, 100), dtype=float)
-    state_probability_count = np.zeros((4, 100), dtype=float)
+    n_states = len(STATE_LABELS)
+    state_probability_sum = np.zeros((n_states, 100), dtype=float)
+    state_probability_sq_sum = np.zeros((n_states, 100), dtype=float)
+    state_probability_count = np.zeros((n_states, 100), dtype=float)
     for summary in eligible or sessions:
         bundle = _trim_bundle_for_cutoff(store, store.load_session_bundle(summary.exp_id))
         manual_masks = store.load_manual_masks(summary.exp_id)
@@ -434,7 +455,7 @@ def compute_statistics(
             valid = mask & (state >= 0)
             if not np.any(valid):
                 continue
-            for state_id in range(4):
+            for state_id in range(n_states):
                 fraction = float(np.mean(state[valid] == state_id))
                 if np.isfinite(fraction):
                     state_probability_sum[state_id, b] += fraction
@@ -443,13 +464,13 @@ def compute_statistics(
     state_probability = np.divide(
         state_probability_sum,
         state_probability_count,
-        out=np.full((4, 100), np.nan, dtype=float),
+        out=np.full((n_states, 100), np.nan, dtype=float),
         where=state_probability_count > 0,
     )
     state_probability_var = np.divide(
         state_probability_sq_sum,
         state_probability_count,
-        out=np.full((4, 100), np.nan, dtype=float),
+        out=np.full((n_states, 100), np.nan, dtype=float),
         where=state_probability_count > 0,
     ) - np.square(state_probability)
     state_probability_std = np.sqrt(np.clip(state_probability_var, 0.0, None))
@@ -502,7 +523,7 @@ def statistics_panel_paths(output_dir: Path) -> list[tuple[str, Path]]:
 def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
     sessions = result.session_labels
     x = np.arange(len(sessions))
-    colors = ["tab:green", "tab:purple", "tab:red", "tab:brown"]
+    colors = STATE_COLORS
     figures: list[Figure] = []
 
     fig = Figure(figsize=(10, 6), constrained_layout=True)
@@ -627,7 +648,7 @@ def save_statistics_outputs(store: HabituationStore, result: StatisticsResult) -
 
     ax = axes[3]
     bottom = np.zeros(len(sessions))
-    colors = ["tab:green", "tab:purple", "tab:red", "tab:brown"]
+    colors = STATE_COLORS
     for i, label in enumerate(STATE_LABELS):
         vals = [result.pupil_pct_by_session.get(session, {}).get(label, 0.0) for session in sessions]
         ax.bar(x, vals, bottom=bottom, label=label, color=colors[i])
@@ -640,7 +661,7 @@ def save_statistics_outputs(store: HabituationStore, result: StatisticsResult) -
     ax = axes[4]
     lag_labels = result.session_labels
     lag_x = np.arange(len(lag_labels))
-    lag_colors = ["tab:green", "tab:purple", "tab:red", "tab:brown"]
+    lag_colors = STATE_COLORS
     for i, label in enumerate(STATE_LABELS):
         lag_vals = [result.lag_by_session.get(exp_id, {}).get(label, np.nan) for exp_id in lag_labels]
         ax.plot(lag_x, lag_vals, marker="o", color=lag_colors[i], label=label)
