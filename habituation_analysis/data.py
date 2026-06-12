@@ -29,7 +29,8 @@ FACE_MOTION_CACHE_DIR = GUI_OUTPUT_ROOT / "face_motion_cache"
 STATS_DIR = GUI_OUTPUT_ROOT / "stats"
 APP_STATE_PATH = GUI_OUTPUT_ROOT / "app_state.json"
 
-CACHE_VERSION = 7
+CACHE_VERSION = 8
+STATISTICS_RESULTS_VERSION = 7
 MIN_ANALYSIS_SESSION_DURATION_SEC = 1800.0
 SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d+_[A-Za-z0-9]+$")
 
@@ -91,6 +92,39 @@ def _save_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(_jsonable(data), f, indent=2, sort_keys=True)
+
+
+def _coerce_optional_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(value) or value <= 0.0:
+        return None
+    return float(value)
+
+
+def analysis_cutoff_mask(times: np.ndarray, cutoff_sec: float | None) -> np.ndarray:
+    times = np.asarray(times, dtype=float)
+    if times.size == 0:
+        return np.zeros(0, dtype=bool)
+    cutoff = _coerce_optional_float(cutoff_sec)
+    if cutoff is None:
+        return np.ones(times.shape, dtype=bool)
+    return np.isfinite(times) & (times <= cutoff)
+
+
+def apply_time_mask(values, mask: np.ndarray):
+    arr = np.asarray(values)
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if arr.ndim == 0:
+        return arr
+    if arr.shape[0] == 0 or mask.size == 0:
+        return arr[:0]
+    n = min(arr.shape[0], mask.size)
+    return arr[:n][mask[:n]]
 
 
 def _load_pickle(path: Path):
@@ -197,6 +231,81 @@ def _video_time_axis(summary: SessionSummary, frame_count: int | None = None) ->
     if duration > 0:
         return np.linspace(0.0, duration, n, endpoint=False, dtype=float)
     return np.arange(n, dtype=float)
+
+
+def _load_timestamp_series(csv_path: Path | None) -> np.ndarray:
+    if csv_path is None or not csv_path.exists():
+        return np.array([], dtype=float)
+    try:
+        df = pd.read_csv(csv_path, usecols=["timestamp"])
+    except Exception:
+        return np.array([], dtype=float)
+    if "timestamp" not in df.columns or df.empty:
+        return np.array([], dtype=float)
+    timestamps = np.asarray(pd.to_numeric(df["timestamp"], errors="coerce"), dtype=float).reshape(-1)
+    timestamps = timestamps[np.isfinite(timestamps)]
+    if timestamps.size == 0:
+        return np.array([], dtype=float)
+    return timestamps.astype(float)
+
+
+def _resample_series_to_times(values, source_t: np.ndarray, target_t: np.ndarray):
+    values = np.asarray(values)
+    source_t = np.asarray(source_t, dtype=float).reshape(-1)
+    target_t = np.asarray(target_t, dtype=float).reshape(-1)
+    if target_t.size == 0:
+        return np.asarray(values[:0])
+    if values.size == 0:
+        return np.asarray(values[:0])
+    if values.shape[0] == target_t.size:
+        return np.asarray(values)
+    if source_t.size != values.shape[0]:
+        source_t = np.linspace(0.0, float(max(values.shape[0] - 1, 1)), values.shape[0], dtype=float)
+    finite = np.isfinite(source_t)
+    source_t = source_t[finite]
+    if source_t.size == 0:
+        return np.asarray(values[:0])
+    if values.ndim == 1:
+        series = np.asarray(values, dtype=float).reshape(-1)
+        series = series[finite]
+        if series.size == 0:
+            return np.zeros(target_t.shape, dtype=float)
+        if source_t.size == 1:
+            return np.full(target_t.shape, float(series[0]), dtype=float)
+        order = np.argsort(source_t)
+        source_t = source_t[order]
+        series = series[order]
+        unique_t, unique_idx = np.unique(source_t, return_index=True)
+        series = series[unique_idx]
+        if unique_t.size == 1:
+            return np.full(target_t.shape, float(series[0]), dtype=float)
+        return np.interp(target_t, unique_t, series, left=float(series[0]), right=float(series[-1])).astype(float)
+    flat = np.asarray(values, dtype=float).reshape(values.shape[0], -1)
+    flat = flat[finite]
+    if flat.size == 0:
+        return np.zeros((target_t.size,) + values.shape[1:], dtype=float)
+    if source_t.size == 1:
+        out = np.repeat(flat[:1], target_t.size, axis=0)
+        return out.reshape((target_t.size,) + values.shape[1:]).astype(float)
+    order = np.argsort(source_t)
+    source_t = source_t[order]
+    flat = flat[order]
+    unique_t, unique_idx = np.unique(source_t, return_index=True)
+    flat = flat[unique_idx]
+    if unique_t.size == 1:
+        out = np.repeat(flat[:1], target_t.size, axis=0)
+        return out.reshape((target_t.size,) + values.shape[1:]).astype(float)
+    out = np.empty((target_t.size, flat.shape[1]), dtype=float)
+    for i in range(flat.shape[1]):
+        out[:, i] = np.interp(target_t, unique_t, flat[:, i], left=float(flat[0, i]), right=float(flat[-1, i]))
+    return out.reshape((target_t.size,) + values.shape[1:]).astype(float)
+
+
+def _frame_time_axis(summary: SessionSummary, *, frame_count: int | None = None) -> np.ndarray:
+    csv_times = _load_timestamp_series(Path(summary.locomotion_csv) if summary.locomotion_csv else None)
+    if csv_times.size:
+        return csv_times
+    return _video_time_axis(summary, frame_count=frame_count)
 
 
 def _video_metadata(video_path: Path | None) -> dict:
@@ -548,23 +657,33 @@ class HabituationStore:
         path = self.session_state_path(exp_id)
         default = {
             "manual_masks": [],
+            "manual_masks_timebase": None,
             "last_stats_signature": "",
+            "last_stats_output_dir": "",
             "stats_dirty": True,
             "preprocessed": False,
             "deeplabcut_reference": False,
             "do_not_use": False,
+            "analysis_cutoff_sec": None,
+            "timebase_aligned": False,
             "threshold_signature": "",
         }
         state = _load_json(path, default)
         if not isinstance(state, dict):
             state = {}
         state.setdefault("manual_masks", [])
+        state.setdefault("manual_masks_timebase", None)
         state.setdefault("last_stats_signature", "")
+        state.setdefault("last_stats_output_dir", "")
         state.setdefault("stats_dirty", True)
         state.setdefault("preprocessed", False)
         state.setdefault("deeplabcut_reference", False)
         state.setdefault("do_not_use", False)
+        state.setdefault("analysis_cutoff_sec", None)
+        state.setdefault("timebase_aligned", False)
         state.setdefault("threshold_signature", "")
+        state["analysis_cutoff_sec"] = _coerce_optional_float(state.get("analysis_cutoff_sec"))
+        state["timebase_aligned"] = bool(state.get("timebase_aligned", False))
         forced_do_not_use = self.is_session_forced_do_not_use(exp_id)
         if forced_do_not_use and not state.get("do_not_use", False):
             state["do_not_use"] = True
@@ -592,6 +711,43 @@ class HabituationStore:
             return True
         state = self.load_session_state(exp_id)
         return bool(state.get("do_not_use", False))
+
+    def session_analysis_cutoff_sec(self, exp_id: str) -> float | None:
+        state = self.load_session_state(exp_id)
+        return _coerce_optional_float(state.get("analysis_cutoff_sec"))
+
+    def effective_session_duration_sec(self, exp_id: str) -> float:
+        summary = self.get_session_summary(exp_id)
+        if summary is None:
+            return 0.0
+        cutoff = self.session_analysis_cutoff_sec(exp_id)
+        if cutoff is None:
+            return float(summary.duration_sec)
+        video_duration = float(summary.video_duration_sec or 0.0)
+        if video_duration > 0.0:
+            return float(min(video_duration, cutoff))
+        return float(min(float(summary.duration_sec), cutoff))
+
+    def set_session_analysis_cutoff(self, exp_id: str, cutoff_sec: float | None) -> float | None:
+        state = self.load_session_state(exp_id)
+        normalized = _coerce_optional_float(cutoff_sec)
+        state["analysis_cutoff_sec"] = normalized
+        if normalized is not None:
+            state["timebase_aligned"] = True
+        self.save_session_state(exp_id, state)
+        self.mark_all_animals_stats_dirty()
+        return normalized
+
+    def is_session_timebase_aligned(self, exp_id: str) -> bool:
+        state = self.load_session_state(exp_id)
+        return bool(state.get("timebase_aligned", False))
+
+    def set_session_timebase_aligned(self, exp_id: str, aligned: bool) -> bool:
+        state = self.load_session_state(exp_id)
+        state["timebase_aligned"] = bool(aligned)
+        self.save_session_state(exp_id, state)
+        return bool(aligned)
+
 
     def deeplabcut_reference_sessions(self, animal_id: str | None = None) -> list[SessionSummary]:
         if animal_id is None or animal_id == "All":
@@ -656,6 +812,12 @@ class HabituationStore:
         if self.index is None:
             return None
         return self.index.session_by_id().get(exp_id)
+
+    def load_frame_timestamps(self, exp_id: str) -> np.ndarray:
+        summary = self.get_session_summary(exp_id)
+        if summary is None:
+            return np.array([], dtype=float)
+        return _frame_time_axis(summary, frame_count=summary.video_frame_count)
 
     def load_session_bundle(self, exp_id: str, *, force_rebuild: bool = False) -> SessionBundle:
         summary = self.get_session_summary(exp_id)
@@ -734,25 +896,45 @@ class HabituationStore:
         else:
             locomotion_t, _, wheel_pos, locomotion = wheel_trace
         frame_count = int(summary.video_frame_count or radius.shape[0] or 0)
-        frame_t = _video_time_axis(summary, frame_count=frame_count)
+        source_t = _video_time_axis(summary, frame_count=frame_count if frame_count > 0 else radius.shape[0])
+        frame_t = _load_timestamp_series(Path(summary.locomotion_csv) if summary.locomotion_csv else None)
+        if frame_t.size == 0 and radius.size:
+            frame_t = source_t[: radius.shape[0]] if source_t.size else np.arange(radius.shape[0], dtype=float)
         if frame_t.size == 0 and radius.size:
             frame_t = np.arange(radius.shape[0], dtype=float)
-        n = min(len(radius), len(frame_t))
-        if n <= 0:
+        if frame_t.size == 0:
             raise ValueError(f"No aligned samples found for {summary.exp_id}")
-        radius = radius[:n]
-        x = x[:n]
-        y = y[:n]
-        velocity = velocity[:n]
-        qc = qc[:n]
-        in_eye = in_eye[:n]
-        eye_lid_x = eye_lid_x[:n] if eye_lid_x.ndim >= 1 else eye_lid_x
-        eye_lid_y = eye_lid_y[:n] if eye_lid_y.ndim >= 1 else eye_lid_y
-        eyeX = eyeX[:n] if eyeX.ndim >= 1 else eyeX
-        eyeY = eyeY[:n] if eyeY.ndim >= 1 else eyeY
-        pupilX = pupilX[:n] if pupilX.ndim >= 1 else pupilX
-        pupilY = pupilY[:n] if pupilY.ndim >= 1 else pupilY
-        t = frame_t[:n]
+        if radius.size and frame_t.size != radius.size:
+            radius = _resample_series_to_times(radius, source_t, frame_t)
+            x = _resample_series_to_times(x, source_t, frame_t)
+            y = _resample_series_to_times(y, source_t, frame_t)
+            velocity = _resample_series_to_times(velocity, source_t, frame_t)
+            qc = _resample_series_to_times(qc, source_t, frame_t)
+            in_eye = _resample_series_to_times(in_eye.astype(float), source_t, frame_t) > 0.5
+            eye_lid_x = _resample_series_to_times(eye_lid_x, source_t, frame_t)
+            eye_lid_y = _resample_series_to_times(eye_lid_y, source_t, frame_t)
+            eyeX = _resample_series_to_times(eyeX, source_t, frame_t)
+            eyeY = _resample_series_to_times(eyeY, source_t, frame_t)
+            pupilX = _resample_series_to_times(pupilX, source_t, frame_t)
+            pupilY = _resample_series_to_times(pupilY, source_t, frame_t)
+        else:
+            n = min(len(radius), len(frame_t))
+            if n <= 0:
+                raise ValueError(f"No aligned samples found for {summary.exp_id}")
+            radius = radius[:n]
+            x = x[:n]
+            y = y[:n]
+            velocity = velocity[:n]
+            qc = qc[:n]
+            in_eye = in_eye[:n]
+            eye_lid_x = eye_lid_x[:n] if eye_lid_x.ndim >= 1 else eye_lid_x
+            eye_lid_y = eye_lid_y[:n] if eye_lid_y.ndim >= 1 else eye_lid_y
+            eyeX = eyeX[:n] if eyeX.ndim >= 1 else eyeX
+            eyeY = eyeY[:n] if eyeY.ndim >= 1 else eyeY
+            pupilX = pupilX[:n] if pupilX.ndim >= 1 else pupilX
+            pupilY = pupilY[:n] if pupilY.ndim >= 1 else pupilY
+            frame_t = frame_t[:n]
+        t = np.asarray(frame_t, dtype=float)
 
         bundle = SessionBundle(
             summary=summary,
@@ -996,6 +1178,40 @@ class HabituationStore:
             t = t[:n]
         return t, motion
 
+    def _migrate_manual_masks_to_session_timebase(
+        self,
+        exp_id: str,
+        masks: list[tuple[float, float]],
+        *,
+        summary: SessionSummary | None = None,
+    ) -> list[tuple[float, float]] | None:
+        summary = summary or self.get_session_summary(exp_id)
+        if summary is None or not summary.has_right_video:
+            return None
+        video_duration = float(summary.video_duration_sec or 0.0)
+        if video_duration <= 0.0:
+            return None
+        try:
+            bundle = self.load_session_bundle(exp_id)
+        except Exception:
+            bundle = None
+        if bundle is not None and bundle.t.size:
+            new_start = float(bundle.t[0])
+            new_end = float(bundle.t[-1])
+        else:
+            new_start = 0.0
+            new_end = float(summary.duration_sec)
+        if not np.isfinite(new_end) or new_end <= new_start:
+            return None
+        span = float(new_end - new_start)
+        scale = span / video_duration
+        migrated = []
+        for start, end in masks:
+            if end <= start:
+                continue
+            migrated.append((float(new_start + start * scale), float(new_start + end * scale)))
+        return migrated
+
     def load_manual_masks(self, exp_id: str) -> list[tuple[float, float]]:
         state = self.load_session_state(exp_id)
         masks = []
@@ -1006,11 +1222,23 @@ class HabituationStore:
                     masks.append((start, end))
             except Exception:
                 continue
+        timebase = state.get("manual_masks_timebase")
+        if masks and timebase != "session" and bool(state.get("timebase_aligned", False)):
+            migrated = self._migrate_manual_masks_to_session_timebase(exp_id, masks)
+            if migrated is not None:
+                state["manual_masks"] = [[float(s), float(e)] for s, e in migrated]
+                state["manual_masks_timebase"] = "session"
+                state["stats_dirty"] = True
+                state["last_stats_signature"] = ""
+                self.save_session_state(exp_id, state)
+                self.mark_stats_dirty()
+                return migrated
         return masks
 
     def save_manual_masks(self, exp_id: str, intervals: list[tuple[float, float]], *, mark_dirty: bool = True) -> None:
         state = self.load_session_state(exp_id)
         state["manual_masks"] = [[float(s), float(e)] for s, e in sorted(intervals)]
+        state["manual_masks_timebase"] = "session"
         if mark_dirty:
             state["stats_dirty"] = True
             state["last_stats_signature"] = ""
@@ -1138,6 +1366,37 @@ class HabituationStore:
             "zscore_mean": float(zscore_mean),
             "zscore_std": float(zscore_std),
             "cache_version": self.source_version,
+        }
+        return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+    def statistics_cache_signature(self, scope: str, animal_id: str, thresholds: dict) -> str:
+        if scope == "All" or animal_id == "All":
+            sessions = self.dataset_sessions()
+        else:
+            sessions = self.sessions_for_animal(animal_id)
+        analysis_sessions = [
+            summary
+            for summary in sessions
+            if summary.has_right_pickle and not self.is_deeplabcut_reference_session(summary.exp_id) and not self.is_session_do_not_use(summary.exp_id)
+        ]
+        payload = {
+            "scope": scope,
+            "animal_id": animal_id,
+            "thresholds": thresholds,
+            "sessions": [
+                {
+                    "exp_id": summary.exp_id,
+                    "source_signature": self._current_source_signature(summary),
+                    "manual_masks_hash": self.session_masks_hash(summary.exp_id),
+                    "analysis_cutoff_sec": self.session_analysis_cutoff_sec(summary.exp_id),
+                    "do_not_use": self.is_session_do_not_use(summary.exp_id),
+                    "deeplabcut_reference": self.is_deeplabcut_reference_session(summary.exp_id),
+                }
+                for summary in analysis_sessions
+            ],
+            "cache_version": self.source_version,
+            "statistics_results_version": STATISTICS_RESULTS_VERSION,
         }
         return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 

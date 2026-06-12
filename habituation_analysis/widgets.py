@@ -194,8 +194,8 @@ class VideoPlayerWidget(QWidget):
             self._fps = fps
         self._apply_playback_speed()
         frame_count = int(self._capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if frame_count <= 0 and self.timestamps.size:
-            frame_count = int(self.timestamps.size)
+        if self.timestamps.size:
+            frame_count = int(self.timestamps.size) if frame_count <= 0 else min(frame_count, int(self.timestamps.size))
         self.slider.setEnabled(True)
         self.slider.setMaximum(max(0, frame_count - 1))
         self._frame_index = 0
@@ -354,15 +354,16 @@ class TracePanZoomCanvas(FigureCanvas):
     """Matplotlib canvas with shared x-axis zoom and drag-pan support."""
 
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(10, 9.1), constrained_layout=True)
-        grid = self.figure.add_gridspec(3, 1, height_ratios=[3.5, 2.45, 0.55])
+        self.figure = Figure(figsize=(10, 11.0), constrained_layout=True)
+        grid = self.figure.add_gridspec(4, 1, height_ratios=[3.5, 2.2, 1.35, 0.55])
         self.pupil_ax = self.figure.add_subplot(grid[0])
         self.loc_ax = self.figure.add_subplot(grid[1], sharex=self.pupil_ax)
-        self.lock_ax = self.figure.add_subplot(grid[2], sharex=self.pupil_ax)
+        self.face_ax = self.figure.add_subplot(grid[2], sharex=self.pupil_ax)
+        self.lock_ax = self.figure.add_subplot(grid[3], sharex=self.pupil_ax)
         super().__init__(self.figure)
         self.setParent(parent)
 
-        self._trace_axes = (self.pupil_ax, self.loc_ax, self.lock_ax)
+        self._trace_axes = (self.pupil_ax, self.loc_ax, self.face_ax, self.lock_ax)
         self._data_xlim: tuple[float, float] | None = None
         self._view_xlim: tuple[float, float] | None = None
         self._min_span = 1e-3

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable
@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .data import HabituationStore, SessionSummary
+from .data import HabituationStore, SessionSummary, analysis_cutoff_mask, apply_time_mask
 from .plotting import style_axes
 from .stats import (
     STATE_LABELS,
@@ -46,9 +46,11 @@ from .stats import (
     animal_zscores,
     compute_animal_baseline,
     compute_statistics,
+    load_cached_statistics_outputs,
     percentile_from_value,
     percentile_threshold_values,
     save_statistics_outputs,
+    statistics_panel_paths,
 )
 from .widgets import DraggableHLine, TracePanZoomCanvas, VideoPlayerWidget
 
@@ -72,6 +74,8 @@ class LoadedSession:
     wheel_pos: np.ndarray
     locomotion: np.ndarray
     locomotion_t: np.ndarray
+    face_motion: np.ndarray
+    face_motion_t: np.ndarray
     eye_lid_x: np.ndarray
     eye_lid_y: np.ndarray
     eyeX: np.ndarray
@@ -122,6 +126,65 @@ class TaskThread(QtCore.QThread):
             self.error.emit(traceback.format_exc())
             return
         self.result_ready.emit(result)
+
+
+class ScrollableComboBox(QComboBox):
+    def __init__(self, parent=None, *, visible_rows: int = 4):
+        super().__init__(parent)
+        self._visible_rows = max(1, int(visible_rows))
+
+    def showPopup(self):
+        super().showPopup()
+        QtCore.QTimer.singleShot(0, self._fit_popup_to_window)
+
+    def _fit_popup_to_window(self):
+        view = self.view()
+        popup = view.window()
+        if popup is None or self.count() <= 0:
+            return
+
+        rows = min(self._visible_rows, self.count())
+        row_height = max(view.sizeHintForRow(0), self.fontMetrics().height() + 8)
+        frame = max(0, popup.frameGeometry().height() - view.geometry().height())
+        desired_height = rows * row_height + frame + 6
+        desired_width = max(self.width(), view.sizeHintForColumn(0) + 32)
+
+        window = self.window()
+        if window is not None:
+            bounds = window.frameGeometry()
+        else:
+            screen = QtGui.QGuiApplication.screenAt(self.mapToGlobal(QtCore.QPoint(0, self.height())))
+            if screen is None:
+                screen = QtGui.QGuiApplication.primaryScreen()
+            bounds = screen.availableGeometry() if screen is not None else QtCore.QRect()
+
+        combo_top_left = self.mapToGlobal(QtCore.QPoint(0, 0))
+        combo_bottom_left = self.mapToGlobal(QtCore.QPoint(0, self.height()))
+        space_below = max(0, bounds.bottom() - combo_bottom_left.y())
+        space_above = max(0, combo_top_left.y() - bounds.top())
+        height = min(desired_height, max(space_below, space_above))
+        if height <= 0:
+            return
+
+        if space_below >= space_above:
+            y = combo_bottom_left.y()
+        else:
+            y = combo_top_left.y() - height
+
+        width = min(desired_width, max(1, bounds.width()))
+        x = combo_top_left.x()
+        max_x = bounds.right() - width + 1
+        if x > max_x:
+            x = max(bounds.left(), max_x)
+        if x < bounds.left():
+            x = bounds.left()
+        if y + height > bounds.bottom() + 1:
+            y = max(bounds.top(), bounds.bottom() - height + 1)
+        if y < bounds.top():
+            y = bounds.top()
+
+        popup.setGeometry(x, y, width, height)
+        popup.raise_()
 
 
 class TraceCanvas(TracePanZoomCanvas):
@@ -334,8 +397,18 @@ class ExperimentIndexTab(QWidget):
                         color = QtGui.QColor("#666666")
                 child = QTreeWidgetItem([summary.exp_id, status])
                 child.setData(0, Qt.UserRole, {"kind": "session", "animal_id": animal, "exp_id": summary.exp_id})
-                child.setToolTip(0, summary.exp_id)
-                child.setToolTip(1, status)
+                cutoff = self.store.session_analysis_cutoff_sec(summary.exp_id)
+                usable_duration = self.store.effective_session_duration_sec(summary.exp_id)
+                tooltip_lines = [
+                    summary.exp_id,
+                    f"Status: {status}",
+                    f"Usable duration: {format_seconds(usable_duration)}",
+                ]
+                if cutoff is not None:
+                    tooltip_lines.append(f"Cutoff: {format_seconds(cutoff)}")
+                tooltip_text = "\n".join(tooltip_lines)
+                child.setToolTip(0, tooltip_text)
+                child.setToolTip(1, tooltip_text)
                 if checked and not reference and not do_not_use:
                     font = child.font(0)
                     font.setBold(True)
@@ -556,6 +629,10 @@ class MetricsTab(QWidget):
         self.timebase_warning.setWordWrap(True)
         self.timebase_warning.setStyleSheet("color: #b26a00; font-weight: 600;")
         self.timebase_warning.setVisible(False)
+        self.movie_locomotion_warning = QLabel("")
+        self.movie_locomotion_warning.setWordWrap(True)
+        self.movie_locomotion_warning.setStyleSheet("color: #7a4a00; font-weight: 600;")
+        self.movie_locomotion_warning.setVisible(False)
 
         self.canvas = TraceCanvas(self)
         self.canvas.set_pan_blocker(self._should_block_trace_pan)
@@ -597,6 +674,19 @@ class MetricsTab(QWidget):
         self.reference_check = QCheckBox("Add for DLC model", self)
         self.reference_check.toggled.connect(self._on_reference_toggled)
         self.reference_check.setToolTip("Mark this expID for DLC model use. This is independent of not-visible pupil intervals.")
+
+        self.timebase_aligned_check = QCheckBox("Posteriorly aligned", self)
+        self.timebase_aligned_check.toggled.connect(self._on_timebase_aligned_toggled)
+        self.timebase_aligned_check.setToolTip(
+            "Mark sessions whose timebase was aligned after acquisition. This changes the warning wording but does not hide it."
+        )
+
+        self.cutoff_btn = QPushButton("Set cutoff", self)
+        self.cutoff_btn.clicked.connect(self._set_cutoff_from_current_time)
+        self.clear_cutoff_btn = QPushButton("Clear cutoff", self)
+        self.clear_cutoff_btn.clicked.connect(self._clear_cutoff)
+        self.cutoff_label = QLabel("Cutoff: none", self)
+        self.cutoff_label.setWordWrap(True)
 
         self.threshold_group = QGroupBox("Pupil thresholds (shared percentiles)", self)
         threshold_layout = QGridLayout(self.threshold_group)
@@ -663,6 +753,7 @@ class MetricsTab(QWidget):
         metrics_summary_layout.addWidget(self._scope_label)
         metrics_summary_layout.addWidget(self._session_label)
         metrics_summary_layout.addWidget(self.timebase_warning)
+        metrics_summary_layout.addWidget(self.movie_locomotion_warning)
         metrics_summary_layout.addWidget(self._baseline_label)
         metrics_summary_layout.addWidget(self._dirty_label)
         metrics_summary_layout.addWidget(self.threshold_group)
@@ -687,7 +778,14 @@ class MetricsTab(QWidget):
         reference_layout.addWidget(self.do_not_use_check)
         reference_layout.addWidget(self.preprocessed_check)
         reference_layout.addWidget(self.reference_check)
-        reference_hint = QLabel("Mark this session as excluded from statistics or as a manual reference for DeeplabCut training.", self.reference_group)
+        reference_layout.addWidget(self.timebase_aligned_check)
+        cutoff_row = QHBoxLayout()
+        cutoff_row.addWidget(self.cutoff_btn)
+        cutoff_row.addWidget(self.clear_cutoff_btn)
+        cutoff_row.addStretch(1)
+        reference_layout.addLayout(cutoff_row)
+        reference_layout.addWidget(self.cutoff_label)
+        reference_hint = QLabel("Mark this session as excluded from statistics, cut it shorter, or flag it as a manual reference for DeeplabCut training.", self.reference_group)
         reference_hint.setWordWrap(True)
         reference_hint.setStyleSheet("color: #666666; font-size: 11px;")
         reference_layout.addWidget(reference_hint)
@@ -786,6 +884,8 @@ class MetricsTab(QWidget):
         self._refresh_do_not_use_checkbox()
         self._refresh_preprocessed_checkbox()
         self._refresh_reference_checkbox()
+        self._refresh_timebase_aligned_checkbox()
+        self._refresh_cutoff_controls()
         self._draw_plots()
         self._update_video()
         self._update_dirty_label()
@@ -820,7 +920,15 @@ class MetricsTab(QWidget):
             self.preprocessed_check.setEnabled(False)
         if hasattr(self, "reference_check"):
             self.reference_check.setEnabled(False)
+        if hasattr(self, "timebase_aligned_check"):
+            self.timebase_aligned_check.setEnabled(False)
+        if hasattr(self, "cutoff_btn"):
+            self.cutoff_btn.setEnabled(False)
+        if hasattr(self, "clear_cutoff_btn"):
+            self.clear_cutoff_btn.setEnabled(False)
         self._update_timebase_warning(None, None)
+        self.movie_locomotion_warning.setText("")
+        self.movie_locomotion_warning.setVisible(False)
         self._current_session = None
         self._current_payload = None
         self._clear_threshold_lines()
@@ -828,14 +936,17 @@ class MetricsTab(QWidget):
         self._clear_cursor_lines()
         pupil_ax = self.canvas.pupil_ax
         loc_ax = self.canvas.loc_ax
+        face_ax = self.canvas.face_ax
         lock_ax = self.canvas.lock_ax
         pupil_ax.clear()
         loc_ax.clear()
+        face_ax.clear()
         lock_ax.clear()
         style_axes(pupil_ax, title="Pupil dynamics", ylabel="z-scored radius")
         style_axes(loc_ax, title="Locomotion", ylabel="Wheel speed")
+        style_axes(face_ax, title="Face motion", ylabel="Motion")
         style_axes(lock_ax, title="Lock state", xlabel="Time (s)", ylabel="Lock state")
-        for ax in (pupil_ax, loc_ax, lock_ax):
+        for ax in (pupil_ax, loc_ax, face_ax, lock_ax):
             ax.text(
                 0.5,
                 0.5,
@@ -893,7 +1004,13 @@ class MetricsTab(QWidget):
             f"Pupil baseline mean={self._zscore_mean:.3f}, std={self._zscore_std:.3f}"
         )
         if self.view_mode == "Session" and self.exp_id:
-            self._session_label.setText(f"Focused expID: {self.exp_id}")
+            cutoff = self.store.session_analysis_cutoff_sec(self.exp_id)
+            label_bits = [f"Focused expID: {self.exp_id}"]
+            if cutoff is not None:
+                label_bits.append(f"Cutoff: {format_seconds(cutoff)}")
+            if self.store.is_session_timebase_aligned(self.exp_id):
+                label_bits.append("Posteriorly aligned")
+            self._session_label.setText(" | ".join(label_bits))
         elif self.animal_id == "All":
             self._session_label.setText("Cohort-wide overview")
         else:
@@ -1052,22 +1169,61 @@ class MetricsTab(QWidget):
             self.timebase_warning.setVisible(False)
             return
         video_duration = float(summary.video_duration_sec or 0.0)
-        locomotion_duration = float(payload.locomotion_t[-1]) if payload.locomotion_t.size else 0.0
-        if not summary.has_right_video or video_duration <= 0.0 or locomotion_duration <= 0.0:
+        session_duration = float(payload.t[-1]) if payload.t.size else 0.0
+        if not summary.has_right_video or video_duration <= 0.0 or session_duration <= 0.0:
             self.timebase_warning.setText("")
             self.timebase_warning.setVisible(False)
             return
-        diff = abs(video_duration - locomotion_duration)
+        diff = abs(video_duration - session_duration)
         if diff > 5.0:
-            shorter = "video" if video_duration < locomotion_duration else "locomotion"
-            self.timebase_warning.setText(
-                f"Timebase mismatch: video {video_duration:.1f} s vs locomotion {locomotion_duration:.1f} s. "
-                f"The {shorter} is shorter; the full CSV locomotion timeline is kept."
-            )
+            aligned = self.store.is_session_timebase_aligned(summary.exp_id)
+            if aligned:
+                self.timebase_warning.setText(
+                    f"Posteriorly aligned timebase mismatch: video {video_duration:.1f} s vs session clock {session_duration:.1f} s. "
+                    f"This expID was resampled after acquisition, so the session clock is kept even though the raw video duration differs."
+                )
+            else:
+                shorter = "video" if video_duration < session_duration else "CSV session clock"
+                self.timebase_warning.setText(
+                    f"Timebase mismatch: video {video_duration:.1f} s vs session clock {session_duration:.1f} s. "
+                    f"The {shorter} is shorter; the CSV session clock is kept."
+                )
             self.timebase_warning.setVisible(True)
         else:
             self.timebase_warning.setText("")
             self.timebase_warning.setVisible(False)
+
+
+    def _update_movie_locomotion_warning(self, summary: SessionSummary | None, payload: LoadedSession | None):
+        if not hasattr(self, "movie_locomotion_warning"):
+            return
+        if self.view_mode != "Session" or summary is None or payload is None:
+            self.movie_locomotion_warning.setText("")
+            self.movie_locomotion_warning.setVisible(False)
+            return
+        video_duration = float(summary.video_duration_sec or 0.0)
+        locomotion_duration = float(payload.locomotion_t[-1]) if payload.locomotion_t.size else 0.0
+        if not summary.has_right_video or video_duration <= 0.0 or locomotion_duration <= 0.0:
+            self.movie_locomotion_warning.setText("")
+            self.movie_locomotion_warning.setVisible(False)
+            return
+        diff = abs(video_duration - locomotion_duration)
+        if diff > 5.0:
+            if self.store.is_session_timebase_aligned(summary.exp_id):
+                self.movie_locomotion_warning.setText(
+                    f"Movie / locomotion mismatch: the right video ends at {video_duration:.1f} s, while the locomotion trace spans {locomotion_duration:.1f} s. "
+                    f"This session was aligned after acquisition, so the movie is shown on the session clock and the full locomotion trace is kept."
+                )
+            else:
+                longer = "locomotion trace" if locomotion_duration > video_duration else "movie"
+                self.movie_locomotion_warning.setText(
+                    f"Movie / locomotion mismatch: the right video ends at {video_duration:.1f} s, while the locomotion trace spans {locomotion_duration:.1f} s. "
+                    f"The {longer} is longer; the raw movie and locomotion timeline are not the same length."
+                )
+            self.movie_locomotion_warning.setVisible(True)
+        else:
+            self.movie_locomotion_warning.setText("")
+            self.movie_locomotion_warning.setVisible(False)
 
     def _on_percentile_changed(self, idx: int, value: float):
         if self._updating_controls:
@@ -1220,6 +1376,27 @@ class MetricsTab(QWidget):
             tip = "Mark this expID for DLC model use."
         self.reference_check.setToolTip(tip)
 
+    def _refresh_timebase_aligned_checkbox(self):
+        if not hasattr(self, "timebase_aligned_check"):
+            return
+        if self.view_mode != "Session" or not self.exp_id:
+            self.timebase_aligned_check.blockSignals(True)
+            self.timebase_aligned_check.setChecked(False)
+            self.timebase_aligned_check.blockSignals(False)
+            self.timebase_aligned_check.setEnabled(False)
+            self.timebase_aligned_check.setToolTip("Available only for a specific expID.")
+            return
+        aligned = self.store.is_session_timebase_aligned(self.exp_id)
+        self.timebase_aligned_check.blockSignals(True)
+        self.timebase_aligned_check.setChecked(aligned)
+        self.timebase_aligned_check.blockSignals(False)
+        self.timebase_aligned_check.setEnabled(True)
+        if aligned:
+            tip = "This expID was aligned after acquisition, so the warning uses the posteriorly aligned wording."
+        else:
+            tip = "Mark this expID if its timebase was aligned after acquisition."
+        self.timebase_aligned_check.setToolTip(tip)
+
     def _on_do_not_use_toggled(self, checked: bool):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
@@ -1240,6 +1417,89 @@ class MetricsTab(QWidget):
         self.store.set_session_deeplabcut_reference(self.exp_id, bool(checked))
         self._refresh_reference_checkbox()
         self.session_state_changed.emit()
+
+    def _on_timebase_aligned_toggled(self, checked: bool):
+        if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
+            return
+        self.store.set_session_timebase_aligned(self.exp_id, bool(checked))
+        self._refresh_timebase_aligned_checkbox()
+        self._update_timebase_warning(self._current_session, self._current_payload)
+        self.session_state_changed.emit()
+
+    def _session_cutoff_text(self, cutoff_sec: float | None) -> str:
+        if cutoff_sec is None:
+            return "Cutoff: none"
+        return f"Cutoff: {format_seconds(cutoff_sec)}"
+
+    def _refresh_cutoff_controls(self):
+        if not hasattr(self, "cutoff_btn"):
+            return
+        if self.view_mode != "Session" or not self.exp_id:
+            self.cutoff_btn.setEnabled(False)
+            self.clear_cutoff_btn.setEnabled(False)
+            self.cutoff_label.setText("Cutoff: unavailable")
+            self.cutoff_btn.setToolTip("Available only for a specific expID with video data.")
+            self.clear_cutoff_btn.setToolTip("Available only for a specific expID.")
+            return
+        summary = self.store.get_session_summary(self.exp_id)
+        cutoff = self.store.session_analysis_cutoff_sec(self.exp_id)
+        has_video = bool(summary and summary.has_right_video and summary.right_video and Path(summary.right_video).exists())
+        self.cutoff_btn.setEnabled(has_video)
+        self.clear_cutoff_btn.setEnabled(cutoff is not None)
+        self.cutoff_label.setText(self._session_cutoff_text(cutoff))
+        if has_video:
+            self.cutoff_btn.setToolTip("Store the current video time as the analysis cutoff for this session.")
+        else:
+            self.cutoff_btn.setToolTip("This session has no right-eye video available to use as a cutoff source.")
+        if cutoff is None:
+            self.clear_cutoff_btn.setToolTip("No cutoff is set for this session.")
+        else:
+            self.clear_cutoff_btn.setToolTip("Remove the analysis cutoff and restore the full session.")
+
+    def _set_cutoff_from_current_time(self):
+        if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
+            return
+        cutoff = self.video_widget.current_time()
+        self.store.set_session_analysis_cutoff(self.exp_id, cutoff)
+        self.refresh()
+
+    def _clear_cutoff(self):
+        if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
+            return
+        self.store.set_session_analysis_cutoff(self.exp_id, None)
+        self.refresh()
+
+    def _analysis_payload(self, payload: LoadedSession, summary: SessionSummary | None = None) -> LoadedSession:
+        summary = summary or payload.summary
+        cutoff = self.store.session_analysis_cutoff_sec(summary.exp_id)
+        if cutoff is None:
+            return payload
+        frame_mask = analysis_cutoff_mask(payload.t, cutoff)
+        locomotion_mask = analysis_cutoff_mask(payload.locomotion_t, cutoff)
+        brake_mask = analysis_cutoff_mask(payload.brake_t, cutoff)
+        return replace(
+            payload,
+            t=apply_time_mask(payload.t, frame_mask),
+            radius=apply_time_mask(payload.radius, frame_mask),
+            x=apply_time_mask(payload.x, frame_mask),
+            y=apply_time_mask(payload.y, frame_mask),
+            velocity=apply_time_mask(payload.velocity, frame_mask),
+            qc=apply_time_mask(payload.qc, frame_mask),
+            in_eye=apply_time_mask(payload.in_eye, frame_mask),
+            brake_raw=apply_time_mask(payload.brake_raw, brake_mask),
+            brake_t=apply_time_mask(payload.brake_t, brake_mask),
+            wheel_pos=apply_time_mask(payload.wheel_pos, locomotion_mask),
+            locomotion=apply_time_mask(payload.locomotion, locomotion_mask),
+            locomotion_t=apply_time_mask(payload.locomotion_t, locomotion_mask),
+            face_motion=apply_time_mask(payload.face_motion, frame_mask),
+            face_motion_t=apply_time_mask(payload.face_motion_t, frame_mask),
+            eye_lid_x=apply_time_mask(payload.eye_lid_x, frame_mask),
+            eye_lid_y=apply_time_mask(payload.eye_lid_y, frame_mask),
+            eyeX=apply_time_mask(payload.eyeX, frame_mask),
+            eyeY=apply_time_mask(payload.eyeY, frame_mask),
+            pupilX=apply_time_mask(payload.pupilX, frame_mask),
+            pupilY=apply_time_mask(payload.pupilY, frame_mask),
+        )
 
     def _reset_trace_zoom_view(self):
         self._reset_trace_view_pending = True
@@ -1296,6 +1556,9 @@ class MetricsTab(QWidget):
         self._reset_trace_view_pending = False
 
     def _video_time_axis(self, summary: SessionSummary, frame_count: int | None = None) -> np.ndarray:
+        timestamps = self.store.load_frame_timestamps(summary.exp_id)
+        if timestamps.size:
+            return np.asarray(timestamps, dtype=float)
         n = int(frame_count if frame_count is not None else (summary.video_frame_count or 0))
         if n <= 0 and summary.video_duration_sec and summary.video_fps:
             n = int(round(float(summary.video_duration_sec) * float(summary.video_fps)))
@@ -1311,6 +1574,10 @@ class MetricsTab(QWidget):
     def _load_session_payload(self, summary: SessionSummary) -> LoadedSession:
         try:
             bundle = self.store.load_session_bundle(summary.exp_id)
+            face_motion_t, face_motion = self.store.load_face_motion(summary.exp_id)
+            if face_motion_t is None or face_motion is None:
+                face_motion_t = np.array([], dtype=float)
+                face_motion = np.array([], dtype=float)
             return LoadedSession(
                 summary=summary,
                 t=np.asarray(bundle.t, dtype=float),
@@ -1325,6 +1592,8 @@ class MetricsTab(QWidget):
                 wheel_pos=np.asarray(bundle.wheel_pos, dtype=float),
                 locomotion=np.asarray(bundle.locomotion, dtype=float),
                 locomotion_t=np.asarray(bundle.locomotion_t, dtype=float),
+                face_motion=np.asarray(face_motion, dtype=float),
+                face_motion_t=np.asarray(face_motion_t, dtype=float),
                 eye_lid_x=np.asarray(bundle.eye_lid_x, dtype=float),
                 eye_lid_y=np.asarray(bundle.eye_lid_y, dtype=float),
                 eyeX=np.asarray(bundle.eyeX, dtype=float),
@@ -1349,6 +1618,8 @@ class MetricsTab(QWidget):
             frame_t = self._video_time_axis(summary, frame_count=summary.video_frame_count)
             if frame_t.size == 0 and locomotion_t.size:
                 frame_t = np.asarray(locomotion_t, dtype=float)
+            face_motion_t = np.array([], dtype=float)
+            face_motion = np.array([], dtype=float)
             return LoadedSession(
                 summary=summary,
                 t=np.asarray(frame_t, dtype=float),
@@ -1363,6 +1634,8 @@ class MetricsTab(QWidget):
                 wheel_pos=np.asarray(wheel_pos, dtype=float),
                 locomotion=np.asarray(locomotion, dtype=float),
                 locomotion_t=np.asarray(locomotion_t, dtype=float),
+                face_motion=np.array([], dtype=float),
+                face_motion_t=np.array([], dtype=float),
                 eye_lid_x=np.array([], dtype=float),
                 eye_lid_y=np.array([], dtype=float),
                 eyeX=np.array([], dtype=float),
@@ -1373,21 +1646,23 @@ class MetricsTab(QWidget):
                 has_pupil=False,
             )
 
-    def _build_scope_trace(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[tuple[float, float, str]], list[str]]:
+    def _build_scope_trace(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[tuple[float, float, str]], list[str]]:
         if not self._scope_sessions:
             empty = np.array([], dtype=float)
-            return empty, empty, empty, empty, empty, empty, [], []
+            return empty, empty, empty, empty, empty, empty, empty, empty, [], []
         pupil_t_parts: list[np.ndarray] = []
         z_parts: list[np.ndarray] = []
         loc_t_parts: list[np.ndarray] = []
         loc_parts: list[np.ndarray] = []
+        face_t_parts: list[np.ndarray] = []
+        face_parts: list[np.ndarray] = []
         lock_t_parts: list[np.ndarray] = []
         lock_parts: list[np.ndarray] = []
         spans: list[tuple[float, float, str]] = []
         labels: list[str] = []
         offset = 0.0
         for summary in self._scope_sessions:
-            payload = self._load_session_payload(summary)
+            payload = self._analysis_payload(self._load_session_payload(summary), summary)
             labels.append(summary.exp_id)
             if payload.t.size == 0 and payload.locomotion_t.size == 0 and payload.brake_t.size == 0:
                 continue
@@ -1396,6 +1671,8 @@ class MetricsTab(QWidget):
             lock_t = np.asarray(payload.brake_t, dtype=float)
             radius = np.asarray(payload.radius, dtype=float)
             locomotion = np.asarray(payload.locomotion, dtype=float)
+            face_t = np.asarray(payload.face_motion_t, dtype=float)
+            face_motion = np.asarray(payload.face_motion, dtype=float)
             lock_state = np.asarray(payload.brake_raw, dtype=float)
             if radius.size:
                 n = min(pupil_t.size, radius.size)
@@ -1416,6 +1693,13 @@ class MetricsTab(QWidget):
             else:
                 loc_t = np.array([], dtype=float)
                 locomotion = np.array([], dtype=float)
+            if face_motion.size and face_t.size:
+                f = min(face_t.size, face_motion.size)
+                face_t = face_t[:f]
+                face_motion = face_motion[:f]
+            else:
+                face_t = np.array([], dtype=float)
+                face_motion = np.array([], dtype=float)
             if lock_state.size and lock_t.size:
                 k = min(lock_t.size, lock_state.size)
                 lock_t = lock_t[:k]
@@ -1425,16 +1709,20 @@ class MetricsTab(QWidget):
                 lock_state = np.array([], dtype=float)
             pupil_t_shift = pupil_t + offset
             loc_t_shift = loc_t + offset
+            face_t_shift = face_t + offset
             lock_t_shift = lock_t + offset
             pupil_t_parts.append(pupil_t_shift)
             z_parts.append(z)
             if loc_t_shift.size:
                 loc_t_parts.append(loc_t_shift)
                 loc_parts.append(locomotion)
+            if face_t_shift.size:
+                face_t_parts.append(face_t_shift)
+                face_parts.append(face_motion)
             if lock_t_shift.size:
                 lock_t_parts.append(lock_t_shift)
                 lock_parts.append(lock_state)
-            session_duration = float(summary.duration_sec)
+            session_duration = float(self.store.effective_session_duration_sec(summary.exp_id))
             if session_duration <= 0.0:
                 session_duration = max(
                     float(pupil_t[-1]) if pupil_t.size else 0.0,
@@ -1443,16 +1731,18 @@ class MetricsTab(QWidget):
                 )
             spans.append((float(offset), float(offset + session_duration), summary.exp_id))
             offset += session_duration + 30.0
-        if not pupil_t_parts and not loc_t_parts and not lock_t_parts:
+        if not pupil_t_parts and not loc_t_parts and not face_t_parts and not lock_t_parts:
             empty = np.array([], dtype=float)
-            return empty, empty, empty, empty, empty, empty, spans, labels
+            return empty, empty, empty, empty, empty, empty, empty, empty, spans, labels
         pupil_t_out = np.concatenate(pupil_t_parts) if pupil_t_parts else np.array([], dtype=float)
         z_out = np.concatenate(z_parts) if z_parts else np.array([], dtype=float)
         loc_t_out = np.concatenate(loc_t_parts) if loc_t_parts else np.array([], dtype=float)
         loc_out = np.concatenate(loc_parts) if loc_parts else np.array([], dtype=float)
+        face_t_out = np.concatenate(face_t_parts) if face_t_parts else np.array([], dtype=float)
+        face_out = np.concatenate(face_parts) if face_parts else np.array([], dtype=float)
         lock_t_out = np.concatenate(lock_t_parts) if lock_t_parts else np.array([], dtype=float)
         lock_out = np.concatenate(lock_parts) if lock_parts else np.array([], dtype=float)
-        return pupil_t_out, z_out, loc_t_out, loc_out, lock_t_out, lock_out, spans, labels
+        return pupil_t_out, z_out, loc_t_out, loc_out, face_t_out, face_out, lock_t_out, lock_out, spans, labels
 
     def _clear_cursor_lines(self):
         for line in self._cursor_lines:
@@ -1500,12 +1790,15 @@ class MetricsTab(QWidget):
         self._clear_cursor_lines()
         pupil_ax = self.canvas.pupil_ax
         loc_ax = self.canvas.loc_ax
+        face_ax = self.canvas.face_ax
         lock_ax = self.canvas.lock_ax
         pupil_ax.clear()
         loc_ax.clear()
+        face_ax.clear()
         lock_ax.clear()
         style_axes(pupil_ax, title="Pupil dynamics", ylabel="z-scored radius")
         style_axes(loc_ax, title="Locomotion", ylabel="Wheel speed")
+        style_axes(face_ax, title="Face motion", ylabel="Motion")
         style_axes(lock_ax, title="Lock state", xlabel="Time (s)", ylabel="Lock state")
         if not self._metrics_available():
             self._show_unavailable_state()
@@ -1519,8 +1812,9 @@ class MetricsTab(QWidget):
                 self.canvas.draw_idle()
                 return
             self._current_session = summary
-            payload = self._load_session_payload(summary)
-            self._current_payload = payload
+            raw_payload = self._load_session_payload(summary)
+            self._current_payload = raw_payload
+            payload = self._analysis_payload(raw_payload, summary)
             if payload.has_pupil and payload.radius.size:
                 z = (payload.radius.astype(float) - self._zscore_mean) / self._zscore_std
                 visible = payload.visible_mask_base
@@ -1567,17 +1861,26 @@ class MetricsTab(QWidget):
                 loc_ax.axhline(loc_thr, color="tab:red", linestyle="--", linewidth=1.5, label="threshold")
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data", transform=loc_ax.transAxes, ha="center", va="center")
+            if payload.face_motion.size:
+                face_t = np.asarray(payload.face_motion_t, dtype=float)
+                face_n = min(face_t.size, payload.face_motion.size)
+                if face_n:
+                    face_ax.plot(face_t[:face_n], payload.face_motion[:face_n], color="tab:purple", linewidth=1.2, label="face motion")
+            else:
+                face_ax.text(0.5, 0.5, "No face motion data", transform=face_ax.transAxes, ha="center", va="center")
             self._plot_lock_state(lock_ax, np.asarray(payload.brake_t, dtype=float), np.asarray(payload.brake_raw, dtype=float))
             pupil_ax.set_title(f"Pupil dynamics - {summary.exp_id}", pad=10)
             loc_ax.set_title(f"Locomotion - {summary.exp_id}", pad=10)
+            face_ax.set_title(f"Face motion - {summary.exp_id}", pad=10)
             lock_ax.set_title(f"Lock state - {summary.exp_id}", pad=10)
             self._update_timebase_warning(summary, payload)
+            self._update_movie_locomotion_warning(summary, payload)
             if self.timebase_warning.isVisible() and payload.t.size:
                 video_end = float(payload.t[-1])
-                for ax in (pupil_ax, loc_ax, lock_ax):
-                    ax.axvline(video_end, color="0.45", linestyle="--", linewidth=1.1, alpha=0.8, label="video end")
+                for ax in (pupil_ax, loc_ax, face_ax, lock_ax):
+                    ax.axvline(video_end, color="0.45", linestyle="--", linewidth=1.1, alpha=0.8, label="session end")
             if payload.t.size:
-                self._make_cursor_lines(pupil_ax, loc_ax, lock_ax)
+                self._make_cursor_lines(pupil_ax, loc_ax, face_ax, lock_ax)
                 self._set_cursor_position(float(payload.t[0]))
             if payload.has_pupil and payload.radius.size:
                 self._make_threshold_lines(pupil_ax)
@@ -1585,7 +1888,7 @@ class MetricsTab(QWidget):
                 self._threshold_lines = []
             bounds = self._trace_bounds_from_arrays(payload.t, payload.locomotion_t, payload.brake_t)
         else:
-            pupil_t, z, loc_t, loc, lock_t, lock, spans, labels = self._build_scope_trace()
+            pupil_t, z, loc_t, loc, face_t, face, lock_t, lock, spans, labels = self._build_scope_trace()
             if pupil_t.size and z.size:
                 pupil_ax.plot(pupil_t[: z.size], z, color="black", linewidth=1.2)
             else:
@@ -1594,6 +1897,10 @@ class MetricsTab(QWidget):
                 loc_ax.plot(loc_t[: loc.size], loc, color="tab:blue", linewidth=1.2)
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data to display", transform=loc_ax.transAxes, ha="center", va="center")
+            if face_t.size and face.size:
+                face_ax.plot(face_t[: face.size], face, color="tab:purple", linewidth=1.1)
+            else:
+                face_ax.text(0.5, 0.5, "No face motion data to display", transform=face_ax.transAxes, ha="center", va="center")
             self._plot_lock_state(lock_ax, lock_t, lock)
             for start_t, end_t, label in spans:
                 pupil_ax.axvline(start_t, color="0.65", linestyle=":", linewidth=0.8)
@@ -1603,13 +1910,16 @@ class MetricsTab(QWidget):
                     pupil_ax.text(start_t, 0.98, label, transform=pupil_ax.get_xaxis_transform(), rotation=90, fontsize=8, va="top")
             pupil_ax.set_title(f"Pupil dynamics - {self.animal_id} overall", pad=10)
             loc_ax.set_title(f"Locomotion - {self.animal_id} overall", pad=10)
+            face_ax.set_title(f"Face motion - {self.animal_id} overall", pad=10)
             lock_ax.set_title(f"Lock state - {self.animal_id} overall", pad=10)
             self._update_timebase_warning(None, None)
+            self._update_movie_locomotion_warning(None, None)
             self._make_threshold_lines(pupil_ax)
-            bounds = self._trace_bounds_from_arrays(pupil_t, loc_t, lock_t)
+            bounds = self._trace_bounds_from_arrays(pupil_t, loc_t, face_t, lock_t)
 
         self._refresh_axis_legend(pupil_ax)
         self._refresh_axis_legend(loc_ax)
+        self._refresh_axis_legend(face_ax)
         self._refresh_axis_legend(lock_ax)
         self._apply_trace_bounds(bounds)
         self.canvas.draw_idle()
@@ -1628,15 +1938,18 @@ class MetricsTab(QWidget):
             self.interval_list.clear()
             self.video_time_label.setText("Current video time: --")
             self._clear_cursor_lines()
+            self._update_movie_locomotion_warning(None, None)
             return
         summary = self.store.get_session_summary(self.exp_id)
         if summary is None:
             self.video_widget.set_video(None, None)
             self.mask_group.setEnabled(False)
             self._clear_cursor_lines()
+            self._update_movie_locomotion_warning(None, None)
             return
-        payload = self._current_payload if self._current_payload and self._current_payload.summary.exp_id == summary.exp_id else self._load_session_payload(summary)
-        self._current_payload = payload
+        raw_payload = self._current_payload if self._current_payload and self._current_payload.summary.exp_id == summary.exp_id else self._load_session_payload(summary)
+        self._current_payload = raw_payload
+        payload = self._analysis_payload(raw_payload, summary)
         if summary.has_right_video and summary.right_video and Path(summary.right_video).exists():
             self.video_widget.set_video(summary.right_video, payload.t, overlay=payload.video_overlay())
             self.mask_group.setEnabled(bool(payload.has_pupil))
@@ -1646,6 +1959,7 @@ class MetricsTab(QWidget):
             self.video_widget.set_video(None, None)
             self.mask_group.setEnabled(False)
             self._clear_cursor_lines()
+        self._update_movie_locomotion_warning(summary, payload)
 
     def _refresh_interval_list(self):
         self.interval_list.clear()
@@ -1717,35 +2031,75 @@ class StatisticsTab(QWidget):
         self._prompted_for_entry = False
         self._current_result = None
         self._current_paths: tuple[Path, Path, Path] | None = None
+        self._plot_pages: list[tuple[str, Path]] = []
+        self._plot_index = 0
         self._scope_label = QLabel("Statistics are not running yet.", self)
         self._scope_label.setWordWrap(True)
         self._status_label = QLabel("Open this tab to run or review statistics.", self)
         self._status_label.setWordWrap(True)
         self._paths_label = QLabel("", self)
         self._paths_label.setWordWrap(True)
+        self._current_figure_pixmap = QtGui.QPixmap()
+        self.log_toggle = QCheckBox("Show log window", self)
+        self.log_toggle.setChecked(True)
+        self.log_toggle.toggled.connect(self._set_log_visible)
+        self.log_toggle.setToolTip("Show or hide the statistics log and file paths.")
+
         self.summary_edit = QPlainTextEdit(self)
         self.summary_edit.setReadOnly(True)
         self.summary_edit.setPlaceholderText("Statistics output will appear here after the analysis runs.")
         self.summary_edit.setMinimumHeight(220)
 
+        self.log_panel = QWidget(self)
+        log_layout = QVBoxLayout(self.log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(self._paths_label)
+        log_layout.addWidget(self.summary_edit, stretch=1)
+
+        self._plot_title_label = QLabel("No plot selected.", self)
+        self._plot_title_label.setAlignment(Qt.AlignCenter)
+        self._plot_title_label.setWordWrap(True)
         self.figure_label = QLabel("No statistics figure yet.", self)
-        self.figure_label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self.figure_label.setAlignment(Qt.AlignCenter)
         self.figure_label.setMinimumSize(0, 0)
         self.figure_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.figure_scroll = QScrollArea(self)
         self.figure_scroll.setWidgetResizable(True)
         self.figure_scroll.setWidget(self.figure_label)
+        self._plot_prev_button = QToolButton(self)
+        self._plot_prev_button.setArrowType(Qt.LeftArrow)
+        self._plot_prev_button.clicked.connect(lambda: self._step_plot(-1))
+        self._plot_next_button = QToolButton(self)
+        self._plot_next_button.setArrowType(Qt.RightArrow)
+        self._plot_next_button.clicked.connect(lambda: self._step_plot(1))
+        self._plot_counter_label = QLabel("", self)
+        self._plot_counter_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.run_button = QPushButton("Run statistics now", self)
         self.run_button.clicked.connect(self.run_current_scope)
+        self.run_all_button = QPushButton("Run all animals", self)
+        self.run_all_button.clicked.connect(self.run_all_animals)
+        self.run_all_button.setToolTip("Run statistics separately for every animal in the dataset.")
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.run_button)
+        button_row.addWidget(self.run_all_button)
+        button_row.addStretch(1)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._scope_label)
         layout.addWidget(self._status_label)
-        layout.addWidget(self.run_button)
-        layout.addWidget(self._paths_label)
-        layout.addWidget(self.summary_edit, stretch=1)
+        layout.addLayout(button_row)
+        layout.addWidget(self.log_toggle, alignment=Qt.AlignLeft)
+        layout.addWidget(self.log_panel, stretch=1)
+        layout.addWidget(self._plot_title_label)
         layout.addWidget(self.figure_scroll, stretch=2)
+        plot_nav = QHBoxLayout()
+        plot_nav.addWidget(self._plot_prev_button)
+        plot_nav.addWidget(self._plot_next_button)
+        plot_nav.addStretch(1)
+        plot_nav.addWidget(self._plot_counter_label)
+        layout.addLayout(plot_nav)
 
     def set_context(self, animal_id: str, view_mode: str):
         changed = animal_id != self.animal_id or view_mode != self.view_mode
@@ -1754,16 +2108,136 @@ class StatisticsTab(QWidget):
         self._scope_label.setText(f"Statistics scope: {animal_id} | View: {view_mode}")
         if changed:
             self._prompted_for_entry = False
-            self._set_placeholder(f"Statistics for {animal_id} are not running yet.")
+            self._set_placeholder(f"Loading statistics for {animal_id}...")
+            QApplication.processEvents()
+            if self._show_cached_statistics_for_context():
+                self._prompted_for_entry = True
+            else:
+                self._set_placeholder(f"Statistics for {animal_id} are not running yet.")
 
     def _set_placeholder(self, message: str):
         self._status_label.setText(message)
         self.summary_edit.setPlainText(message)
-        self.figure_label.setText("No statistics figure yet.")
-        self.figure_label.setPixmap(QtGui.QPixmap())
         self._paths_label.setText("")
         self._current_result = None
         self._current_paths = None
+        self._set_plot_pages([])
+
+    def _set_log_visible(self, visible: bool):
+        self.log_panel.setVisible(bool(visible))
+
+    def _set_plot_pages(self, pages: list[tuple[str, Path]]):
+        self._plot_pages = [(title, Path(path)) for title, path in pages if Path(path).exists()]
+        self._plot_index = 0
+        self._show_current_plot_page()
+
+    def _load_plot_pages_from_output_dir(self, output_dir: Path):
+        pages: list[tuple[str, Path]] = []
+        for title, path in statistics_panel_paths(output_dir):
+            path = Path(path)
+            if path.exists():
+                pages.append((title, path))
+        if not pages:
+            summary_path = Path(output_dir) / "statistics_summary.png"
+            if summary_path.exists():
+                pages.append(("Statistics summary", summary_path))
+        self._set_plot_pages(pages)
+
+    def _show_current_plot_page(self):
+        if not self._plot_pages:
+            self._plot_title_label.setText("No plot selected.")
+            self._plot_counter_label.setText("")
+            self.figure_label.setText("No statistics figure yet.")
+            self.figure_label.setPixmap(QtGui.QPixmap())
+            self._current_figure_pixmap = QtGui.QPixmap()
+            self._update_plot_controls()
+            return
+        title, path = self._plot_pages[self._plot_index]
+        pixmap = QtGui.QPixmap(str(path))
+        if pixmap.isNull():
+            self._plot_title_label.setText(title)
+            self._plot_counter_label.setText("")
+            self.figure_label.setText("Statistics figure could not be loaded.")
+            self.figure_label.setPixmap(QtGui.QPixmap())
+            self._current_figure_pixmap = QtGui.QPixmap()
+            self._update_plot_controls()
+            return
+        self._plot_title_label.setText(title)
+        self._current_figure_pixmap = QtGui.QPixmap(pixmap)
+        self.figure_label.setText("")
+        self._refresh_figure_preview()
+        self._update_plot_controls()
+
+    def _update_plot_controls(self):
+        enabled = len(self._plot_pages) > 1
+        self._plot_prev_button.setEnabled(enabled)
+        self._plot_next_button.setEnabled(enabled)
+        if self._plot_pages:
+            self._plot_counter_label.setText(f"{self._plot_index + 1}/{len(self._plot_pages)}")
+        else:
+            self._plot_counter_label.setText("")
+
+    def _step_plot(self, delta: int):
+        if not self._plot_pages:
+            return
+        self._plot_index = (self._plot_index + int(delta)) % len(self._plot_pages)
+        self._show_current_plot_page()
+
+    def _display_statistics_payload(self, payload: dict, *, status_prefix: str | None = None):
+        result = payload["result"]
+        result_path, svg_path, png_path = payload["paths"]
+        self._current_result = result
+        self._current_paths = (result_path, svg_path, png_path)
+        self.store.clear_animal_dirty(result.animal_id)
+        prefix = status_prefix or ("Loaded cached statistics for" if payload.get("cached") else "Statistics complete for")
+        self._status_label.setText(f"{prefix} {result.scope} / {result.animal_id}")
+        self._paths_label.setText(f"Saved: {result_path}\nSVG: {svg_path}\nPNG: {png_path}")
+        self.summary_edit.setPlainText(self._format_result_text(result))
+        self._load_plot_pages_from_output_dir(Path(result_path).parent)
+
+    def _show_cached_statistics_for_context(self) -> bool:
+        if self._worker is not None and self._worker.isRunning():
+            return False
+        scope = self.animal_id
+        thresholds = self._threshold_payload(*self._threshold_inputs_for_animal(scope))
+        cached = load_cached_statistics_outputs(
+            self.store,
+            scope=scope,
+            animal_id=scope,
+            thresholds=thresholds,
+        )
+        if cached is None:
+            return False
+        result, result_paths = cached
+        self._display_statistics_payload({"result": result, "paths": result_paths, "cached": True})
+        return True
+
+
+    def _set_figure_preview(self, pixmap: QtGui.QPixmap):
+        self._current_figure_pixmap = QtGui.QPixmap(pixmap)
+        self._refresh_figure_preview()
+
+    def _refresh_figure_preview(self):
+        if self._current_figure_pixmap.isNull():
+            return
+        viewport = self.figure_scroll.viewport()
+        if viewport is None:
+            self.figure_label.setPixmap(self._current_figure_pixmap)
+            return
+        target = viewport.size()
+        if target.width() <= 0 or target.height() <= 0:
+            self.figure_label.setPixmap(self._current_figure_pixmap)
+            return
+        scaled = self._current_figure_pixmap.scaled(
+            target,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.figure_label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_figure_preview()
 
     def maybe_prompt_and_run(self):
         if self._worker is not None and self._worker.isRunning():
@@ -1784,22 +2258,85 @@ class StatisticsTab(QWidget):
         if answer == QMessageBox.Yes:
             self.run_current_scope()
 
+    def _set_statistics_running(self, message: str):
+        self._status_label.setText(message)
+        self.run_button.setEnabled(False)
+        self.run_all_button.setEnabled(False)
+
+    def _finish_statistics_run(self):
+        self.run_button.setEnabled(True)
+        self.run_all_button.setEnabled(True)
+        self._worker = None
+
+    def _start_statistics_worker(self, job, on_result):
+        self._worker = TaskThread(job, self)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.result_ready.connect(on_result)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _ask_all_animals_mode(self) -> str | None:
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return "all"
+        box = QMessageBox(self)
+        box.setWindowTitle("Run all animals")
+        box.setText("Do you want to run statistics for all animals or only the ones without saved stats?")
+        all_button = box.addButton("All animals", QMessageBox.AcceptRole)
+        missing_button = box.addButton("Only missing stats", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(all_button)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked == all_button:
+            return "all"
+        if clicked == missing_button:
+            return "missing"
+        return None
+
     def run_current_scope(self):
         if self._worker is not None and self._worker.isRunning():
             return
         scope = self.animal_id
-        self._status_label.setText(f"Running statistics for {scope}...")
-        self.run_button.setEnabled(False)
-        self._worker = TaskThread(self._build_statistics_job(scope), self)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.result_ready.connect(self._on_result)
-        self._worker.error.connect(self._on_error)
-        self._worker.start()
+        self._set_statistics_running(f"Running statistics for {scope}...")
+        self._start_statistics_worker(self._build_statistics_job(scope), self._on_result)
+
+    def run_all_animals(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        animals = self._analysis_animals()
+        if not animals:
+            self._status_label.setText("No animals with analysis sessions were found.")
+            return
+        mode = self._ask_all_animals_mode()
+        if mode is None:
+            return
+        mode_label = "all animals" if mode == "all" else "animals without saved stats"
+        self._set_statistics_running(f"Running statistics for {len(animals)} animals ({mode_label})...")
+        self._start_statistics_worker(self._build_all_statistics_job(animals, mode), self._on_batch_result)
+
+    @staticmethod
+    def _threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec) -> dict:
+        return {
+            "percentiles": [float(v) for v in percentiles],
+            "threshold_values": [float(v) for v in threshold_values],
+            "locomotion_threshold": float(locomotion_threshold),
+            "missing_buffer_sec": float(missing_buffer_sec),
+        }
 
     def _build_statistics_job(self, scope: str):
-        percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = self._current_threshold_inputs()
+        percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = self._threshold_inputs_for_animal(scope)
+        thresholds = self._threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec)
 
         def job(progress_cb):
+            cached = load_cached_statistics_outputs(
+                self.store,
+                scope=scope,
+                animal_id=scope,
+                thresholds=thresholds,
+            )
+            if cached is not None:
+                result, result_paths = cached
+                return {"result": result, "paths": result_paths, "cached": True}
             result = compute_statistics(
                 self.store,
                 scope=scope,
@@ -1811,11 +2348,68 @@ class StatisticsTab(QWidget):
                 progress_cb=progress_cb,
             )
             result_paths = save_statistics_outputs(self.store, result)
-            return {"result": result, "paths": result_paths}
+            return {"result": result, "paths": result_paths, "cached": False}
 
         return job
 
-    def _current_threshold_inputs(self):
+    def _build_all_statistics_job(self, animals: list[str], mode: str):
+        threshold_inputs = {animal: self._threshold_inputs_for_animal(animal) for animal in animals}
+
+        def job(progress_cb):
+            outputs = []
+            skipped = []
+            total = max(1, len(animals))
+            for idx, animal in enumerate(animals):
+                percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = threshold_inputs[animal]
+                thresholds = self._threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec)
+                cached = load_cached_statistics_outputs(
+                    self.store,
+                    scope=animal,
+                    animal_id=animal,
+                    thresholds=thresholds,
+                )
+                if cached is not None and mode == "missing":
+                    result, result_paths = cached
+                    skipped.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
+                    progress_cb((idx + 1) / total, f"{animal}: cached statistics already exist")
+                    continue
+                if cached is not None:
+                    result, result_paths = cached
+                    outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
+                    progress_cb((idx + 1) / total, f"{animal}: loaded cached statistics")
+                    continue
+
+                def animal_progress(fraction: float, message: str, *, idx=idx, animal=animal):
+                    overall = (idx + float(fraction)) / total
+                    progress_cb(overall, f"{animal}: {message}")
+
+                result = compute_statistics(
+                    self.store,
+                    scope=animal,
+                    animal_id=animal,
+                    percentiles=percentiles,
+                    threshold_values=threshold_values,
+                    locomotion_threshold=locomotion_threshold,
+                    missing_buffer_sec=missing_buffer_sec,
+                    progress_cb=animal_progress,
+                )
+                result_paths = save_statistics_outputs(self.store, result)
+                outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": False})
+            return {"mode": "all_animals", "selection_mode": mode, "results": outputs, "skipped": skipped}
+
+        return job
+
+    def _analysis_animals(self) -> list[str]:
+        animals = []
+        for animal in self.store.animals():
+            if any(
+                s.has_right_pickle and not self.store.is_deeplabcut_reference_session(s.exp_id) and not self.store.is_session_do_not_use(s.exp_id)
+                for s in self.store.sessions_for_animal(animal)
+            ):
+                animals.append(animal)
+        return animals
+
+    def _threshold_inputs_for_animal(self, animal_id: str):
         global_percentiles = self.store.global_pupil_percentile_cutoffs()
         locomotion_threshold = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
         missing_buffer_sec = float(self.store.global_pupil_missing_buffer_sec())
@@ -1825,7 +2419,7 @@ class StatisticsTab(QWidget):
             if (
                 metrics is not None
                 and metrics._metrics_available()
-                and metrics.animal_id == self.animal_id
+                and metrics.animal_id == animal_id
                 and metrics._percentile_cutoffs
                 and metrics._threshold_values
             ):
@@ -1836,7 +2430,7 @@ class StatisticsTab(QWidget):
                     float(metrics.missing_buffer_spin.value()),
                 )
 
-        if self.animal_id == "All":
+        if animal_id == "All":
             mean, std = compute_animal_baseline(self.store, "All", scope="All")
             zmap = animal_zscores(self.store, "All", mean=mean, std=std)
             pooled = [values[np.isfinite(values)] for values in zmap.values() if np.any(np.isfinite(values))]
@@ -1844,26 +2438,29 @@ class StatisticsTab(QWidget):
             threshold_values = percentile_threshold_values(distribution, global_percentiles) if distribution.size else [0.0, 0.0, 0.0]
             return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
 
-        settings = self.store.get_animal_settings(self.animal_id)
+        settings = self.store.get_animal_settings(animal_id)
         threshold_values = settings.get("threshold_values", [0.0, 0.5, 1.0])
         threshold_signature = str(settings.get("threshold_signature", ""))
         global_signature = self.store.pupil_percentile_signature(global_percentiles)
         if not isinstance(threshold_values, list) or len(threshold_values) != 3 or threshold_signature != global_signature:
-            mean, std = compute_animal_baseline(self.store, self.animal_id)
-            zmap = animal_zscores(self.store, self.animal_id, mean=mean, std=std)
+            mean, std = compute_animal_baseline(self.store, animal_id)
+            zmap = animal_zscores(self.store, animal_id, mean=mean, std=std)
             pooled = [values[np.isfinite(values)] for values in zmap.values() if np.any(np.isfinite(values))]
             distribution = np.concatenate(pooled) if pooled else np.array([], dtype=float)
             threshold_values = percentile_threshold_values(distribution, global_percentiles) if distribution.size else [0.0, 0.0, 0.0]
             settings["threshold_values"] = [float(v) for v in threshold_values]
             settings["threshold_signature"] = global_signature
-            self.store.set_animal_settings(self.animal_id, settings)
+            self.store.set_animal_settings(animal_id, settings)
         return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
+
+    def _current_threshold_inputs(self):
+        return self._threshold_inputs_for_animal(self.animal_id)
 
     def _on_progress(self, fraction: float, message: str):
         self._status_label.setText(f"{message} ({fraction * 100.0:.0f}%)")
 
     def _on_error(self, message: str):
-        self.run_button.setEnabled(True)
+        self._finish_statistics_run()
         self._status_label.setText("Statistics failed.")
         self._set_message_box_error(message)
 
@@ -1874,50 +2471,114 @@ class StatisticsTab(QWidget):
         QMessageBox.critical(self, "Statistics error", message)
 
     def _on_result(self, payload: dict):
-        self.run_button.setEnabled(True)
-        result = payload["result"]
-        result_path, svg_path, png_path = payload["paths"]
-        self._current_result = result
-        self._current_paths = (result_path, svg_path, png_path)
-        self.store.clear_animal_dirty(self.animal_id)
-        self._status_label.setText(f"Statistics complete for {result.scope} / {result.animal_id}")
-        self._paths_label.setText(f"Saved: {result_path}\nSVG: {svg_path}\nPNG: {png_path}")
-        self.summary_edit.setPlainText(self._format_result_text(result))
-        pixmap = QtGui.QPixmap(str(png_path))
-        if not pixmap.isNull():
-            self.figure_label.setPixmap(pixmap)
-            self.figure_label.setText("")
+        self._finish_statistics_run()
+        self._display_statistics_payload(payload)
+    def _on_batch_result(self, payload: dict):
+        self._finish_statistics_run()
+        results = payload.get("results", [])
+        skipped = payload.get("skipped", [])
+        if not results and not skipped:
+            self._status_label.setText("No batch statistics were generated.")
+            self.summary_edit.setPlainText("No batch statistics were generated.")
+            self._paths_label.setText("")
+            self._set_plot_pages([])
+            self._current_result = None
+            self._current_paths = None
+            return
+        for item in results + skipped:
+            self.store.clear_animal_dirty(item["animal_id"])
+        if results:
+            loaded_count = sum(1 for item in results if item.get("cached"))
+            computed_count = len(results) - loaded_count
+            skipped_count = len(skipped)
+            status_bits = []
+            if computed_count:
+                status_bits.append(f"{computed_count} computed")
+            if loaded_count:
+                status_bits.append(f"{loaded_count} loaded from cache")
+            if skipped_count:
+                status_bits.append(f"{skipped_count} skipped because cached stats already exist")
+            extra = f" ({'; '.join(status_bits)})" if status_bits else ""
+            self._status_label.setText(f"Batch statistics complete for {len(results)} animals{extra}.")
         else:
-            self.figure_label.setText("Statistics figure could not be loaded.")
-        self.figure_label.adjustSize()
+            self._status_label.setText(f"No animals needed rerun; {len(skipped)} cached stats were already up to date.")
 
+        active_items = results + skipped
+        matching_item = next((item for item in active_items if item["animal_id"] == self.animal_id), None)
+        if matching_item is None and self.animal_id == "All":
+            matching_item = next((item for item in active_items if item["result"].scope == "All"), None)
+        if matching_item is None and active_items:
+            matching_item = active_items[0]
+        if matching_item is None:
+            return
+        self._display_statistics_payload(
+            {"result": matching_item["result"], "paths": matching_item["paths"], "cached": matching_item.get("cached", False)}
+        )
+        if len(active_items) > 1:
+            batch_text = self._format_batch_result_text(payload, active_items, matching_item)
+            self.summary_edit.setPlainText(batch_text)
     def _format_result_text(self, result) -> str:
         lines = [
             f"Scope: {result.scope}",
             f"Animal: {result.animal_id}",
             f"Generated at: {result.generated_at}",
             f"Sessions: {len(result.session_ids)}",
-            f"Eligible sessions (>30 min video): {len(result.eligible_session_ids)}",
+            f"Eligible sessions (>30 min usable duration): {len(result.eligible_session_ids)}",
             f"Baseline mean/std: {result.zscore_mean:.4f} / {result.zscore_std:.4f}",
             f"Thresholds: percentiles={result.thresholds.get('percentiles', [])} | values={result.thresholds.get('threshold_values', [])}",
             f"Locomotion threshold: {result.thresholds.get('locomotion_threshold', float('nan'))}",
             f"Missing pupil buffer: {result.thresholds.get('missing_buffer_sec', float('nan')):.2f} s",
             "",
-            "Day-wise locomotion fraction:",
+            "Session-wise locomotion fraction:",
         ]
-        for day in result.day_labels:
-            lines.append(f"  {day}: {result.locomotion_pct_by_day.get(day, float('nan')):.4f}")
+        for session in result.session_labels:
+            lines.append(f"  {session}: {result.locomotion_pct_by_session.get(session, float('nan')):.4f}")
         lines.append("")
-        lines.append("Day-wise face motion fraction:")
-        for day in result.day_labels:
-            lines.append(f"  {day}: {result.face_motion_pct_by_day.get(day, float('nan')):.4f}")
+        lines.append("Session-wise face motion fraction:")
+        for session in result.session_labels:
+            lines.append(f"  {session}: {result.face_motion_pct_by_session.get(session, float('nan')):.4f}")
         lines.append("")
-        lines.append("Day-wise pupil state fractions:")
-        for day in result.day_labels:
+        lines.append("Session-wise pupil state fractions:")
+        for session in result.session_labels:
             state_text = ", ".join(
-                f"{label}={result.pupil_pct_by_day.get(day, {}).get(label, float('nan')):.4f}" for label in STATE_LABELS
+                f"{label}={result.pupil_pct_by_session.get(session, {}).get(label, float('nan')):.4f}" for label in STATE_LABELS
             )
-            lines.append(f"  {day}: {state_text}")
+            lines.append(f"  {session}: {state_text}")
+        return "\n".join(lines)
+
+
+    def _format_batch_result_text(self, payload: dict, active_items: list[dict], selected_item: dict) -> str:
+        results = payload.get("results", [])
+        skipped = payload.get("skipped", [])
+        skipped_ids = {str(item.get("animal_id", "")) for item in skipped}
+        computed_ids = {str(item.get("animal_id", "")) for item in results if not item.get("cached")}
+        loaded_ids = {str(item.get("animal_id", "")) for item in results if item.get("cached")}
+        selected_id = str(selected_item.get("animal_id", ""))
+
+        lines = [
+            f"Batch mode: {payload.get('selection_mode', 'all')}",
+            f"Animals processed: {len(active_items)}",
+            "",
+            "Animal IDs:",
+        ]
+        for item in active_items:
+            animal_id = str(item.get("animal_id", ""))
+            if animal_id in skipped_ids:
+                status = "cached, skipped rerun"
+            elif animal_id in loaded_ids:
+                status = "loaded from cache"
+            elif animal_id in computed_ids:
+                status = "computed"
+            else:
+                status = "processed"
+            lines.append(f"  - {animal_id}: {status}")
+
+        lines.extend([
+            "",
+            f"Showing detailed statistics for: {selected_id}",
+            "",
+            self._format_result_text(selected_item["result"]),
+        ])
         return "\n".join(lines)
 
 
@@ -1944,8 +2605,14 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self._worker: TaskThread | None = None
         self._stats_prompted_for_entry = False
 
-        self.animal_combo = QComboBox(self)
-        self.exp_combo = QComboBox(self)
+        self.animal_combo = ScrollableComboBox(self, visible_rows=4)
+        self.animal_combo.setMinimumWidth(240)
+        self.animal_combo.setMinimumContentsLength(12)
+        self.animal_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        animal_view = self.animal_combo.view()
+        animal_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        animal_view.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerItem)
+        self.exp_combo = ScrollableComboBox(self, visible_rows=6)
         self.prev_btn = QPushButton("<", self)
         self.next_btn = QPushButton(">", self)
         self.update_btn = QPushButton("Update dataset", self)
@@ -2068,16 +2735,19 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
                 idx = self.exp_combo.count() - 1
                 if item_brush is not None:
                     self.exp_combo.setItemData(idx, item_brush, Qt.ForegroundRole)
-                tooltip = "\n".join(
-                    [
-                        summary.exp_id,
-                        f"Animal: {summary.animal_id}",
-                        f"Duration: {format_seconds(summary.duration_sec)}",
-                        f"Right video: {'yes' if summary.has_right_video else 'no'}",
-                        f"Right pupil pickle: {'yes' if summary.has_right_pickle else 'no'}",
-                        f"Locomotion CSV: {'yes' if summary.has_locomotion_csv else 'no'}",
-                    ]
-                )
+                usable_duration = self.store.effective_session_duration_sec(summary.exp_id)
+                cutoff = self.store.session_analysis_cutoff_sec(summary.exp_id)
+                tooltip_lines = [
+                    summary.exp_id,
+                    f"Animal: {summary.animal_id}",
+                    f"Duration: {format_seconds(usable_duration)}",
+                    f"Right video: {'yes' if summary.has_right_video else 'no'}",
+                    f"Right pupil pickle: {'yes' if summary.has_right_pickle else 'no'}",
+                    f"Locomotion CSV: {'yes' if summary.has_locomotion_csv else 'no'}",
+                ]
+                if cutoff is not None:
+                    tooltip_lines.append(f"Cutoff: {format_seconds(cutoff)}")
+                tooltip = "\n".join(tooltip_lines)
                 self.exp_combo.setItemData(idx, tooltip, Qt.ToolTipRole)
         del blocker
         if prefer_overall or animal == "All":

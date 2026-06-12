@@ -37,7 +37,7 @@ If you are using the Sci environment on this machine, the direct launcher is:
 3. Choose an `expID` for a single session, or `Overall` for the selected animal.
 4. In `Metrics`, review the pupil trace, locomotion trace, and right-eye video.
 5. Adjust shared pupil percentile cutoffs if needed, then mark the session as `Pre-processed` once you are happy with it.
-6. Switch to `Statistics` and run the analysis when you want the day-wise summary.
+6. Switch to `Statistics` and run the analysis when you want the summary.
 
 ## What The GUI Does
 
@@ -52,6 +52,7 @@ If you are using the Sci environment on this machine, the direct launcher is:
   shows a warning in session view.
 - Lets you review pupil dynamics, locomotion, not visible pupil intervals, and
   summary statistics.
+- Reuses cached results when the metrics inputs and session data have not changed.
 
 ## Typical Workflow
 
@@ -104,6 +105,9 @@ The small note under the threshold panel summarizes this behavior:
 - In some sessions, the right video ends before the locomotion CSV. The GUI
   keeps the full locomotion timebase, shows a warning when the mismatch is
   larger than 5 s, and marks the video coverage end on the plot.
+- If an older session was aligned after the fact, mark it as posteriorly
+  aligned in the Metrics tab so the warning keeps showing for that expID even
+  when no cutoff is set.
 
 ### Video Review
 
@@ -135,6 +139,7 @@ The `Pre-processed` checkbox is a manual checklist for each expID.
   threshold settings.
 - If any shared pupil percentile changes, the checkbox becomes unchecked
   automatically.
+- Sessions marked `Do not use` are excluded from statistics and are shown in red in the experiment list.
 - This is session-specific bookkeeping, not an automated pipeline step.
 
 ### Important Metrics Tab Behavior
@@ -146,7 +151,7 @@ The `Pre-processed` checkbox is a manual checklist for each expID.
 
 ## Statistics Tab
 
-The `Statistics` tab summarizes the selected scope by day.
+The `Statistics` tab summarizes the selected scope by day within animal.
 
 ### Running Statistics
 
@@ -154,22 +159,31 @@ When you open the tab, the GUI asks if you want to run the analysis.
 
 The summary includes:
 
-- locomotion fraction by day
-- face motion fraction by day
-- pupil state fractions by day
-- lag to the first pupil state after the first minute of each session
-- pupil state probability as a function of experiment progress from 0 to 100%
+- locomotion fraction by day within animal
+- face motion fraction by day within animal
+- pupil state fractions by day within animal
+- lag to the first pupil state after the first minute of each session, shown once per pupil state
+- pupil state fraction as a function of experiment progress from 0 to 100%, with SD shading for each pupil state
 
 Only sessions longer than 30 minutes are included in the progress-based
 probability analysis.
+
+### Plot Browser
+
+The Statistics tab shows one plot at a time. Use the left and right arrow buttons at the bottom to browse the individual panels. The log area can be hidden with the `Show log window` checkbox.
+
+### Batch Runs
+
+`Run statistics now` updates the current scope only. `Run all animals` asks whether you want to process every animal or only the ones that do not already have matching saved stats.
 
 ### Outputs
 
 When statistics finish, the GUI saves:
 
 - a JSON report
-- an SVG figure
-- a PNG figure
+- an SVG summary figure
+- a PNG summary figure
+- individual PNG panels that you can browse with the arrows in the GUI
 
 All outputs are written under `/data/common/habituation/gui_output/stats/`.
 
