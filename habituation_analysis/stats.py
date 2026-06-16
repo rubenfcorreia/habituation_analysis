@@ -276,6 +276,15 @@ def build_extra_large_mask(
         return extra_large
 
     working = dict(calibration or {})
+    
+    confirmed = bool(working.get("confirmed", False))
+    if not confirmed:
+        return _extra_large_missing_mask(
+            bundle,
+            manual_masks,
+            min_duration_sec=MIN_EXTRA_LARGE_MISSING_SEC,
+            manual_buffer_sec=manual_buffer_sec,
+        )
     interval = working.get("interval")
     reference_band = working.get("reference_band")
     similarity_cutoff = working.get("similarity_cutoff")
