@@ -59,6 +59,7 @@ BOUNDARY_COLORS = ["tab:red", "tab:orange", "tab:green"]
 class LoadedSession:
     summary: SessionSummary
     t: np.ndarray
+    frame_observed: np.ndarray
     radius: np.ndarray
     x: np.ndarray
     y: np.ndarray
@@ -85,6 +86,8 @@ class LoadedSession:
         if self.radius.size == 0:
             return np.zeros(0, dtype=bool)
         visible = np.isfinite(self.radius)
+        if self.frame_observed.shape == self.radius.shape:
+            visible = visible & self.frame_observed.astype(bool)
         if self.in_eye.ndim == 2 and self.in_eye.shape[0] == self.radius.shape[0]:
             visible = visible & np.all(self.in_eye.astype(bool), axis=1)
         if self.qc.shape == self.radius.shape:
@@ -1394,6 +1397,7 @@ class MetricsTab(QWidget):
         return replace(
             payload,
             t=apply_time_mask(payload.t, frame_mask),
+            frame_observed=apply_time_mask(payload.frame_observed, frame_mask),
             radius=apply_time_mask(payload.radius, frame_mask),
             x=apply_time_mask(payload.x, frame_mask),
             y=apply_time_mask(payload.y, frame_mask),
@@ -1490,6 +1494,7 @@ class MetricsTab(QWidget):
             return LoadedSession(
                 summary=summary,
                 t=np.asarray(bundle.t, dtype=float),
+                frame_observed=np.asarray(bundle.frame_observed, dtype=bool),
                 radius=np.asarray(bundle.radius, dtype=float),
                 x=np.asarray(bundle.x, dtype=float),
                 y=np.asarray(bundle.y, dtype=float),
@@ -1532,6 +1537,7 @@ class MetricsTab(QWidget):
             return LoadedSession(
                 summary=summary,
                 t=np.asarray(frame_t, dtype=float),
+                frame_observed=np.ones(np.asarray(frame_t, dtype=float).shape, dtype=bool),
                 radius=np.array([], dtype=float),
                 x=np.array([], dtype=float),
                 y=np.array([], dtype=float),
@@ -1856,7 +1862,7 @@ class MetricsTab(QWidget):
         self._current_payload = raw_payload
         payload = self._analysis_payload(raw_payload, summary)
         if summary.has_right_video and summary.right_video and Path(summary.right_video).exists():
-            self.video_widget.set_video(summary.right_video, payload.t, overlay=payload.video_overlay())
+            self.video_widget.set_video(summary.right_video, self.store.load_frame_timestamps(summary.exp_id), overlay=raw_payload.video_overlay())
             self.mask_group.setEnabled(bool(payload.has_pupil))
             if payload.t.size:
                 self._set_cursor_position(float(self.video_widget.current_time()))
@@ -2057,6 +2063,12 @@ class MetricsTab(QWidget):
         if current_time is None or not np.isfinite(current_time):
             return
         self._calibration_selection_end = float(current_time)
+        message = f"Calibration end set at {format_seconds(float(self._calibration_selection_end))}. Refreshing calibration controls..."
+        self.calibration_status_label.setText(message)
+        window = self.window()
+        if hasattr(window, "statusBar"):
+            window.statusBar().showMessage(message, 3000)
+        QApplication.processEvents()
         self.refresh()
     def _clear_extra_large_calibration_selection(self):
         if self.view_mode != "Session" or self.exp_id == "":
@@ -2188,11 +2200,34 @@ class MetricsTab(QWidget):
         if self.view_mode != "Session" or self.exp_id == "":
             return
         calibration = self._selected_extra_large_calibration()
+        source = "selected"
         if calibration is None:
             calibration = self._calibration_suggestion
+            source = "suggested"
         if not calibration:
+            message = (
+                "Calibration confirmation failed: there is no valid selected interval or auto-suggestion to confirm. "
+                "Pick a calibration period or wait for a valid suggestion, then try again."
+            )
+            self.calibration_status_label.setText(message)
+            QMessageBox.warning(self, "Calibration confirmation failed", message)
             return
-        self.store.set_session_extra_large_calibration(self.exp_id, calibration, confirmed=True)
+        confirmed = self.store.set_session_extra_large_calibration(self.exp_id, calibration, confirmed=True)
+        if confirmed is None:
+            interval = calibration.get("interval")
+            if interval is None:
+                interval_text = "unknown interval"
+            else:
+                interval_text = f"{format_seconds(float(interval[0]))} -> {format_seconds(float(interval[1]))}"
+            message = (
+                f"Calibration confirmation failed for the {source} interval ({interval_text}). "
+                "The interval could not be converted into a confirmed extra-large calibration. "
+                "Try selecting a different period or refresh the session and try again."
+            )
+            self.calibration_status_label.setText(message)
+            QMessageBox.warning(self, "Calibration confirmation failed", message)
+            return
+        self.calibration_status_label.setText("Calibration confirmed. Refreshing the active extra-large rule.")
         self.session_state_changed.emit()
         self.refresh()
     def _clear_extra_large_calibration(self):

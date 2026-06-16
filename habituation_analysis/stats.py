@@ -266,8 +266,10 @@ def build_extra_large_mask(
     n = min(times.size, radius.size)
     times = times[:n]
     radius = radius[:n]
+    observed = np.asarray(getattr(bundle, "frame_observed", np.ones(times.shape, dtype=bool)), dtype=bool).reshape(-1)
+    observed = observed[:n] if observed.size else np.ones(times.shape, dtype=bool)
     manual_mask = _interval_mask(times, manual_masks, pad=manual_buffer_sec)
-    missing = ~np.isfinite(radius)
+    missing = ~np.isfinite(radius) & observed
     candidate = missing & ~manual_mask
     extra_large = np.zeros(times.shape, dtype=bool)
     if not np.any(candidate):
@@ -305,7 +307,8 @@ def build_extra_large_mask(
     radius = radius[:n]
     similarity = similarity[:n]
     manual_mask = manual_mask[:n]
-    missing = ~np.isfinite(radius)
+    observed = observed[:n] if observed.size else np.ones(times.shape, dtype=bool)
+    missing = (~np.isfinite(radius)) & observed
     candidate = missing & ~manual_mask & np.isfinite(similarity)
     extra_large = np.zeros(times.shape, dtype=bool)
     extra_large[candidate & (similarity >= float(similarity_cutoff))] = True
@@ -420,8 +423,10 @@ def _extra_large_missing_mask(
         return np.zeros(0, dtype=bool)
 
     manual_mask = _interval_mask(times, manual_masks, pad=manual_buffer_sec)
+    observed = np.asarray(getattr(bundle, "frame_observed", np.ones(times.shape, dtype=bool)), dtype=bool).reshape(-1)
+    observed = observed[: times.size] if observed.size else np.ones(times.shape, dtype=bool)
     radius = np.asarray(bundle.radius, dtype=float).reshape(-1)
-    missing = ~np.isfinite(radius[: times.size])
+    missing = (~np.isfinite(radius[: times.size])) & observed
     candidate = missing & ~manual_mask
     extra_large = np.zeros(times.shape, dtype=bool)
     if not np.any(candidate):
@@ -531,7 +536,7 @@ def classify_zscores(
     not_visible_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     thresholds = sorted([float(t) for t in thresholds])
-    state = np.full(z.shape, 3, dtype=int)
+    state = np.full(z.shape, -1, dtype=int)
     mask = np.isfinite(z)
     if visible_mask is not None:
         mask &= visible_mask
@@ -598,6 +603,7 @@ def _trim_bundle_for_cutoff(store: HabituationStore, bundle: SessionBundle) -> S
     return SessionBundle(
         summary=bundle.summary,
         t=apply_time_mask(bundle.t, frame_mask),
+        frame_observed=apply_time_mask(bundle.frame_observed, frame_mask),
         radius=apply_time_mask(bundle.radius, frame_mask),
         x=apply_time_mask(bundle.x, frame_mask),
         y=apply_time_mask(bundle.y, frame_mask),

@@ -30,7 +30,7 @@ PUPIL_BRIGHTNESS_CACHE_DIR = GUI_OUTPUT_ROOT / "pupil_brightness_cache"
 STATS_DIR = GUI_OUTPUT_ROOT / "stats"
 APP_STATE_PATH = GUI_OUTPUT_ROOT / "app_state.json"
 
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 STATISTICS_RESULTS_VERSION = 9
 MIN_ANALYSIS_SESSION_DURATION_SEC = 1800.0
 SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d+_[A-Za-z0-9]+$")
@@ -318,6 +318,109 @@ def _frame_time_axis(summary: SessionSummary, *, frame_count: int | None = None)
     return _video_time_axis(summary, frame_count=frame_count)
 
 
+def _frame_interval_guess(summary: SessionSummary, timestamps: np.ndarray) -> float:
+    fps = float(summary.video_fps or 0.0)
+    if fps > 0.0:
+        interval = 1.0 / fps
+        if np.isfinite(interval) and interval > 0.0:
+            return float(interval)
+    times = np.asarray(timestamps, dtype=float).reshape(-1)
+    if times.size > 1:
+        deltas = np.diff(times)
+        positive = deltas[np.isfinite(deltas) & (deltas > 0.0)]
+        if positive.size:
+            return float(np.nanmedian(positive))
+    return 0.0
+
+
+def _pad_frame_array(values: np.ndarray, missing_count: int):
+    arr = np.asarray(values)
+    if arr.ndim == 0 or missing_count <= 0:
+        return arr
+    pad_shape = (int(missing_count),) + arr.shape[1:]
+    if arr.dtype == np.bool_:
+        pad = np.zeros(pad_shape, dtype=bool)
+    elif np.issubdtype(arr.dtype, np.floating):
+        pad = np.full(pad_shape, np.nan, dtype=arr.dtype)
+    else:
+        arr = arr.astype(float, copy=False)
+        pad = np.full(pad_shape, np.nan, dtype=float)
+    return np.concatenate([arr, pad], axis=0)
+
+
+def _pad_frame_row(values: np.ndarray):
+    arr = np.asarray(values)
+    if arr.ndim == 0 or arr.shape[0] == 0:
+        return arr[:0] if arr.ndim > 0 else arr
+    return _pad_frame_array(arr[:1], 1)[-1:]
+
+
+def _expand_frame_gaps(
+    summary: SessionSummary,
+    times: np.ndarray,
+    *values: np.ndarray,
+    gap_factor: float = 1.5,
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    times = np.asarray(times, dtype=float).reshape(-1)
+    arrays = [np.asarray(value) for value in values]
+    if times.size == 0:
+        return times, [arr[:0] if arr.ndim > 0 else arr for arr in arrays], np.zeros(0, dtype=bool)
+
+    lengths = [times.size]
+    for arr in arrays:
+        if arr.ndim > 0 and arr.shape[0] > 0:
+            lengths.append(arr.shape[0])
+    n = min(lengths)
+    times = times[:n]
+    arrays = [arr[:n] if arr.ndim > 0 and arr.shape[0] > 0 else arr for arr in arrays]
+    if times.size <= 1:
+        return times, arrays, np.ones(times.shape, dtype=bool)
+
+    expected_interval = _frame_interval_guess(summary, times)
+    if not np.isfinite(expected_interval) or expected_interval <= 0.0:
+        return times, arrays, np.ones(times.shape, dtype=bool)
+
+    pad_rows = [_pad_frame_row(arr) for arr in arrays]
+    expanded_times: list[float] = []
+    observed_mask: list[bool] = []
+    expanded_arrays: list[list[np.ndarray]] = [[] for _ in arrays]
+
+    for idx, current_t in enumerate(times):
+        if idx > 0:
+            prev_t = float(times[idx - 1])
+            delta = float(current_t) - prev_t
+            if np.isfinite(delta) and delta > expected_interval * gap_factor:
+                missing_count = int(np.rint(delta / expected_interval)) - 1
+                if missing_count > 0:
+                    for missing_idx in range(1, missing_count + 1):
+                        expanded_times.append(prev_t + expected_interval * missing_idx)
+                        observed_mask.append(False)
+                        for out, pad_row in zip(expanded_arrays, pad_rows):
+                            if pad_row.size:
+                                out.append(pad_row)
+        expanded_times.append(float(current_t))
+        observed_mask.append(True)
+        for out, arr in zip(expanded_arrays, arrays):
+            if arr.ndim > 0 and arr.shape[0] > 0:
+                out.append(arr[idx : idx + 1])
+
+    expanded_arrays_out = [
+        np.concatenate(parts, axis=0) if parts else (arr[:0] if arr.ndim > 0 else arr)
+        for parts, arr in zip(expanded_arrays, arrays)
+    ]
+    return np.asarray(expanded_times, dtype=float), expanded_arrays_out, np.asarray(observed_mask, dtype=bool)
+
+
+def _frame_observed_mask(bundle: SessionBundle) -> np.ndarray:
+    times = np.asarray(bundle.t, dtype=float).reshape(-1)
+    observed = np.asarray(getattr(bundle, "frame_observed", np.ones(times.shape, dtype=bool)), dtype=bool).reshape(-1)
+    if observed.size >= times.size:
+        return observed[: times.size]
+    out = np.ones(times.shape, dtype=bool)
+    out[: observed.size] = observed
+    return out
+
+
 def _video_metadata(video_path: Path | None) -> dict:
     if video_path is None or not video_path.exists():
         return {"fps": None, "frame_count": None, "duration_sec": None}
@@ -414,6 +517,7 @@ class DatasetIndex:
 class SessionBundle:
     summary: SessionSummary
     t: np.ndarray
+    frame_observed: np.ndarray
     radius: np.ndarray
     x: np.ndarray
     y: np.ndarray
@@ -436,6 +540,8 @@ class SessionBundle:
     @property
     def visible_mask_base(self) -> np.ndarray:
         visible = np.isfinite(self.radius)
+        if self.frame_observed.shape == self.radius.shape:
+            visible = visible & self.frame_observed.astype(bool)
         if self.in_eye.ndim == 2 and self.in_eye.shape[0] == self.radius.shape[0]:
             visible = visible & np.all(self.in_eye.astype(bool), axis=1)
         if self.qc.shape == self.radius.shape:
@@ -1021,6 +1127,7 @@ class HabituationStore:
                     return SessionBundle(
                         summary=summary,
                         t=np.asarray(cached["t"], dtype=float),
+                        frame_observed=np.asarray(cached.get("frame_observed", np.ones_like(cached["t"], dtype=bool)), dtype=bool),
                         radius=np.asarray(cached["radius"], dtype=float),
                         x=np.asarray(cached["x"], dtype=float),
                         y=np.asarray(cached["y"], dtype=float),
@@ -1119,11 +1226,41 @@ class HabituationStore:
             pupilX = pupilX[:n] if pupilX.ndim >= 1 else pupilX
             pupilY = pupilY[:n] if pupilY.ndim >= 1 else pupilY
             frame_t = frame_t[:n]
-        t = np.asarray(frame_t, dtype=float)
+        t, padded_arrays, frame_observed = _expand_frame_gaps(
+            summary,
+            frame_t,
+            radius,
+            x,
+            y,
+            velocity,
+            qc,
+            in_eye,
+            eye_lid_x,
+            eye_lid_y,
+            eyeX,
+            eyeY,
+            pupilX,
+            pupilY,
+        )
+        (
+            radius,
+            x,
+            y,
+            velocity,
+            qc,
+            in_eye,
+            eye_lid_x,
+            eye_lid_y,
+            eyeX,
+            eyeY,
+            pupilX,
+            pupilY,
+        ) = padded_arrays
 
         bundle = SessionBundle(
             summary=summary,
             t=t.astype(float),
+            frame_observed=frame_observed.astype(bool),
             radius=radius.astype(np.float32),
             x=x.astype(np.float32),
             y=y.astype(np.float32),
@@ -1147,6 +1284,7 @@ class HabituationStore:
             "cache_version": self.source_version,
             "source_signature": current_sig,
             "t": bundle.t.astype(np.float64),
+            "frame_observed": bundle.frame_observed.astype(bool),
             "radius": bundle.radius.astype(np.float32),
             "x": bundle.x.astype(np.float32),
             "y": bundle.y.astype(np.float32),
@@ -1335,32 +1473,27 @@ class HabituationStore:
         cap = cv2.VideoCapture(summary.right_video)
         if not cap.isOpened():
             return None, None
-        diffs = []
+        observed = _frame_observed_mask(bundle)
+        t = np.asarray(bundle.t, dtype=float).reshape(-1)
+        motion = np.full(t.shape, np.nan, dtype=float)
         prev_gray = None
-        idx = 0
-        max_frames = int(bundle.t.size)
-        while True:
+        any_frame = False
+        for frame_idx in range(t.size):
+            if not observed[frame_idx]:
+                continue
             ok, frame = cap.read()
             if not ok:
                 break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if prev_gray is None:
-                diffs.append(0.0)
+                motion[frame_idx] = 0.0
             else:
-                diffs.append(float(np.sum(cv2.absdiff(gray, prev_gray))))
+                motion[frame_idx] = float(np.sum(cv2.absdiff(gray, prev_gray)))
             prev_gray = gray
-            idx += 1
-            if idx >= max_frames:
-                break
+            any_frame = True
         cap.release()
-        if not diffs:
+        if not any_frame:
             return None, None
-        motion = np.asarray(diffs, dtype=float)
-        t = np.asarray(bundle.t[: motion.size], dtype=float)
-        if motion.size != t.size:
-            n = min(motion.size, t.size)
-            motion = motion[:n]
-            t = t[:n]
         return t, motion
 
     def load_pupil_brightness(self, exp_id: str, *, force_recompute: bool = False) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -1451,23 +1584,24 @@ class HabituationStore:
         cap = cv2.VideoCapture(summary.right_video)
         if not cap.isOpened():
             return None, None
-        values: list[float] = []
-        idx = 0
-        max_frames = int(bundle.t.size)
+        observed = _frame_observed_mask(bundle)
+        t = np.asarray(bundle.t, dtype=float).reshape(-1)
+        similarity = np.full(t.shape, np.nan, dtype=float)
         low, high = float(band[0]), float(band[1])
         if high < low:
             low, high = high, low
-        while True:
+        any_frame = False
+        for frame_idx in range(t.size):
+            if not observed[frame_idx]:
+                continue
             ok, frame = cap.read()
             if not ok:
                 break
-            if idx >= max_frames:
-                break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mask = np.zeros(gray.shape[:2], dtype=np.uint8)
-            if idx < bundle.eye_lid_x.size and idx < bundle.eye_lid_y.size:
-                eye_x = np.asarray(bundle.eye_lid_x[idx], dtype=float).reshape(-1)
-                eye_y = np.asarray(bundle.eye_lid_y[idx], dtype=float).reshape(-1)
+            if frame_idx < bundle.eye_lid_x.size and frame_idx < bundle.eye_lid_y.size:
+                eye_x = np.asarray(bundle.eye_lid_x[frame_idx], dtype=float).reshape(-1)
+                eye_y = np.asarray(bundle.eye_lid_y[frame_idx], dtype=float).reshape(-1)
                 pts = []
                 for x, y in zip(eye_x[: min(eye_x.size, eye_y.size)].ravel(), eye_y[: min(eye_x.size, eye_y.size)].ravel()):
                     if np.isfinite(x) and np.isfinite(y):
@@ -1475,9 +1609,9 @@ class HabituationStore:
                 if len(pts) >= 3:
                     poly = np.asarray(pts, dtype=np.int32).reshape((-1, 1, 2))
                     cv2.fillPoly(mask, [poly], 1)
-                    if idx < bundle.pupilX.size and idx < bundle.pupilY.size:
-                        pupil_x = np.asarray(bundle.pupilX[idx], dtype=float).reshape(-1)
-                        pupil_y = np.asarray(bundle.pupilY[idx], dtype=float).reshape(-1)
+                    if frame_idx < bundle.pupilX.size and frame_idx < bundle.pupilY.size:
+                        pupil_x = np.asarray(bundle.pupilX[frame_idx], dtype=float).reshape(-1)
+                        pupil_y = np.asarray(bundle.pupilY[frame_idx], dtype=float).reshape(-1)
                         pupil_pts = []
                         for x, y in zip(pupil_x[: min(pupil_x.size, pupil_y.size)].ravel(), pupil_y[: min(pupil_x.size, pupil_y.size)].ravel()):
                             if np.isfinite(x) and np.isfinite(y):
@@ -1490,17 +1624,11 @@ class HabituationStore:
                 region = gray[mask.astype(bool)]
                 if region.size:
                     value = float(np.mean((region >= low) & (region <= high)))
-            values.append(value)
-            idx += 1
+            similarity[frame_idx] = value
+            any_frame = True
         cap.release()
-        if not values:
+        if not any_frame:
             return None, None
-        similarity = np.asarray(values, dtype=float)
-        t = np.asarray(bundle.t[: similarity.size], dtype=float)
-        if similarity.size != t.size:
-            n = min(similarity.size, t.size)
-            similarity = similarity[:n]
-            t = t[:n]
         return t, similarity
 
     def _compute_pupil_brightness(self, summary: SessionSummary):
@@ -1510,20 +1638,21 @@ class HabituationStore:
         cap = cv2.VideoCapture(summary.right_video)
         if not cap.isOpened():
             return None, None
-        values: list[float] = []
-        idx = 0
-        max_frames = int(bundle.t.size)
-        while True:
+        observed = _frame_observed_mask(bundle)
+        t = np.asarray(bundle.t, dtype=float).reshape(-1)
+        brightness = np.full(t.shape, np.nan, dtype=float)
+        any_frame = False
+        for frame_idx in range(t.size):
+            if not observed[frame_idx]:
+                continue
             ok, frame = cap.read()
             if not ok:
                 break
-            if idx >= max_frames:
-                break
             value = float("nan")
-            if idx < bundle.radius.size and idx < bundle.x.size and idx < bundle.y.size:
-                x = float(bundle.x[idx])
-                y = float(bundle.y[idx])
-                radius = float(bundle.radius[idx])
+            if frame_idx < bundle.radius.size and frame_idx < bundle.x.size and frame_idx < bundle.y.size:
+                x = float(bundle.x[frame_idx])
+                y = float(bundle.y[frame_idx])
+                radius = float(bundle.radius[frame_idx])
                 if np.isfinite(x) and np.isfinite(y) and np.isfinite(radius) and radius > 0.0:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     h, w = gray.shape[:2]
@@ -1540,17 +1669,11 @@ class HabituationStore:
                         region = gray[y0:y1, x0:x1]
                         if np.any(mask):
                             value = float(np.nanmean(region[mask]))
-            values.append(value)
-            idx += 1
+            brightness[frame_idx] = value
+            any_frame = True
         cap.release()
-        if not values:
+        if not any_frame:
             return None, None
-        brightness = np.asarray(values, dtype=float)
-        t = np.asarray(bundle.t[: brightness.size], dtype=float)
-        if brightness.size != t.size:
-            n = min(brightness.size, t.size)
-            brightness = brightness[:n]
-            t = t[:n]
         return t, brightness
 
     def _migrate_manual_masks_to_session_timebase(
