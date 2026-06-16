@@ -210,6 +210,20 @@ class VideoPlayerWidget(QWidget):
             return float(self.timestamps[self._frame_index])
         return float(self._frame_index / max(self._fps, 1e-6))
 
+    def seek_time(self, time_seconds: float):
+        if self._capture is None or not np.isfinite(time_seconds):
+            return
+        if self.timestamps.size:
+            target = float(time_seconds)
+            idx = int(np.searchsorted(self.timestamps, target, side="left"))
+            if idx >= self.timestamps.size:
+                idx = self.timestamps.size - 1
+            elif idx > 0 and abs(float(self.timestamps[idx - 1]) - target) < abs(float(self.timestamps[idx]) - target):
+                idx -= 1
+            self.seek(idx)
+            return
+        self.seek(int(round(float(time_seconds) * max(self._fps, 1e-6))))
+
     def seek(self, frame_index: int):
         if self._capture is None:
             return

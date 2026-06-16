@@ -31,9 +31,11 @@ STATS_DIR = GUI_OUTPUT_ROOT / "stats"
 APP_STATE_PATH = GUI_OUTPUT_ROOT / "app_state.json"
 
 CACHE_VERSION = 8
-STATISTICS_RESULTS_VERSION = 8
+STATISTICS_RESULTS_VERSION = 9
 MIN_ANALYSIS_SESSION_DURATION_SEC = 1800.0
 SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d+_[A-Za-z0-9]+$")
+EYE_SIMILARITY_CACHE_DIR = GUI_OUTPUT_ROOT / "eye_similarity_cache"
+EYE_SIMILARITY_CACHE_VERSION = 1
 
 
 def ensure_output_dirs() -> None:
@@ -43,6 +45,7 @@ def ensure_output_dirs() -> None:
         SESSION_CACHE_DIR,
         FACE_MOTION_CACHE_DIR,
         PUPIL_BRIGHTNESS_CACHE_DIR,
+        EYE_SIMILARITY_CACHE_DIR,
         STATS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
@@ -155,6 +158,11 @@ def _normalize_percentiles(values, fallback: Iterable[float] | None = None) -> l
 
 
 def _pupil_percentile_signature(values: Iterable[float]) -> str:
+    payload = json.dumps([float(v) for v in values], separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha1(payload.encode('utf-8')).hexdigest()
+
+
+def _band_signature(values: Iterable[float]) -> str:
     payload = json.dumps([float(v) for v in values], separators=(',', ':'), ensure_ascii=True)
     return hashlib.sha1(payload.encode('utf-8')).hexdigest()
 
@@ -650,6 +658,13 @@ class HabituationStore:
     def pupil_brightness_cache_path(self, exp_id: str) -> Path:
         return PUPIL_BRIGHTNESS_CACHE_DIR / f"{exp_id}_pupil_brightness.pkl"
 
+    def eye_similarity_cache_path(self, exp_id: str, band: tuple[float, float]) -> Path:
+        low, high = float(band[0]), float(band[1])
+        if high < low:
+            low, high = high, low
+        signature = _band_signature((low, high))
+        return EYE_SIMILARITY_CACHE_DIR / f"{exp_id}_eye_similarity_{signature}.pkl"
+
     def is_session_forced_do_not_use(self, exp_id: str) -> bool:
         summary = self.get_session_summary(exp_id)
         if summary is None:
@@ -664,6 +679,12 @@ class HabituationStore:
             "manual_masks": [],
             "manual_masks_timebase": None,
             "extra_large_calibration_interval": None,
+            "extra_large_calibration_reference_mean": None,
+            "extra_large_calibration_reference_std": None,
+            "extra_large_calibration_reference_band": None,
+            "extra_large_calibration_similarity_mean": None,
+            "extra_large_calibration_similarity_std": None,
+            "extra_large_calibration_similarity_cutoff": None,
             "extra_large_calibration_threshold": None,
             "extra_large_calibration_confirmed": False,
             "last_stats_signature": "",
@@ -682,6 +703,12 @@ class HabituationStore:
         state.setdefault("manual_masks", [])
         state.setdefault("manual_masks_timebase", None)
         state.setdefault("extra_large_calibration_interval", None)
+        state.setdefault("extra_large_calibration_reference_mean", None)
+        state.setdefault("extra_large_calibration_reference_std", None)
+        state.setdefault("extra_large_calibration_reference_band", None)
+        state.setdefault("extra_large_calibration_similarity_mean", None)
+        state.setdefault("extra_large_calibration_similarity_std", None)
+        state.setdefault("extra_large_calibration_similarity_cutoff", None)
         state.setdefault("extra_large_calibration_threshold", None)
         state.setdefault("extra_large_calibration_confirmed", False)
         state.setdefault("last_stats_signature", "")
@@ -714,8 +741,7 @@ class HabituationStore:
         if not bool(state.get("extra_large_calibration_confirmed", False)):
             return None
         interval = state.get("extra_large_calibration_interval", None)
-        threshold = _coerce_optional_float(state.get("extra_large_calibration_threshold", None))
-        if interval is None or threshold is None:
+        if interval is None:
             return None
         try:
             start, end = float(interval[0]), float(interval[1])
@@ -723,35 +749,131 @@ class HabituationStore:
             return None
         if not np.isfinite(start) or not np.isfinite(end) or end <= start:
             return None
+        reference_band = state.get("extra_large_calibration_reference_band", None)
+        similarity_cutoff = _coerce_optional_float(state.get("extra_large_calibration_similarity_cutoff", None))
+        reference_mean = _coerce_optional_float(state.get("extra_large_calibration_reference_mean", None))
+        reference_std = _coerce_optional_float(state.get("extra_large_calibration_reference_std", None))
+        similarity_mean = _coerce_optional_float(state.get("extra_large_calibration_similarity_mean", None))
+        similarity_std = _coerce_optional_float(state.get("extra_large_calibration_similarity_std", None))
+        if (
+            reference_band is not None
+            and similarity_cutoff is not None
+            and reference_mean is not None
+            and reference_std is not None
+        ):
+            try:
+                band_low, band_high = float(reference_band[0]), float(reference_band[1])
+            except Exception:
+                band_low = band_high = np.nan
+            if np.isfinite(band_low) and np.isfinite(band_high):
+                if band_high < band_low:
+                    band_low, band_high = band_high, band_low
+                out = {
+                    "interval": (float(start), float(end)),
+                    "reference_mean": float(reference_mean),
+                    "reference_std": float(reference_std),
+                    "reference_band": (float(band_low), float(band_high)),
+                    "similarity_cutoff": float(similarity_cutoff),
+                    "confirmed": True,
+                }
+                if similarity_mean is not None and similarity_std is not None:
+                    out["similarity_mean"] = float(similarity_mean)
+                    out["similarity_std"] = float(similarity_std)
+                return out
+        legacy_threshold = _coerce_optional_float(state.get("extra_large_calibration_threshold", None))
+        if legacy_threshold is None:
+            return None
         return {
             "interval": (float(start), float(end)),
-            "threshold": float(threshold),
+            "threshold": float(legacy_threshold),
             "confirmed": True,
+            "legacy": True,
         }
 
     def set_session_extra_large_calibration(
         self,
         exp_id: str,
-        interval: tuple[float, float] | None,
-        threshold: float | None,
+        calibration: dict | None,
         *,
         confirmed: bool = True,
     ) -> dict | None:
         state = self.load_session_state(exp_id)
-        if interval is None or threshold is None:
+        if not calibration:
             state["extra_large_calibration_interval"] = None
+            state["extra_large_calibration_reference_mean"] = None
+            state["extra_large_calibration_reference_std"] = None
+            state["extra_large_calibration_reference_band"] = None
+            state["extra_large_calibration_similarity_mean"] = None
+            state["extra_large_calibration_similarity_std"] = None
+            state["extra_large_calibration_similarity_cutoff"] = None
             state["extra_large_calibration_threshold"] = None
             state["extra_large_calibration_confirmed"] = False
         else:
-            start, end = float(interval[0]), float(interval[1])
-            if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+            interval = calibration.get("interval", None)
+            if interval is None:
                 state["extra_large_calibration_interval"] = None
+                state["extra_large_calibration_reference_mean"] = None
+                state["extra_large_calibration_reference_std"] = None
+                state["extra_large_calibration_reference_band"] = None
+                state["extra_large_calibration_similarity_mean"] = None
+                state["extra_large_calibration_similarity_std"] = None
+                state["extra_large_calibration_similarity_cutoff"] = None
                 state["extra_large_calibration_threshold"] = None
                 state["extra_large_calibration_confirmed"] = False
             else:
-                state["extra_large_calibration_interval"] = [float(start), float(end)]
-                state["extra_large_calibration_threshold"] = float(threshold)
-                state["extra_large_calibration_confirmed"] = bool(confirmed)
+                start, end = float(interval[0]), float(interval[1])
+                if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+                    state["extra_large_calibration_interval"] = None
+                    state["extra_large_calibration_reference_mean"] = None
+                    state["extra_large_calibration_reference_std"] = None
+                    state["extra_large_calibration_reference_band"] = None
+                    state["extra_large_calibration_similarity_mean"] = None
+                    state["extra_large_calibration_similarity_std"] = None
+                    state["extra_large_calibration_similarity_cutoff"] = None
+                    state["extra_large_calibration_threshold"] = None
+                    state["extra_large_calibration_confirmed"] = False
+                else:
+                    state["extra_large_calibration_interval"] = [float(start), float(end)]
+                    reference_mean = _coerce_optional_float(calibration.get("reference_mean"))
+                    reference_std = _coerce_optional_float(calibration.get("reference_std"))
+                    reference_band = calibration.get("reference_band", None)
+                    similarity_mean = _coerce_optional_float(calibration.get("similarity_mean"))
+                    similarity_std = _coerce_optional_float(calibration.get("similarity_std"))
+                    similarity_cutoff = _coerce_optional_float(calibration.get("similarity_cutoff"))
+                    if reference_mean is None or reference_std is None or similarity_cutoff is None:
+                        state["extra_large_calibration_reference_mean"] = None
+                        state["extra_large_calibration_reference_std"] = None
+                        state["extra_large_calibration_reference_band"] = None
+                        state["extra_large_calibration_similarity_mean"] = None
+                        state["extra_large_calibration_similarity_std"] = None
+                        state["extra_large_calibration_similarity_cutoff"] = None
+                        state["extra_large_calibration_threshold"] = None
+                        state["extra_large_calibration_confirmed"] = False
+                    else:
+                        try:
+                            band_low, band_high = float(reference_band[0]), float(reference_band[1])
+                        except Exception:
+                            band_low = band_high = np.nan
+                        if not np.isfinite(band_low) or not np.isfinite(band_high):
+                            state["extra_large_calibration_reference_mean"] = None
+                            state["extra_large_calibration_reference_std"] = None
+                            state["extra_large_calibration_reference_band"] = None
+                            state["extra_large_calibration_similarity_mean"] = None
+                            state["extra_large_calibration_similarity_std"] = None
+                            state["extra_large_calibration_similarity_cutoff"] = None
+                            state["extra_large_calibration_threshold"] = None
+                            state["extra_large_calibration_confirmed"] = False
+                        else:
+                            if band_high < band_low:
+                                band_low, band_high = band_high, band_low
+                            state["extra_large_calibration_reference_mean"] = float(reference_mean)
+                            state["extra_large_calibration_reference_std"] = float(reference_std)
+                            state["extra_large_calibration_reference_band"] = [float(band_low), float(band_high)]
+                            state["extra_large_calibration_similarity_mean"] = float(similarity_mean) if similarity_mean is not None else None
+                            state["extra_large_calibration_similarity_std"] = float(similarity_std) if similarity_std is not None else None
+                            state["extra_large_calibration_similarity_cutoff"] = float(similarity_cutoff)
+                            state["extra_large_calibration_threshold"] = None
+                            state["extra_large_calibration_confirmed"] = bool(confirmed)
         state["stats_dirty"] = True
         state["last_stats_signature"] = ""
         self.save_session_state(exp_id, state)
@@ -759,7 +881,7 @@ class HabituationStore:
         return self.session_extra_large_calibration(exp_id)
 
     def clear_session_extra_large_calibration(self, exp_id: str) -> None:
-        self.set_session_extra_large_calibration(exp_id, None, None)
+        self.set_session_extra_large_calibration(exp_id, None)
 
     def is_session_preprocessed(self, exp_id: str) -> bool:
         state = self.load_session_state(exp_id)
@@ -1274,6 +1396,112 @@ class HabituationStore:
         }
         _save_pickle(cache_path, payload)
         return np.asarray(t, dtype=float), np.asarray(brightness, dtype=float)
+
+    def load_eye_similarity(
+        self,
+        exp_id: str,
+        band: tuple[float, float],
+        *,
+        force_recompute: bool = False,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        summary = self.get_session_summary(exp_id)
+        if summary is None:
+            raise FileNotFoundError(f"Unknown expID: {exp_id}")
+        if not summary.has_right_video or summary.right_video is None or not Path(summary.right_video).exists():
+            return None, None
+        low, high = float(band[0]), float(band[1])
+        if high < low:
+            low, high = high, low
+        cache_path = self.eye_similarity_cache_path(exp_id, (low, high))
+        current_sig = self._current_source_signature(summary)
+        band_sig = _band_signature((low, high))
+        if not force_recompute and cache_path.exists():
+            try:
+                cached = _load_pickle(cache_path)
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("cache_version") == EYE_SIMILARITY_CACHE_VERSION
+                    and cached.get("band_signature") == band_sig
+                    and self._signature_matches(cached.get("source_signature", {}), current_sig)
+                ):
+                    return (
+                        np.asarray(cached["eye_similarity_t"], dtype=float),
+                        np.asarray(cached["eye_similarity"], dtype=float),
+                    )
+            except Exception:
+                pass
+        t, similarity = self._compute_eye_similarity(summary, (low, high))
+        if t is None or similarity is None:
+            return None, None
+        payload = {
+            "cache_version": EYE_SIMILARITY_CACHE_VERSION,
+            "source_signature": current_sig,
+            "band_signature": band_sig,
+            "reference_band": [float(low), float(high)],
+            "eye_similarity_t": np.asarray(t, dtype=np.float64),
+            "eye_similarity": np.asarray(similarity, dtype=np.float32),
+        }
+        _save_pickle(cache_path, payload)
+        return np.asarray(t, dtype=float), np.asarray(similarity, dtype=float)
+
+    def _compute_eye_similarity(self, summary: SessionSummary, band: tuple[float, float]):
+        if summary.right_video is None or not Path(summary.right_video).exists():
+            return None, None
+        bundle = self.load_session_bundle(summary.exp_id)
+        cap = cv2.VideoCapture(summary.right_video)
+        if not cap.isOpened():
+            return None, None
+        values: list[float] = []
+        idx = 0
+        max_frames = int(bundle.t.size)
+        low, high = float(band[0]), float(band[1])
+        if high < low:
+            low, high = high, low
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx >= max_frames:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mask = np.zeros(gray.shape[:2], dtype=np.uint8)
+            if idx < bundle.eye_lid_x.size and idx < bundle.eye_lid_y.size:
+                eye_x = np.asarray(bundle.eye_lid_x[idx], dtype=float).reshape(-1)
+                eye_y = np.asarray(bundle.eye_lid_y[idx], dtype=float).reshape(-1)
+                pts = []
+                for x, y in zip(eye_x[: min(eye_x.size, eye_y.size)].ravel(), eye_y[: min(eye_x.size, eye_y.size)].ravel()):
+                    if np.isfinite(x) and np.isfinite(y):
+                        pts.append((int(round(x)), int(round(y))))
+                if len(pts) >= 3:
+                    poly = np.asarray(pts, dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.fillPoly(mask, [poly], 1)
+                    if idx < bundle.pupilX.size and idx < bundle.pupilY.size:
+                        pupil_x = np.asarray(bundle.pupilX[idx], dtype=float).reshape(-1)
+                        pupil_y = np.asarray(bundle.pupilY[idx], dtype=float).reshape(-1)
+                        pupil_pts = []
+                        for x, y in zip(pupil_x[: min(pupil_x.size, pupil_y.size)].ravel(), pupil_y[: min(pupil_x.size, pupil_y.size)].ravel()):
+                            if np.isfinite(x) and np.isfinite(y):
+                                pupil_pts.append((int(round(x)), int(round(y))))
+                        if len(pupil_pts) >= 3:
+                            pupil_poly = np.asarray(pupil_pts, dtype=np.int32).reshape((-1, 1, 2))
+                            cv2.fillPoly(mask, [pupil_poly], 0)
+            value = float("nan")
+            if np.any(mask):
+                region = gray[mask.astype(bool)]
+                if region.size:
+                    value = float(np.mean((region >= low) & (region <= high)))
+            values.append(value)
+            idx += 1
+        cap.release()
+        if not values:
+            return None, None
+        similarity = np.asarray(values, dtype=float)
+        t = np.asarray(bundle.t[: similarity.size], dtype=float)
+        if similarity.size != t.size:
+            n = min(similarity.size, t.size)
+            similarity = similarity[:n]
+            t = t[:n]
+        return t, similarity
 
     def _compute_pupil_brightness(self, summary: SessionSummary):
         if summary.right_video is None or not Path(summary.right_video).exists():

@@ -36,7 +36,7 @@ If you are using the Sci environment on this machine, the direct launcher is:
 2. Choose one animal from the `Animal` drop-down.
 3. Choose an `expID` for a single session, or `Overall` for the selected animal.
 4. In `Metrics`, review the pupil trace, locomotion trace, and right-eye video.
-5. Adjust shared pupil percentile cutoffs if needed, then mark the session as `Pre-processed` once you are happy with it.
+5. Adjust shared pupil percentile cutoffs if needed, and confirm an extra-large calibration interval when the session needs one. Mark the session as `Pre-processed` once you are happy with it.
 6. Switch to `Statistics` and run the analysis when you want the summary.
 
 ## What The GUI Does
@@ -50,8 +50,8 @@ If you are using the Sci environment on this machine, the direct launcher is:
 - Keeps video and locomotion as separate timebases. If the right video is
   shorter than the CSV trace, the GUI keeps the full locomotion timeline and
   shows a warning in session view.
-- Lets you review pupil dynamics, locomotion, not visible pupil intervals, and
-  summary statistics.
+- Lets you review pupil dynamics, locomotion, not visible pupil intervals, the
+  extra-large calibration suggestion, and summary statistics.
 - Reuses cached results when the metrics inputs and session data have not changed.
 
 ## Typical Workflow
@@ -92,6 +92,12 @@ The `Metrics` tab is the main review view.
   each animal can map the same percentiles to different values.
 - You can drag the threshold lines on the plot or edit the percentile values
   directly.
+- The `Extra-large calibration` panel suggests a calibration interval from big
+  detected pupil periods. You can also select a new interval with `Set
+  calibration start` and `Set calibration end`, jump the video to it with
+  `Go to calibration`, and activate it with `Confirm calibration`.
+- Confirming the calibration trains the extra-large similarity rule for that
+  expID. Until then, the suggestion stays inactive.
 
 The small note under the threshold panel summarizes this behavior:
 
@@ -129,7 +135,8 @@ playback:
 6. Click `Save intervals` to store the edit.
 
 These manual masks are saved in the GUI output folder and are used by the
-statistics tab.
+statistics tab. They are also the source of the `not_visible` state in the
+summary plots.
 
 ### Pre-Processed Checklist
 
@@ -161,7 +168,7 @@ The summary includes:
 
 - locomotion fraction by day within animal
 - face motion fraction by day within animal
-- pupil state fractions by day within animal
+- pupil state fractions by day within animal, including `small`, `medium`, `large`, `extra_large`, and `not_visible`
 - lag to the first pupil state after the first minute of each session, shown once per pupil state
 - pupil state fraction as a function of experiment progress from 0 to 100%, with SD shading for each pupil state
 

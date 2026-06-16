@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 import os
 import traceback
@@ -7,7 +6,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable
-
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -37,15 +35,16 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 from .data import HabituationStore, SessionSummary, analysis_cutoff_mask, apply_time_mask
 from .plotting import style_axes
 from .stats import (
     STATE_LABELS,
-    _extra_large_missing_mask,
     animal_zscores,
+    build_extra_large_mask,
     compute_animal_baseline,
     compute_statistics,
+    learn_extra_large_calibration,
+    learn_extra_large_reference_band,
     load_cached_statistics_outputs,
     percentile_from_value,
     percentile_threshold_values,
@@ -54,12 +53,8 @@ from .stats import (
     suggest_extra_large_calibration,
 )
 from .widgets import DraggableHLine, TracePanZoomCanvas, VideoPlayerWidget
-
-
 BOUNDARY_NAMES = ["small/medium", "medium/large", "large/extra-large"]
 BOUNDARY_COLORS = ["tab:red", "tab:orange", "tab:green"]
-
-
 @dataclass
 class LoadedSession:
     summary: SessionSummary
@@ -85,7 +80,6 @@ class LoadedSession:
     pupilY: np.ndarray
     source_signature: dict
     has_pupil: bool
-
     @property
     def visible_mask_base(self) -> np.ndarray:
         if self.radius.size == 0:
@@ -96,7 +90,6 @@ class LoadedSession:
         if self.qc.shape == self.radius.shape:
             visible = visible & (self.qc == 0)
         return visible
-
     def video_overlay(self) -> dict[str, np.ndarray]:
         return {
             'x': self.x,
@@ -109,17 +102,13 @@ class LoadedSession:
             'pupilX': self.pupilX,
             'pupilY': self.pupilY,
         }
-
-
 class TaskThread(QtCore.QThread):
     progress = pyqtSignal(float, str)
     result_ready = pyqtSignal(object)
     error = pyqtSignal(str)
-
     def __init__(self, fn, parent=None):
         super().__init__(parent)
         self._fn = fn
-
     def run(self):
         try:
             result = self._fn(self.progress.emit)
@@ -127,29 +116,23 @@ class TaskThread(QtCore.QThread):
             self.error.emit(traceback.format_exc())
             return
         self.result_ready.emit(result)
-
-
 class ScrollableComboBox(QComboBox):
     def __init__(self, parent=None, *, visible_rows: int = 4):
         super().__init__(parent)
         self._visible_rows = max(1, int(visible_rows))
-
     def showPopup(self):
         super().showPopup()
         QtCore.QTimer.singleShot(0, self._fit_popup_to_window)
-
     def _fit_popup_to_window(self):
         view = self.view()
         popup = view.window()
         if popup is None or self.count() <= 0:
             return
-
         rows = min(self._visible_rows, self.count())
         row_height = max(view.sizeHintForRow(0), self.fontMetrics().height() + 8)
         frame = max(0, popup.frameGeometry().height() - view.geometry().height())
         desired_height = rows * row_height + frame + 6
         desired_width = max(self.width(), view.sizeHintForColumn(0) + 32)
-
         window = self.window()
         if window is not None:
             bounds = window.frameGeometry()
@@ -158,7 +141,6 @@ class ScrollableComboBox(QComboBox):
             if screen is None:
                 screen = QtGui.QGuiApplication.primaryScreen()
             bounds = screen.availableGeometry() if screen is not None else QtCore.QRect()
-
         combo_top_left = self.mapToGlobal(QtCore.QPoint(0, 0))
         combo_bottom_left = self.mapToGlobal(QtCore.QPoint(0, self.height()))
         space_below = max(0, bounds.bottom() - combo_bottom_left.y())
@@ -166,12 +148,10 @@ class ScrollableComboBox(QComboBox):
         height = min(desired_height, max(space_below, space_above))
         if height <= 0:
             return
-
         if space_below >= space_above:
             y = combo_bottom_left.y()
         else:
             y = combo_top_left.y() - height
-
         width = min(desired_width, max(1, bounds.width()))
         x = combo_top_left.x()
         max_x = bounds.right() - width + 1
@@ -183,16 +163,11 @@ class ScrollableComboBox(QComboBox):
             y = max(bounds.top(), bounds.bottom() - height + 1)
         if y < bounds.top():
             y = bounds.top()
-
         popup.setGeometry(x, y, width, height)
         popup.raise_()
-
-
 class TraceCanvas(TracePanZoomCanvas):
     def __init__(self, parent=None):
         super().__init__(parent)
-
-
 class LoadingWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(
@@ -235,12 +210,10 @@ class LoadingWindow(QWidget):
         layout.addWidget(self.message_label)
         layout.addWidget(self.detail_label)
         layout.addStretch(1)
-
     def set_message(self, message: str, detail: str = ""):
         self.message_label.setText(message)
         self.detail_label.setText(detail)
         self.adjustSize()
-
 def format_seconds(value: float | None) -> str:
     if value is None or not np.isfinite(value):
         return "--"
@@ -250,8 +223,6 @@ def format_seconds(value: float | None) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
-
-
 def merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
     ordered = sorted((float(s), float(e)) for s, e in intervals if float(e) > float(s))
     merged: list[list[float]] = []
@@ -261,8 +232,6 @@ def merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[floa
             continue
         merged[-1][1] = max(merged[-1][1], end)
     return [(float(s), float(e)) for s, e in merged]
-
-
 def mask_to_intervals(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
     times = np.asarray(times, dtype=float)
     mask = np.asarray(mask, dtype=bool)
@@ -290,8 +259,6 @@ def mask_to_intervals(times: np.ndarray, mask: np.ndarray) -> list[tuple[float, 
         end = float(times[segment[-1]] + step)
         intervals.append((start, end))
     return merge_intervals(intervals)
-
-
 class CollapsibleSection(QWidget):
     def __init__(self, title: str, content: QWidget, parent=None, *, expanded: bool = False):
         super().__init__(parent)
@@ -303,34 +270,26 @@ class CollapsibleSection(QWidget):
         self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self._toggle.toggled.connect(self._on_toggled)
-
         self._content.setVisible(expanded)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         layout.addWidget(self._toggle)
         layout.addWidget(self._content)
-
     def _on_toggled(self, checked: bool):
         self._content.setVisible(bool(checked))
         self._toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
-
-
 class ExperimentIndexTab(QWidget):
     sessionActivated = pyqtSignal(str, str)
-
     def __init__(self, store: HabituationStore, parent=None):
         super().__init__(parent)
         self.store = store
         self._selected_animal = "All"
         self._selected_exp_id = ""
         self._current_signature = self.store.pupil_percentile_signature()
-
         self._hint = QLabel("Double-click an expID to open it in the session browser.", self)
         self._hint.setWordWrap(True)
         self._hint.setStyleSheet("color: #666666; font-size: 11px;")
-
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels(["Experiment", "Status"])
@@ -338,18 +297,14 @@ class ExperimentIndexTab(QWidget):
         self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.tree.setUniformRowHeights(True)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
-
         layout = QVBoxLayout(self)
         layout.addWidget(self._hint)
         layout.addWidget(self.tree, stretch=1)
-
         self.refresh()
-
     def refresh(self):
         self._current_signature = self.store.pupil_percentile_signature()
         previous_animal = self._selected_animal
         previous_exp_id = self._selected_exp_id
-
         self.tree.clear()
         animals = self.store.animals()
         for animal in animals:
@@ -430,17 +385,14 @@ class ExperimentIndexTab(QWidget):
                 parent.setText(1, ", ".join(status_bits))
             self.tree.addTopLevelItem(parent)
             parent.setExpanded(animal == previous_animal)
-
         self.tree.resizeColumnToContents(0)
         self.tree.resizeColumnToContents(1)
         self._select_current_item(previous_animal, previous_exp_id)
-
     def set_current_selection(self, animal_id: str, exp_id: str):
         self._selected_animal = animal_id or "All"
         self._selected_exp_id = exp_id or ""
         if self.tree.topLevelItemCount():
             self._select_current_item(self._selected_animal, self._selected_exp_id)
-
     def _select_current_item(self, animal_id: str, exp_id: str):
         found = None
         for i in range(self.tree.topLevelItemCount()):
@@ -463,7 +415,6 @@ class ExperimentIndexTab(QWidget):
         if found is not None:
             self.tree.setCurrentItem(found)
             self.tree.scrollToItem(found)
-
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         data = item.data(0, Qt.UserRole) or {}
         if data.get("kind") == "animal":
@@ -475,28 +426,22 @@ class ExperimentIndexTab(QWidget):
         exp_id = str(data.get("exp_id", ""))
         if animal_id and exp_id:
             self.sessionActivated.emit(animal_id, exp_id)
-
-
 class DeeplabcutReferenceTab(QWidget):
     sessionActivated = pyqtSignal(str, str)
-
     def __init__(self, store: HabituationStore, parent=None):
         super().__init__(parent)
         self.store = store
         self._selected_animal = "All"
         self._selected_exp_id = ""
         self._copy_text = "No sessions for the DLC model found."
-
         self._hint = QLabel(
             "These expIDs are manually marked for the DLC model and are excluded from statistics.",
             self,
         )
         self._hint.setWordWrap(True)
         self._hint.setStyleSheet("color: #666666; font-size: 11px;")
-
         self.copy_btn = QPushButton("Copy list", self)
         self.copy_btn.clicked.connect(self._copy_list)
-
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels(["Experiment", "Note"])
@@ -504,19 +449,15 @@ class DeeplabcutReferenceTab(QWidget):
         self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.tree.setUniformRowHeights(True)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
-
         layout = QVBoxLayout(self)
         layout.addWidget(self._hint)
         layout.addWidget(self.copy_btn, alignment=Qt.AlignLeft)
         layout.addWidget(self.tree, stretch=1)
-
         self.refresh()
-
     def refresh(self):
         previous_animal = self._selected_animal
         previous_exp_id = self._selected_exp_id
         lines: list[str] = []
-
         self.tree.clear()
         for animal in self.store.animals():
             sessions = self.store.deeplabcut_reference_sessions(animal)
@@ -546,15 +487,12 @@ class DeeplabcutReferenceTab(QWidget):
                 lines.append(f"  {summary.exp_id}")
             parent.setExpanded(animal == previous_animal)
             self.tree.addTopLevelItem(parent)
-
         self._copy_text = "\n".join(lines) if lines else "No sessions for the DLC model found."
         self.tree.resizeColumnToContents(0)
         self.tree.resizeColumnToContents(1)
         self._select_current_item(previous_animal, previous_exp_id)
-
     def _copy_list(self):
         QApplication.clipboard().setText(self._copy_text)
-
     def _select_current_item(self, animal_id: str, exp_id: str):
         found = None
         for i in range(self.tree.topLevelItemCount()):
@@ -577,7 +515,6 @@ class DeeplabcutReferenceTab(QWidget):
         if found is not None:
             self.tree.setCurrentItem(found)
             self.tree.scrollToItem(found)
-
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         data = item.data(0, Qt.UserRole) or {}
         if data.get("kind") == "animal":
@@ -591,13 +528,10 @@ class DeeplabcutReferenceTab(QWidget):
             self._selected_animal = animal_id
             self._selected_exp_id = exp_id
             self.sessionActivated.emit(animal_id, exp_id)
-
-
 class MetricsTab(QWidget):
     thresholds_changed = pyqtSignal()
     masks_changed = pyqtSignal()
     session_state_changed = pyqtSignal()
-
     def __init__(self, store: HabituationStore, parent=None):
         super().__init__(parent)
         self.store = store
@@ -618,6 +552,8 @@ class MetricsTab(QWidget):
         self._current_session: SessionSummary | None = None
         self._current_payload: LoadedSession | None = None
         self._pending_mask_start: float | None = None
+        self._calibration_selection_start: float | None = None
+        self._calibration_selection_end: float | None = None
         self._calibration_suggestion: dict | None = None
         self._reset_trace_view_pending = True
         self._dirty_label = QLabel("Statistics are clean")
@@ -635,24 +571,20 @@ class MetricsTab(QWidget):
         self.movie_locomotion_warning.setWordWrap(True)
         self.movie_locomotion_warning.setStyleSheet("color: #7a4a00; font-weight: 600;")
         self.movie_locomotion_warning.setVisible(False)
-
         self.canvas = TraceCanvas(self)
         self.canvas.set_pan_blocker(self._should_block_trace_pan)
         self.canvas.pupil_ax.set_title("Pupil dynamics", pad=10)
         self.canvas.loc_ax.set_title("Locomotion", pad=10)
-
         self.zoom_in_btn = QPushButton("Zoom in", self)
         self.zoom_out_btn = QPushButton("Zoom out", self)
         self.reset_zoom_btn = QPushButton("Reset zoom", self)
         self.zoom_in_btn.clicked.connect(lambda: self.canvas.zoom(0.8))
         self.zoom_out_btn.clicked.connect(lambda: self.canvas.zoom(1.25))
         self.reset_zoom_btn.clicked.connect(self._reset_trace_zoom_view)
-
         self.video_widget = VideoPlayerWidget(self)
         self.video_widget.time_changed.connect(self._on_video_time_changed)
         self.video_time_label = QLabel("Current video time: --")
         self.video_time_label.setWordWrap(True)
-
         self.interval_list = QListWidget(self)
         self.start_btn = QPushButton("Set start", self)
         self.end_btn = QPushButton("Set end / add", self)
@@ -664,51 +596,62 @@ class MetricsTab(QWidget):
         self.delete_btn.clicked.connect(self._delete_selected_interval)
         self.clear_btn.clicked.connect(self._clear_intervals)
         self.save_btn.clicked.connect(self._save_intervals)
-
         self.calibration_group = QGroupBox("Extra-large calibration", self)
         calibration_layout = QVBoxLayout(self.calibration_group)
         self.calibration_status_label = QLabel("No calibration suggestion available yet.", self.calibration_group)
         self.calibration_status_label.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_status_label)
+        self.calibration_selection_label = QLabel("Selected period: none", self.calibration_group)
+        self.calibration_selection_label.setWordWrap(True)
+        self.calibration_selection_label.setStyleSheet("color: #444444; font-size: 11px;")
+        calibration_layout.addWidget(self.calibration_selection_label)
+        selection_row = QHBoxLayout()
+        self.set_calibration_start_btn = QPushButton("Set calibration start", self.calibration_group)
+        self.set_calibration_start_btn.clicked.connect(self._set_extra_large_calibration_start)
+        self.set_calibration_end_btn = QPushButton("Set calibration end", self.calibration_group)
+        self.set_calibration_end_btn.clicked.connect(self._set_extra_large_calibration_end)
+        self.clear_calibration_selection_btn = QPushButton("Clear selection", self.calibration_group)
+        self.clear_calibration_selection_btn.clicked.connect(self._clear_extra_large_calibration_selection)
+        selection_row.addWidget(self.set_calibration_start_btn)
+        selection_row.addWidget(self.set_calibration_end_btn)
+        selection_row.addWidget(self.clear_calibration_selection_btn)
+        calibration_layout.addLayout(selection_row)
         calibration_button_row = QHBoxLayout()
-        self.confirm_calibration_btn = QPushButton("Confirm suggestion", self.calibration_group)
+        self.goto_calibration_btn = QPushButton("Go to calibration", self.calibration_group)
+        self.goto_calibration_btn.clicked.connect(self._go_to_extra_large_calibration)
+        self.confirm_calibration_btn = QPushButton("Confirm calibration", self.calibration_group)
         self.confirm_calibration_btn.clicked.connect(self._confirm_extra_large_calibration)
         self.clear_calibration_btn = QPushButton("Clear calibration", self.calibration_group)
         self.clear_calibration_btn.clicked.connect(self._clear_extra_large_calibration)
+        calibration_button_row.addWidget(self.goto_calibration_btn)
         calibration_button_row.addWidget(self.confirm_calibration_btn)
         calibration_button_row.addWidget(self.clear_calibration_btn)
         calibration_button_row.addStretch(1)
         calibration_layout.addLayout(calibration_button_row)
-        calibration_hint = QLabel("The app suggests a calibration interval automatically from big detected pupil periods. Confirm it to activate the brightness-based extra-large rule.", self.calibration_group)
+        calibration_hint = QLabel("The app suggests a calibration interval automatically from big detected pupil periods. You can also select a new calibration period from the video controls, then confirm it to activate the brightness-based extra-large rule.", self.calibration_group)
         calibration_hint.setWordWrap(True)
         calibration_hint.setStyleSheet("color: #666666; font-size: 11px;")
         calibration_layout.addWidget(calibration_hint)
-
         self.do_not_use_check = QCheckBox("Do not use", self)
         self.do_not_use_check.toggled.connect(self._on_do_not_use_toggled)
         self.do_not_use_check.setToolTip("Mark this expID as excluded from statistics.")
-
         self.preprocessed_check = QCheckBox("Pre-processed", self)
         self.preprocessed_check.toggled.connect(self._on_preprocessed_toggled)
         self.preprocessed_check.setToolTip("Mark this expID as pre-processed under the current shared pupil percentiles.")
-
         self.reference_check = QCheckBox("Add for DLC model", self)
         self.reference_check.toggled.connect(self._on_reference_toggled)
         self.reference_check.setToolTip("Mark this expID for DLC model use. This is independent of not-visible pupil intervals.")
-
         self.timebase_aligned_check = QCheckBox("Posteriorly aligned", self)
         self.timebase_aligned_check.toggled.connect(self._on_timebase_aligned_toggled)
         self.timebase_aligned_check.setToolTip(
             "Mark sessions whose timebase was aligned after acquisition. This changes the warning wording but does not hide it."
         )
-
         self.cutoff_btn = QPushButton("Set cutoff", self)
         self.cutoff_btn.clicked.connect(self._set_cutoff_from_current_time)
         self.clear_cutoff_btn = QPushButton("Clear cutoff", self)
         self.clear_cutoff_btn.clicked.connect(self._clear_cutoff)
         self.cutoff_label = QLabel("Cutoff: none", self)
         self.cutoff_label.setWordWrap(True)
-
         self.threshold_group = QGroupBox("Pupil thresholds (shared percentiles)", self)
         threshold_layout = QGridLayout(self.threshold_group)
         self.percentile_lock_check = QCheckBox("Unlock shared percentiles", self.threshold_group)
@@ -737,7 +680,6 @@ class MetricsTab(QWidget):
             vlabel = QLabel("--", self.threshold_group)
             self.value_labels.append(vlabel)
             threshold_layout.addWidget(vlabel, row, 2)
-
         threshold_layout.addWidget(QLabel("Missing pupil buffer (s)", self.threshold_group), 5, 0)
         self.missing_buffer_spin = QDoubleSpinBox(self.threshold_group)
         self.missing_buffer_spin.setRange(0.0, 60.0)
@@ -751,11 +693,9 @@ class MetricsTab(QWidget):
         buffer_hint = QLabel("Sustained gaps only", self.threshold_group)
         buffer_hint.setStyleSheet("color: #666666; font-size: 11px;")
         threshold_layout.addWidget(buffer_hint, 5, 2)
-
         self.threshold_hint = QLabel("Unlock the shared percentile fields to type values. Dragging the threshold lines stays live.", self)
         self.threshold_hint.setWordWrap(True)
         self.threshold_hint.setStyleSheet("color: #666666; font-size: 11px;")
-
         self.locomotion_group = QGroupBox("Locomotion", self)
         loc_layout = QFormLayout(self.locomotion_group)
         self.locomotion_spin = QDoubleSpinBox(self.locomotion_group)
@@ -764,7 +704,6 @@ class MetricsTab(QWidget):
         self.locomotion_spin.setSingleStep(0.01)
         self.locomotion_spin.valueChanged.connect(self._on_locomotion_threshold_changed)
         loc_layout.addRow("Threshold", self.locomotion_spin)
-
         left_panel = QWidget(self)
         left_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_panel)
@@ -790,10 +729,8 @@ class MetricsTab(QWidget):
         zoom_row.addStretch(1)
         left_layout.addLayout(zoom_row)
         left_layout.addWidget(self.canvas, stretch=1)
-
         self.experiment_index = ExperimentIndexTab(self.store, self)
         self.reference_sessions = DeeplabcutReferenceTab(self.store, self)
-
         self.reference_group = QGroupBox("Session markers", self)
         reference_layout = QVBoxLayout(self.reference_group)
         reference_layout.addWidget(self.do_not_use_check)
@@ -810,7 +747,6 @@ class MetricsTab(QWidget):
         reference_hint.setWordWrap(True)
         reference_hint.setStyleSheet("color: #666666; font-size: 11px;")
         reference_layout.addWidget(reference_hint)
-
         self.mask_group = QGroupBox("Not visible pupil intervals", self)
         mask_layout = QVBoxLayout(self.mask_group)
         mask_layout.addWidget(self.video_widget)
@@ -823,24 +759,20 @@ class MetricsTab(QWidget):
         mask_layout.addLayout(button_row)
         mask_layout.addWidget(self.interval_list, stretch=1)
         mask_layout.addWidget(self.save_btn)
-
         right_controls_panel = QWidget(self)
         right_controls_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         right_controls_layout = QVBoxLayout(right_controls_panel)
         right_controls_layout.setContentsMargins(0, 0, 0, 0)
         right_controls_layout.addWidget(self.calibration_group)
         right_controls_layout.addWidget(self.mask_group, stretch=1)
-
         index_group = QGroupBox("Experiment Index", self)
         index_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         index_layout = QVBoxLayout(index_group)
         index_layout.addWidget(self.experiment_index)
-
         reference_model_group = QGroupBox("Add for DLC model", self)
         reference_model_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         reference_model_layout = QVBoxLayout(reference_model_group)
         reference_model_layout.addWidget(self.reference_sessions)
-
         right_column_panel = QWidget(self)
         right_column_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         right_column_layout = QVBoxLayout(right_column_panel)
@@ -849,7 +781,6 @@ class MetricsTab(QWidget):
         right_column_layout.addWidget(index_group)
         right_column_layout.addWidget(reference_model_group)
         right_column_layout.addStretch(1)
-
         right_panel = QSplitter(Qt.Horizontal, self)
         right_panel.setChildrenCollapsible(False)
         right_panel.setOpaqueResize(True)
@@ -859,7 +790,6 @@ class MetricsTab(QWidget):
         right_panel.setStretchFactor(0, 2)
         right_panel.setStretchFactor(1, 3)
         right_panel.setSizes([320, 760])
-
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.setChildrenCollapsible(False)
         splitter.setOpaqueResize(True)
@@ -869,22 +799,21 @@ class MetricsTab(QWidget):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([1000, 1100])
-
         layout = QVBoxLayout(self)
         layout.addWidget(splitter)
-
         self._set_threshold_control_values(self._percentile_cutoffs, self._threshold_values)
         self._on_percentile_lock_toggled(self.percentile_lock_check.isChecked())
-
     def set_selection(self, animal_id: str, exp_id: str, view_mode: str):
         changed = (animal_id != self.animal_id) or (exp_id != self.exp_id) or (view_mode != self.view_mode)
         self.animal_id = animal_id
         self.exp_id = exp_id
         self.view_mode = view_mode
+        if changed:
+            self._calibration_selection_start = None
+            self._calibration_selection_end = None
         self._reset_trace_view_pending = changed or not self._metrics_available()
         if changed or not self._metrics_available():
             self.refresh()
-
     def refresh(self):
         self._scope_sessions = self._sessions_for_scope()
         self.experiment_index.refresh()
@@ -911,18 +840,14 @@ class MetricsTab(QWidget):
         self._draw_plots()
         self._update_video()
         self._update_dirty_label()
-
     def _sessions_for_scope(self) -> list[SessionSummary]:
         if self.animal_id == "All":
             return self.store.dataset_sessions()
         return self.store.sessions_for_animal(self.animal_id)
-
     def _animal_settings_key(self) -> str:
         return self.animal_id or "All"
-
     def _metrics_available(self) -> bool:
         return self.animal_id != "All"
-
     def _show_unavailable_state(self):
         message = "Metrics are not available for the All selection. Select a specific animal to view metrics."
         self._scope_label.setText("Scope: All")
@@ -984,7 +909,6 @@ class MetricsTab(QWidget):
                 fontweight="600",
             )
         self.canvas.draw_idle()
-
     def _load_animal_state(self, force_reload: bool = False):
         settings = self.store.get_animal_settings(self._animal_settings_key())
         cache_miss = force_reload or self._scope_cache_key != self._animal_settings_key()
@@ -1018,7 +942,6 @@ class MetricsTab(QWidget):
         self._threshold_values = [float(v) for v in threshold_values]
         self._sort_thresholds_in_place(update_store=False)
         self._update_baseline_label()
-
     def _update_baseline_label(self):
         n_sessions = sum(1 for s in self._scope_sessions if s.has_right_pickle)
         self._scope_label.setText(
@@ -1041,7 +964,6 @@ class MetricsTab(QWidget):
             self._session_label.setText("Cohort-wide overview")
         else:
             self._session_label.setText("Overall view for the selected animal")
-
     def _apply_state_to_controls(self):
         self._updating_controls = True
         try:
@@ -1053,7 +975,6 @@ class MetricsTab(QWidget):
             self._update_threshold_lines()
         finally:
             self._updating_controls = False
-
     def _refresh_threshold_value_labels(self):
         for idx, label in enumerate(self.value_labels):
             if idx < len(self._threshold_values):
@@ -1061,7 +982,6 @@ class MetricsTab(QWidget):
                 label.setText(f"{self._threshold_values[idx]:.3f}  ({percentile:.1f}%)")
             else:
                 label.setText("--")
-
     def _on_percentile_lock_toggled(self, checked: bool):
         editable = bool(checked)
         for spin in self.percentile_spins:
@@ -1077,7 +997,6 @@ class MetricsTab(QWidget):
                 "Enable direct typing in the shared percentile fields. Dragging threshold lines stays available either way."
             )
             self.threshold_hint.setText("Unlock the shared percentile fields to type values. Dragging the threshold lines stays live.")
-
     def _set_threshold_control_values(self, percentiles: list[float], values: list[float]):
         self._updating_controls = True
         try:
@@ -1088,7 +1007,6 @@ class MetricsTab(QWidget):
             self._update_threshold_lines()
         finally:
             self._updating_controls = False
-
     def _update_threshold_lines(self):
         if not self._threshold_lines:
             return
@@ -1098,7 +1016,6 @@ class MetricsTab(QWidget):
             except Exception:
                 pass
         self.canvas.draw_idle()
-
     def _clear_threshold_lines(self):
         for line in self._threshold_lines:
             try:
@@ -1106,7 +1023,6 @@ class MetricsTab(QWidget):
             except Exception:
                 pass
         self._threshold_lines = []
-
     def _clear_locomotion_threshold_line(self):
         if self._locomotion_threshold_line is None:
             return
@@ -1115,7 +1031,6 @@ class MetricsTab(QWidget):
         except Exception:
             pass
         self._locomotion_threshold_line = None
-
     def _make_threshold_lines(self, ax):
         self._threshold_lines = []
         for idx, value in enumerate(self._threshold_values):
@@ -1128,7 +1043,6 @@ class MetricsTab(QWidget):
                 on_changed=lambda y, i=idx: self._on_threshold_line_moved(i, y),
             )
             self._threshold_lines.append(line)
-
     def _make_locomotion_threshold_line(self, ax):
         self._locomotion_threshold_line = DraggableHLine(
             ax,
@@ -1140,7 +1054,6 @@ class MetricsTab(QWidget):
             tolerance_px=10,
             on_changed=self._on_locomotion_threshold_line_moved,
         )
-
     def _sort_thresholds_in_place(self, update_store: bool = True):
         paired = sorted(zip(self._percentile_cutoffs, self._threshold_values), key=lambda item: item[1])
         if paired:
@@ -1148,7 +1061,6 @@ class MetricsTab(QWidget):
             self._threshold_values = [float(v) for _, v in paired]
         if update_store:
             self._persist_threshold_state(mark_baseline_dirty=False)
-
     def _persist_threshold_state(self, mark_baseline_dirty: bool = False):
         percentiles = self.store.set_global_pupil_percentile_cutoffs(self._percentile_cutoffs)
         self._percentile_cutoffs = [float(v) for v in percentiles]
@@ -1170,7 +1082,6 @@ class MetricsTab(QWidget):
         self._update_dirty_label()
         if self.view_mode == "Session" and self._current_session is not None and self._current_payload is not None:
             self._refresh_extra_large_calibration_controls(self._current_session, self._current_payload)
-
     def _persist_locomotion_threshold(self):
         self.store.settings.setdefault("global", {})
         self.store.settings["global"]["locomotion_threshold"] = float(self.locomotion_spin.value())
@@ -1178,17 +1089,14 @@ class MetricsTab(QWidget):
         self.store.mark_stats_dirty()
         self.thresholds_changed.emit()
         self._update_dirty_label()
-
     def _persist_missing_buffer(self):
         self.store.set_global_pupil_missing_buffer_sec(self.missing_buffer_spin.value())
         self.thresholds_changed.emit()
         self._update_dirty_label()
-
     def _update_dirty_label(self):
         dirty = self.store.is_animal_dirty(self._animal_settings_key()) or self.store.is_stats_dirty()
         self._dirty_label.setText("Statistics need to be rerun for this scope." if dirty else "Statistics are clean")
         self._dirty_label.setStyleSheet("color: #b00020; font-weight: 600;" if dirty else "color: #1b5e20; font-weight: 600;")
-
     def _update_timebase_warning(self, summary: SessionSummary | None, payload: LoadedSession | None):
         if not hasattr(self, "timebase_warning"):
             return
@@ -1220,8 +1128,6 @@ class MetricsTab(QWidget):
         else:
             self.timebase_warning.setText("")
             self.timebase_warning.setVisible(False)
-
-
     def _update_movie_locomotion_warning(self, summary: SessionSummary | None, payload: LoadedSession | None):
         if not hasattr(self, "movie_locomotion_warning"):
             return
@@ -1252,7 +1158,6 @@ class MetricsTab(QWidget):
         else:
             self.movie_locomotion_warning.setText("")
             self.movie_locomotion_warning.setVisible(False)
-
     def _on_percentile_changed(self, idx: int, value: float):
         if self._updating_controls:
             return
@@ -1269,7 +1174,6 @@ class MetricsTab(QWidget):
         finally:
             self._updating_controls = False
         self._persist_threshold_state(mark_baseline_dirty=False)
-
     def _on_threshold_line_moved(self, idx: int, value: float):
         if self._updating_controls:
             return
@@ -1285,13 +1189,11 @@ class MetricsTab(QWidget):
         finally:
             self._updating_controls = False
         self._persist_threshold_state(mark_baseline_dirty=False)
-
     def _on_locomotion_threshold_changed(self, value: float):
         if self._updating_controls:
             return
         self._persist_locomotion_threshold()
         self._draw_plots()
-
     def _on_locomotion_threshold_line_moved(self, value: float):
         if self._updating_controls:
             return
@@ -1302,15 +1204,12 @@ class MetricsTab(QWidget):
             self._updating_controls = False
         self._persist_locomotion_threshold()
         self._draw_plots()
-
     def _on_missing_buffer_changed(self, value: float):
         if self._updating_controls:
             return
         self._persist_missing_buffer()
-
     def _current_percentile_signature(self) -> str:
         return self.store.pupil_percentile_signature(self._percentile_cutoffs)
-
     def _recompute_animal_threshold_state(self, animal_id: str) -> tuple[float, float, np.ndarray, list[float]]:
         scope = "All" if animal_id == "All" else None
         mean, std = compute_animal_baseline(self.store, animal_id, scope=scope)
@@ -1329,7 +1228,6 @@ class MetricsTab(QWidget):
         settings["stats_dirty"] = True
         self.store.set_animal_settings(animal_id, settings)
         return float(mean), float(std), distribution.astype(float), [float(v) for v in threshold_values]
-
     def _refresh_preprocessed_checkbox(self):
         if not hasattr(self, "preprocessed_check"):
             return
@@ -1356,7 +1254,6 @@ class MetricsTab(QWidget):
         else:
             tip = "Mark this expID as pre-processed for the current shared pupil percentiles."
         self.preprocessed_check.setToolTip(tip)
-
     def _refresh_do_not_use_checkbox(self):
         if not hasattr(self, "do_not_use_check"):
             return
@@ -1381,7 +1278,6 @@ class MetricsTab(QWidget):
         else:
             tip = "Mark this expID as excluded from statistics."
         self.do_not_use_check.setToolTip(tip)
-
     def _refresh_reference_checkbox(self):
         if not hasattr(self, "reference_check"):
             return
@@ -1403,7 +1299,6 @@ class MetricsTab(QWidget):
         else:
             tip = "Mark this expID for DLC model use."
         self.reference_check.setToolTip(tip)
-
     def _refresh_timebase_aligned_checkbox(self):
         if not hasattr(self, "timebase_aligned_check"):
             return
@@ -1424,28 +1319,24 @@ class MetricsTab(QWidget):
         else:
             tip = "Mark this expID if its timebase was aligned after acquisition."
         self.timebase_aligned_check.setToolTip(tip)
-
     def _on_do_not_use_toggled(self, checked: bool):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
         self.store.set_session_do_not_use(self.exp_id, bool(checked))
         self._refresh_do_not_use_checkbox()
         self.session_state_changed.emit()
-
     def _on_preprocessed_toggled(self, checked: bool):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
         self.store.set_session_preprocessed(self.exp_id, bool(checked), threshold_signature=self._current_percentile_signature())
         self._refresh_preprocessed_checkbox()
         self.session_state_changed.emit()
-
     def _on_reference_toggled(self, checked: bool):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
         self.store.set_session_deeplabcut_reference(self.exp_id, bool(checked))
         self._refresh_reference_checkbox()
         self.session_state_changed.emit()
-
     def _on_timebase_aligned_toggled(self, checked: bool):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
@@ -1453,12 +1344,10 @@ class MetricsTab(QWidget):
         self._refresh_timebase_aligned_checkbox()
         self._update_timebase_warning(self._current_session, self._current_payload)
         self.session_state_changed.emit()
-
     def _session_cutoff_text(self, cutoff_sec: float | None) -> str:
         if cutoff_sec is None:
             return "Cutoff: none"
         return f"Cutoff: {format_seconds(cutoff_sec)}"
-
     def _refresh_cutoff_controls(self):
         if not hasattr(self, "cutoff_btn"):
             return
@@ -1483,20 +1372,17 @@ class MetricsTab(QWidget):
             self.clear_cutoff_btn.setToolTip("No cutoff is set for this session.")
         else:
             self.clear_cutoff_btn.setToolTip("Remove the analysis cutoff and restore the full session.")
-
     def _set_cutoff_from_current_time(self):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
         cutoff = self.video_widget.current_time()
         self.store.set_session_analysis_cutoff(self.exp_id, cutoff)
         self.refresh()
-
     def _clear_cutoff(self):
         if self._updating_controls or self.view_mode != "Session" or not self.exp_id:
             return
         self.store.set_session_analysis_cutoff(self.exp_id, None)
         self.refresh()
-
     def _analysis_payload(self, payload: LoadedSession, summary: SessionSummary | None = None) -> LoadedSession:
         summary = summary or payload.summary
         cutoff = self.store.session_analysis_cutoff_sec(summary.exp_id)
@@ -1528,11 +1414,9 @@ class MetricsTab(QWidget):
             pupilX=apply_time_mask(payload.pupilX, frame_mask),
             pupilY=apply_time_mask(payload.pupilY, frame_mask),
         )
-
     def _reset_trace_zoom_view(self):
         self._reset_trace_view_pending = True
         self.canvas.reset_zoom()
-
     def _should_block_trace_pan(self, event) -> bool:
         if self.view_mode != "Session":
             return False
@@ -1550,7 +1434,6 @@ class MetricsTab(QWidget):
             except Exception:
                 pass
         return False
-
     def _trace_bounds_from_arrays(self, *arrays: np.ndarray) -> tuple[float, float] | None:
         finite_parts = []
         for arr in arrays:
@@ -1572,7 +1455,6 @@ class MetricsTab(QWidget):
         if xmax <= xmin:
             xmax = xmin + 1.0
         return xmin, xmax
-
     def _apply_trace_bounds(self, bounds: tuple[float, float] | None):
         if bounds is None:
             self.canvas.clear_limits()
@@ -1582,7 +1464,6 @@ class MetricsTab(QWidget):
         self.canvas.set_x_bounds(xmin, xmax, reset_view=self._reset_trace_view_pending)
         self.canvas.apply_view()
         self._reset_trace_view_pending = False
-
     def _video_time_axis(self, summary: SessionSummary, frame_count: int | None = None) -> np.ndarray:
         timestamps = self.store.load_frame_timestamps(summary.exp_id)
         if timestamps.size:
@@ -1673,7 +1554,6 @@ class MetricsTab(QWidget):
                 source_signature={},
                 has_pupil=False,
             )
-
     def _build_scope_trace(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[tuple[float, float, str]], list[str]]:
         if not self._scope_sessions:
             empty = np.array([], dtype=float)
@@ -1771,7 +1651,6 @@ class MetricsTab(QWidget):
         lock_t_out = np.concatenate(lock_t_parts) if lock_t_parts else np.array([], dtype=float)
         lock_out = np.concatenate(lock_parts) if lock_parts else np.array([], dtype=float)
         return pupil_t_out, z_out, loc_t_out, loc_out, face_t_out, face_out, lock_t_out, lock_out, spans, labels
-
     def _clear_cursor_lines(self):
         for line in self._cursor_lines:
             try:
@@ -1779,13 +1658,11 @@ class MetricsTab(QWidget):
             except Exception:
                 pass
         self._cursor_lines = []
-
     def _make_cursor_lines(self, *axes):
         self._clear_cursor_lines()
         for ax in axes:
             line = ax.axvline(0.0, color="tab:cyan", linestyle="-", linewidth=1.6, alpha=0.85, zorder=30)
             self._cursor_lines.append(line)
-
     def _set_cursor_position(self, value: float | None):
         if not self._cursor_lines or value is None or not np.isfinite(value):
             return
@@ -1795,7 +1672,6 @@ class MetricsTab(QWidget):
             except Exception:
                 pass
         self.canvas.draw_idle()
-
     def _plot_lock_state(self, ax, lock_t: np.ndarray, lock_state: np.ndarray, empty_message: str = "No lock state available") -> bool:
         ax.set_ylim(-0.2, 1.2)
         ax.set_yticks([0.0, 1.0])
@@ -1811,7 +1687,6 @@ class MetricsTab(QWidget):
                 return True
         ax.text(0.5, 0.5, empty_message, transform=ax.transAxes, ha="center", va="center")
         return False
-
     def _draw_plots(self):
         self._clear_threshold_lines()
         self._clear_locomotion_threshold_line()
@@ -1831,7 +1706,6 @@ class MetricsTab(QWidget):
         if not self._metrics_available():
             self._show_unavailable_state()
             return
-
         bounds = None
         if self.view_mode == "Session":
             summary = self.store.get_session_summary(self.exp_id)
@@ -1854,20 +1728,14 @@ class MetricsTab(QWidget):
                 manual_masks = self.store.load_manual_masks(summary.exp_id)
                 for start_t, end_t in manual_masks:
                     pupil_ax.axvspan(start_t, end_t, color="tab:red", alpha=0.15)
-                extra_large_mask = None
                 calibration = self.store.session_extra_large_calibration(summary.exp_id)
-                if calibration is not None:
-                    brightness_t, brightness = self.store.load_pupil_brightness(summary.exp_id)
-                    if brightness_t is not None and brightness is not None and brightness.size:
-                        n = min(int(payload.t.size), int(brightness.size))
-                        if n > 0:
-                            extra_large_mask = visible[:n] & np.isfinite(brightness[:n]) & (brightness[:n] >= float(calibration["threshold"]))
-                if extra_large_mask is None:
-                    extra_large_mask = _extra_large_missing_mask(
-                        payload,
-                        manual_masks,
-                        manual_buffer_sec=self.store.global_pupil_missing_buffer_sec(),
-                    )
+                extra_large_mask = build_extra_large_mask(
+                    self.store,
+                    payload,
+                    calibration,
+                    manual_masks,
+                    manual_buffer_sec=self.store.global_pupil_missing_buffer_sec(),
+                )
                 extra_large_intervals = mask_to_intervals(payload.t, extra_large_mask)
                 for idx, (start_t, end_t) in enumerate(extra_large_intervals):
                     pupil_ax.axvspan(
@@ -1955,19 +1823,16 @@ class MetricsTab(QWidget):
             self._update_movie_locomotion_warning(None, None)
             self._make_threshold_lines(pupil_ax)
             bounds = self._trace_bounds_from_arrays(pupil_t, loc_t, face_t, lock_t)
-
         self._refresh_axis_legend(pupil_ax)
         self._refresh_axis_legend(loc_ax)
         self._refresh_axis_legend(face_ax)
         self._refresh_axis_legend(lock_ax)
         self._apply_trace_bounds(bounds)
         self.canvas.draw_idle()
-
     def _refresh_axis_legend(self, ax):
         handles, labels = ax.get_legend_handles_labels()
         if handles:
             ax.legend(loc="upper right", frameon=False)
-
     def _update_video(self):
         show_video = self.view_mode == "Session"
         self.mask_group.setVisible(show_video)
@@ -2000,7 +1865,6 @@ class MetricsTab(QWidget):
             self.mask_group.setEnabled(False)
             self._clear_cursor_lines()
         self._update_movie_locomotion_warning(summary, payload)
-
     def _refresh_interval_list(self):
         self.interval_list.clear()
         if self.view_mode != "Session" or not self.exp_id:
@@ -2008,19 +1872,16 @@ class MetricsTab(QWidget):
         for start, end in self.store.load_manual_masks(self.exp_id):
             self._add_interval_item(start, end)
         self._pending_mask_start = None
-
     def _add_interval_item(self, start: float, end: float):
         label = f"{format_seconds(start)}  ->  {format_seconds(end)}"
         item = QListWidgetItem(label)
         item.setData(Qt.UserRole, (float(start), float(end)))
         self.interval_list.addItem(item)
-
     def _set_interval_start(self):
         if self.view_mode != "Session" or self.video_widget.current_time() is None:
             return
         self._pending_mask_start = float(self.video_widget.current_time())
         self.video_time_label.setText(f"Start set at {format_seconds(self._pending_mask_start)}")
-
     def _set_interval_end(self):
         if self.view_mode != "Session" or self._pending_mask_start is None:
             return
@@ -2031,17 +1892,14 @@ class MetricsTab(QWidget):
         self._add_interval_item(start, end)
         self._pending_mask_start = None
         self.video_time_label.setText(f"Added interval {format_seconds(start)} -> {format_seconds(end)}")
-
     def _delete_selected_interval(self):
         row = self.interval_list.currentRow()
         if row < 0:
             return
         self.interval_list.takeItem(row)
-
     def _clear_intervals(self):
         self.interval_list.clear()
         self._pending_mask_start = None
-
     def _save_intervals(self):
         if self.view_mode != "Session" or not self.exp_id:
             return
@@ -2055,16 +1913,165 @@ class MetricsTab(QWidget):
         self._refresh_interval_list()
         self.masks_changed.emit()
         self.refresh()
-
     def _format_extra_large_calibration_text(self, calibration: dict | None) -> str:
         if calibration is None:
-            return "No confirmed calibration. Awaiting automatic suggestion."
+            return "No confirmed calibration. Select a period or use the suggestion, then confirm to train the extra-large similarity rule."
         start, end = calibration["interval"]
-        return (
-            f"Confirmed: {format_seconds(float(start))} -> {format_seconds(float(end))} | "
-            f"threshold={float(calibration['threshold']):.2f}"
+        parts = [f"Confirmed: {format_seconds(float(start))} -> {format_seconds(float(end))}"]
+        details = self._extra_large_calibration_details(calibration)
+        if details:
+            parts.append(details)
+        if calibration.get("legacy", False):
+            parts.append("legacy calibration, please reconfirm")
+        return " | ".join(parts)
+    def _calibration_selection_interval(self) -> tuple[float, float] | None:
+        if self._calibration_selection_start is None or self._calibration_selection_end is None:
+            return None
+        start = float(self._calibration_selection_start)
+        end = float(self._calibration_selection_end)
+        if not np.isfinite(start) or not np.isfinite(end) or end == start:
+            return None
+        if end < start:
+            start, end = end, start
+        return (start, end)
+    def _extra_large_calibration_details(self, calibration: dict | None) -> str:
+        if calibration is None:
+            return ""
+        parts: list[str] = []
+        band = calibration.get("reference_band")
+        if band is not None and len(band) >= 2:
+            parts.append(f"pupil band={float(band[0]):.2f}..{float(band[1]):.2f}")
+        ref_mean = calibration.get("reference_mean")
+        ref_std = calibration.get("reference_std")
+        if ref_mean is not None and ref_std is not None:
+            parts.append(f"reference mean±spread={float(ref_mean):.2f}±{float(ref_std):.2f}")
+        similarity_cutoff = calibration.get("similarity_cutoff")
+        if similarity_cutoff is not None:
+            parts.append(f"similarity cutoff={float(similarity_cutoff):.3f}")
+        selected_frames = calibration.get("selected_frames")
+        if selected_frames is not None:
+            parts.append(f"{int(selected_frames)} frames")
+        return " | ".join(parts)
+    def _calibration_from_interval(
+        self,
+        summary: SessionSummary,
+        payload: LoadedSession,
+        interval: tuple[float, float],
+    ) -> dict | None:
+        brightness_t, brightness = self.store.load_pupil_brightness(summary.exp_id)
+        if brightness_t is None or brightness is None or not brightness.size:
+            return None
+        reference = learn_extra_large_reference_band(np.asarray(brightness_t, dtype=float), np.asarray(brightness, dtype=float), interval)
+        if reference is None:
+            return None
+        similarity_t, similarity = self.store.load_eye_similarity(summary.exp_id, reference["reference_band"])
+        if similarity_t is None or similarity is None or not similarity.size:
+            return None
+        n = min(int(np.asarray(payload.t, dtype=float).size), int(np.asarray(brightness, dtype=float).size), int(np.asarray(similarity, dtype=float).size))
+        if n <= 0:
+            return None
+        calibration = learn_extra_large_calibration(
+            np.asarray(brightness_t, dtype=float)[:n],
+            np.asarray(brightness, dtype=float)[:n],
+            np.asarray(similarity, dtype=float)[:n],
+            interval,
         )
-
+        if calibration is None:
+            return None
+        calibration["selected_exp_id"] = summary.exp_id
+        return calibration
+    def _resolve_extra_large_calibration(
+        self,
+        calibration: dict | None,
+        summary: SessionSummary,
+        payload: LoadedSession,
+    ) -> dict | None:
+        if calibration is None:
+            return None
+        if calibration.get("reference_band") is not None and calibration.get("similarity_cutoff") is not None:
+            return calibration
+        interval = calibration.get("interval")
+        if interval is None:
+            return calibration
+        resolved = self._calibration_from_interval(summary, payload, interval)
+        if resolved is None:
+            return calibration
+        resolved["confirmed"] = bool(calibration.get("confirmed", False))
+        if calibration.get("legacy", False):
+            resolved["legacy"] = True
+        if calibration.get("selected_exp_id") is not None:
+            resolved["selected_exp_id"] = calibration["selected_exp_id"]
+        if calibration.get("manual_selection") is not None:
+            resolved["manual_selection"] = calibration["manual_selection"]
+        if calibration.get("candidate_source") is not None:
+            resolved["candidate_source"] = calibration["candidate_source"]
+        return resolved
+    def _selected_extra_large_calibration(self) -> dict | None:
+        if self.view_mode != "Session" or self.exp_id == "":
+            return None
+        interval = self._calibration_selection_interval()
+        if interval is None:
+            return None
+        summary = self._current_session or self.store.get_session_summary(self.exp_id)
+        if summary is None:
+            return None
+        raw_payload = self._current_payload if self._current_payload is not None and self._current_payload.summary.exp_id == summary.exp_id else self._load_session_payload(summary)
+        payload = self._analysis_payload(raw_payload, summary)
+        calibration = self._calibration_from_interval(summary, payload, interval)
+        if calibration is None:
+            return None
+        calibration["selected_exp_id"] = summary.exp_id
+        calibration["manual_selection"] = True
+        return calibration
+    def _active_extra_large_calibration(self) -> dict | None:
+        if self.view_mode != "Session" or self.exp_id == "":
+            return None
+        summary = self._current_session or self.store.get_session_summary(self.exp_id)
+        if summary is None:
+            return None
+        raw_payload = self._current_payload if self._current_payload is not None and self._current_payload.summary.exp_id == summary.exp_id else self._load_session_payload(summary)
+        payload = self._analysis_payload(raw_payload, summary)
+        selected = self._selected_extra_large_calibration()
+        if selected is not None:
+            return selected
+        confirmed = self.store.session_extra_large_calibration(self.exp_id)
+        confirmed = self._resolve_extra_large_calibration(confirmed, summary, payload) if confirmed is not None else None
+        if confirmed is not None:
+            return confirmed
+        suggestion = self._calibration_suggestion
+        if suggestion is not None:
+            suggestion = self._resolve_extra_large_calibration(suggestion, summary, payload)
+        return suggestion
+    def _set_extra_large_calibration_start(self):
+        if self.view_mode != "Session" or self.exp_id == "":
+            return
+        current_time = self.video_widget.current_time()
+        if current_time is None or not np.isfinite(current_time):
+            return
+        self._calibration_selection_start = float(current_time)
+        self.refresh()
+    def _set_extra_large_calibration_end(self):
+        if self.view_mode != "Session" or self.exp_id == "":
+            return
+        current_time = self.video_widget.current_time()
+        if current_time is None or not np.isfinite(current_time):
+            return
+        self._calibration_selection_end = float(current_time)
+        self.refresh()
+    def _clear_extra_large_calibration_selection(self):
+        if self.view_mode != "Session" or self.exp_id == "":
+            return
+        self._calibration_selection_start = None
+        self._calibration_selection_end = None
+        self.refresh()
+    def _go_to_extra_large_calibration(self):
+        calibration = self._active_extra_large_calibration()
+        if calibration is None:
+            return
+        interval = calibration.get("interval")
+        if not interval:
+            return
+        self.video_widget.seek_time(float(interval[0]))
     def _refresh_extra_large_calibration_controls(
         self,
         summary: SessionSummary | None,
@@ -2076,15 +2083,20 @@ class MetricsTab(QWidget):
         if self.view_mode != "Session" or summary is None or payload is None or not payload.has_pupil or not payload.radius.size:
             self._calibration_suggestion = None
             self.calibration_status_label.setText("No calibration suggestion available for this session.")
+            self.calibration_selection_label.setText("Selected period: none")
+            self.set_calibration_start_btn.setEnabled(False)
+            self.set_calibration_end_btn.setEnabled(False)
+            self.clear_calibration_selection_btn.setEnabled(False)
+            self.goto_calibration_btn.setEnabled(False)
             self.confirm_calibration_btn.setEnabled(False)
             self.clear_calibration_btn.setEnabled(False)
             return
-
-        confirmed = self.store.session_extra_large_calibration(summary.exp_id)
+        confirmed_raw = self.store.session_extra_large_calibration(summary.exp_id)
+        confirmed = self._resolve_extra_large_calibration(confirmed_raw, summary, payload) if confirmed_raw is not None else None
         brightness_t, brightness = self.store.load_pupil_brightness(summary.exp_id)
-        suggestion = None
+        raw_suggestion = None
         if brightness_t is not None and brightness is not None and brightness.size:
-            suggestion = suggest_extra_large_calibration(
+            raw_suggestion = suggest_extra_large_calibration(
                 np.asarray(payload.t, dtype=float),
                 np.asarray(payload.radius, dtype=float),
                 np.asarray(payload.visible_mask_base, dtype=bool),
@@ -2093,61 +2105,107 @@ class MetricsTab(QWidget):
                 self._zscore_std,
                 self._threshold_values,
             )
+        suggestion = self._resolve_extra_large_calibration(raw_suggestion, summary, payload) if raw_suggestion is not None else None
         self._calibration_suggestion = suggestion
-
+        selection_interval = self._calibration_selection_interval()
+        selection = self._selected_extra_large_calibration()
         status_lines = []
         status_lines.append(self._format_extra_large_calibration_text(confirmed))
-        if suggestion is None:
+        if selection is not None:
+            start, end = selection["interval"]
+            details = self._extra_large_calibration_details(selection)
+            status_lines.append(
+                f"Selected: {format_seconds(float(start))} -> {format_seconds(float(end))}" + (f" | {details}" if details else "")
+            )
+            status_lines.append("This selection is not active until you confirm it.")
+        elif suggestion is None:
             status_lines.append("Suggested: no suitable big-detected interval was found.")
-            confirm_enabled = False
         else:
             start, end = suggestion["interval"]
+            details = self._extra_large_calibration_details(suggestion)
             status_lines.append(
-                f"Suggested: {format_seconds(float(start))} -> {format_seconds(float(end))} | "
-                f"threshold={float(suggestion['threshold']):.2f} ({suggestion['selected_frames']} frames)"
+                f"Suggested: {format_seconds(float(start))} -> {format_seconds(float(end))}" + (f" | {details}" if details else "")
             )
             if confirmed is not None and tuple(map(float, confirmed["interval"])) != tuple(map(float, suggestion["interval"])):
                 status_lines.append("The suggestion differs from the confirmed calibration. Confirm again to update it.")
             elif confirmed is None:
                 status_lines.append("This suggestion is not active until you confirm it.")
-            confirm_enabled = True
+        confirm_enabled = selection is not None or suggestion is not None
         self.calibration_status_label.setText("\n".join(status_lines))
+        if selection is not None:
+            details = self._extra_large_calibration_details(selection)
+            self.calibration_selection_label.setText(
+                f"Selected period: {format_seconds(float(selection['interval'][0]))} -> {format_seconds(float(selection['interval'][1]))}" + (f" | {details}" if details else "")
+            )
+        elif self._calibration_selection_start is not None and self._calibration_selection_end is None:
+            self.calibration_selection_label.setText(
+                f"Selected period: start at {format_seconds(float(self._calibration_selection_start))}; end not set yet"
+            )
+        elif self._calibration_selection_start is None and self._calibration_selection_end is not None:
+            self.calibration_selection_label.setText(
+                f"Selected period: end at {format_seconds(float(self._calibration_selection_end))}; start not set yet"
+            )
+        elif selection_interval is not None:
+            self.calibration_selection_label.setText(
+                f"Selected period: {format_seconds(float(selection_interval[0]))} -> {format_seconds(float(selection_interval[1]))} | ready to confirm similarity rule"
+            )
+        else:
+            self.calibration_selection_label.setText("Selected period: none")
+        self.set_calibration_start_btn.setEnabled(True)
+        self.set_calibration_end_btn.setEnabled(True)
+        self.clear_calibration_selection_btn.setEnabled(
+            self._calibration_selection_start is not None or self._calibration_selection_end is not None
+        )
+        self.goto_calibration_btn.setEnabled(confirmed is not None or selection is not None or suggestion is not None)
+        if selection is not None:
+            self.goto_calibration_btn.setToolTip(
+                f"Jump the video player to the selected calibration start at {format_seconds(float(selection['interval'][0]))}."
+            )
+        elif confirmed is not None:
+            self.goto_calibration_btn.setToolTip(
+                f"Jump the video player to the confirmed calibration start at {format_seconds(float(confirmed['interval'][0]))}."
+            )
+        elif suggestion is not None:
+            self.goto_calibration_btn.setToolTip(
+                f"Jump the video player to the suggested calibration start at {format_seconds(float(suggestion['interval'][0]))}."
+            )
+        else:
+            self.goto_calibration_btn.setToolTip("No calibration interval is available for this session.")
         self.confirm_calibration_btn.setEnabled(confirm_enabled)
         self.clear_calibration_btn.setEnabled(confirmed is not None)
-
         if pupil_ax is not None and summary is not None and payload is not None and payload.has_pupil and payload.radius.size:
             if confirmed is not None:
                 start, end = confirmed["interval"]
                 pupil_ax.axvspan(start, end, color="tab:blue", alpha=0.12, label="confirmed calibration")
+            if selection is not None:
+                start, end = selection["interval"]
+                pupil_ax.axvspan(start, end, color="tab:orange", alpha=0.14, label="selected calibration")
             if suggestion is not None:
                 start, end = suggestion["interval"]
                 label = "suggested calibration" if confirmed is None else "suggested calibration (pending)"
                 pupil_ax.axvspan(start, end, color="tab:cyan", alpha=0.12, label=label)
-
     def _confirm_extra_large_calibration(self):
         if self.view_mode != "Session" or self.exp_id == "":
             return
-        suggestion = self._calibration_suggestion
-        if not suggestion:
+        calibration = self._selected_extra_large_calibration()
+        if calibration is None:
+            calibration = self._calibration_suggestion
+        if not calibration:
             return
-        interval = suggestion["interval"]
-        threshold = suggestion["threshold"]
-        self.store.set_session_extra_large_calibration(self.exp_id, interval, threshold, confirmed=True)
+        self.store.set_session_extra_large_calibration(self.exp_id, calibration, confirmed=True)
         self.session_state_changed.emit()
         self.refresh()
-
     def _clear_extra_large_calibration(self):
         if self.view_mode != "Session" or self.exp_id == "":
             return
+        self._calibration_selection_start = None
+        self._calibration_selection_end = None
         self.store.clear_session_extra_large_calibration(self.exp_id)
         self.session_state_changed.emit()
         self.refresh()
-
     def _on_video_time_changed(self, value: float):
         self.video_time_label.setText(f"Current video time: {format_seconds(value)}")
         self._set_cursor_position(value)
-
-
 class StatisticsTab(QWidget):
     def __init__(self, store: HabituationStore, parent=None):
         super().__init__(parent)
@@ -2171,18 +2229,15 @@ class StatisticsTab(QWidget):
         self.log_toggle.setChecked(True)
         self.log_toggle.toggled.connect(self._set_log_visible)
         self.log_toggle.setToolTip("Show or hide the statistics log and file paths.")
-
         self.summary_edit = QPlainTextEdit(self)
         self.summary_edit.setReadOnly(True)
         self.summary_edit.setPlaceholderText("Statistics output will appear here after the analysis runs.")
         self.summary_edit.setMinimumHeight(220)
-
         self.log_panel = QWidget(self)
         log_layout = QVBoxLayout(self.log_panel)
         log_layout.setContentsMargins(0, 0, 0, 0)
         log_layout.addWidget(self._paths_label)
         log_layout.addWidget(self.summary_edit, stretch=1)
-
         self._plot_title_label = QLabel("No plot selected.", self)
         self._plot_title_label.setAlignment(Qt.AlignCenter)
         self._plot_title_label.setWordWrap(True)
@@ -2201,18 +2256,15 @@ class StatisticsTab(QWidget):
         self._plot_next_button.clicked.connect(lambda: self._step_plot(1))
         self._plot_counter_label = QLabel("", self)
         self._plot_counter_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
         self.run_button = QPushButton("Run statistics now", self)
         self.run_button.clicked.connect(self.run_current_scope)
         self.run_all_button = QPushButton("Run all animals", self)
         self.run_all_button.clicked.connect(self.run_all_animals)
         self.run_all_button.setToolTip("Run statistics separately for every animal in the dataset.")
-
         button_row = QHBoxLayout()
         button_row.addWidget(self.run_button)
         button_row.addWidget(self.run_all_button)
         button_row.addStretch(1)
-
         layout = QVBoxLayout(self)
         layout.addWidget(self._scope_label)
         layout.addWidget(self._status_label)
@@ -2227,7 +2279,6 @@ class StatisticsTab(QWidget):
         plot_nav.addStretch(1)
         plot_nav.addWidget(self._plot_counter_label)
         layout.addLayout(plot_nav)
-
     def set_context(self, animal_id: str, view_mode: str):
         changed = animal_id != self.animal_id or view_mode != self.view_mode
         self.animal_id = animal_id
@@ -2235,13 +2286,20 @@ class StatisticsTab(QWidget):
         self._scope_label.setText(f"Statistics scope: {animal_id} | View: {view_mode}")
         if changed:
             self._prompted_for_entry = False
-            self._set_placeholder(f"Loading statistics for {animal_id}...")
-            QApplication.processEvents()
-            if self._show_cached_statistics_for_context():
-                self._prompted_for_entry = True
-            else:
-                self._set_placeholder(f"Statistics for {animal_id} are not running yet.")
-
+        self._reload_current_context(changed=changed)
+    def refresh(self):
+        self._reload_current_context(changed=True)
+    def _reload_current_context(self, *, changed: bool):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        if not changed:
+            return
+        self._set_placeholder(f"Loading statistics for {self.animal_id}...")
+        QApplication.processEvents()
+        if self._show_cached_statistics_for_context():
+            self._prompted_for_entry = True
+        else:
+            self._set_placeholder(f"Statistics for {self.animal_id} are not running yet.")
     def _set_placeholder(self, message: str):
         self._status_label.setText(message)
         self.summary_edit.setPlainText(message)
@@ -2249,15 +2307,12 @@ class StatisticsTab(QWidget):
         self._current_result = None
         self._current_paths = None
         self._set_plot_pages([])
-
     def _set_log_visible(self, visible: bool):
         self.log_panel.setVisible(bool(visible))
-
     def _set_plot_pages(self, pages: list[tuple[str, Path]]):
         self._plot_pages = [(title, Path(path)) for title, path in pages if Path(path).exists()]
         self._plot_index = 0
         self._show_current_plot_page()
-
     def _load_plot_pages_from_output_dir(self, output_dir: Path):
         pages: list[tuple[str, Path]] = []
         for title, path in statistics_panel_paths(output_dir):
@@ -2269,7 +2324,6 @@ class StatisticsTab(QWidget):
             if summary_path.exists():
                 pages.append(("Statistics summary", summary_path))
         self._set_plot_pages(pages)
-
     def _show_current_plot_page(self):
         if not self._plot_pages:
             self._plot_title_label.setText("No plot selected.")
@@ -2294,7 +2348,6 @@ class StatisticsTab(QWidget):
         self.figure_label.setText("")
         self._refresh_figure_preview()
         self._update_plot_controls()
-
     def _update_plot_controls(self):
         enabled = len(self._plot_pages) > 1
         self._plot_prev_button.setEnabled(enabled)
@@ -2303,13 +2356,11 @@ class StatisticsTab(QWidget):
             self._plot_counter_label.setText(f"{self._plot_index + 1}/{len(self._plot_pages)}")
         else:
             self._plot_counter_label.setText("")
-
     def _step_plot(self, delta: int):
         if not self._plot_pages:
             return
         self._plot_index = (self._plot_index + int(delta)) % len(self._plot_pages)
         self._show_current_plot_page()
-
     def _display_statistics_payload(self, payload: dict, *, status_prefix: str | None = None):
         result = payload["result"]
         result_path, svg_path, png_path = payload["paths"]
@@ -2321,7 +2372,6 @@ class StatisticsTab(QWidget):
         self._paths_label.setText(f"Saved: {result_path}\nSVG: {svg_path}\nPNG: {png_path}")
         self.summary_edit.setPlainText(self._format_result_text(result))
         self._load_plot_pages_from_output_dir(Path(result_path).parent)
-
     def _show_cached_statistics_for_context(self) -> bool:
         if self._worker is not None and self._worker.isRunning():
             return False
@@ -2338,12 +2388,9 @@ class StatisticsTab(QWidget):
         result, result_paths = cached
         self._display_statistics_payload({"result": result, "paths": result_paths, "cached": True})
         return True
-
-
     def _set_figure_preview(self, pixmap: QtGui.QPixmap):
         self._current_figure_pixmap = QtGui.QPixmap(pixmap)
         self._refresh_figure_preview()
-
     def _refresh_figure_preview(self):
         if self._current_figure_pixmap.isNull():
             return
@@ -2361,11 +2408,9 @@ class StatisticsTab(QWidget):
             Qt.SmoothTransformation,
         )
         self.figure_label.setPixmap(scaled)
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_figure_preview()
-
     def maybe_prompt_and_run(self):
         if self._worker is not None and self._worker.isRunning():
             return
@@ -2384,24 +2429,20 @@ class StatisticsTab(QWidget):
         )
         if answer == QMessageBox.Yes:
             self.run_current_scope()
-
     def _set_statistics_running(self, message: str):
         self._status_label.setText(message)
         self.run_button.setEnabled(False)
         self.run_all_button.setEnabled(False)
-
     def _finish_statistics_run(self):
         self.run_button.setEnabled(True)
         self.run_all_button.setEnabled(True)
         self._worker = None
-
     def _start_statistics_worker(self, job, on_result):
         self._worker = TaskThread(job, self)
         self._worker.progress.connect(self._on_progress)
         self._worker.result_ready.connect(on_result)
         self._worker.error.connect(self._on_error)
         self._worker.start()
-
     def _ask_all_animals_mode(self) -> str | None:
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             return "all"
@@ -2419,14 +2460,12 @@ class StatisticsTab(QWidget):
         if clicked == missing_button:
             return "missing"
         return None
-
     def run_current_scope(self):
         if self._worker is not None and self._worker.isRunning():
             return
         scope = self.animal_id
         self._set_statistics_running(f"Running statistics for {scope}...")
         self._start_statistics_worker(self._build_statistics_job(scope), self._on_result)
-
     def run_all_animals(self):
         if self._worker is not None and self._worker.isRunning():
             return
@@ -2442,7 +2481,6 @@ class StatisticsTab(QWidget):
         mode_label = "all animals + overall" if mode == "all" else "animals without saved stats + overall"
         self._set_statistics_running(f"Running statistics for {len(animals)} scopes ({mode_label})...")
         self._start_statistics_worker(self._build_all_statistics_job(animals, mode), self._on_batch_result)
-
     @staticmethod
     def _threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec) -> dict:
         return {
@@ -2451,11 +2489,9 @@ class StatisticsTab(QWidget):
             "locomotion_threshold": float(locomotion_threshold),
             "missing_buffer_sec": float(missing_buffer_sec),
         }
-
     def _build_statistics_job(self, scope: str):
         percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = self._threshold_inputs_for_animal(scope)
         thresholds = self._threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec)
-
         def job(progress_cb):
             cached = load_cached_statistics_outputs(
                 self.store,
@@ -2478,12 +2514,9 @@ class StatisticsTab(QWidget):
             )
             result_paths = save_statistics_outputs(self.store, result)
             return {"result": result, "paths": result_paths, "cached": False}
-
         return job
-
     def _build_all_statistics_job(self, animals: list[str], mode: str):
         threshold_inputs = {animal: self._threshold_inputs_for_animal(animal) for animal in animals}
-
         def job(progress_cb):
             outputs = []
             skipped = []
@@ -2508,11 +2541,9 @@ class StatisticsTab(QWidget):
                         outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
                         progress_cb((idx + 1) / total, f"{animal}: loaded cached statistics")
                         continue
-
                 def animal_progress(fraction: float, message: str, *, idx=idx, animal=animal):
                     overall = (idx + float(fraction)) / total
                     progress_cb(overall, f"{animal}: {message}")
-
                 result = compute_statistics(
                     self.store,
                     scope=animal,
@@ -2526,9 +2557,7 @@ class StatisticsTab(QWidget):
                 result_paths = save_statistics_outputs(self.store, result)
                 outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": False})
             return {"mode": "all_animals", "selection_mode": mode, "results": outputs, "skipped": skipped}
-
         return job
-
     def _analysis_animals(self) -> list[str]:
         animals = []
         for animal in self.store.animals():
@@ -2538,7 +2567,6 @@ class StatisticsTab(QWidget):
             ):
                 animals.append(animal)
         return animals
-
     def _threshold_inputs_for_animal(self, animal_id: str):
         global_percentiles = self.store.global_pupil_percentile_cutoffs()
         locomotion_threshold = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
@@ -2559,7 +2587,6 @@ class StatisticsTab(QWidget):
                     locomotion_threshold,
                     float(metrics.missing_buffer_spin.value()),
                 )
-
         if animal_id == "All":
             mean, std = compute_animal_baseline(self.store, "All", scope="All")
             zmap = animal_zscores(self.store, "All", mean=mean, std=std)
@@ -2567,7 +2594,6 @@ class StatisticsTab(QWidget):
             distribution = np.concatenate(pooled) if pooled else np.array([], dtype=float)
             threshold_values = percentile_threshold_values(distribution, global_percentiles) if distribution.size else [0.0, 0.0, 0.0]
             return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
-
         settings = self.store.get_animal_settings(animal_id)
         threshold_values = settings.get("threshold_values", [0.0, 0.5, 1.0])
         threshold_signature = str(settings.get("threshold_signature", ""))
@@ -2582,24 +2608,19 @@ class StatisticsTab(QWidget):
             settings["threshold_signature"] = global_signature
             self.store.set_animal_settings(animal_id, settings)
         return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
-
     def _current_threshold_inputs(self):
         return self._threshold_inputs_for_animal(self.animal_id)
-
     def _on_progress(self, fraction: float, message: str):
         self._status_label.setText(f"{message} ({fraction * 100.0:.0f}%)")
-
     def _on_error(self, message: str):
         self._finish_statistics_run()
         self._status_label.setText("Statistics failed.")
         self._set_message_box_error(message)
-
     def _set_message_box_error(self, message: str):
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             print(message)
             return
         QMessageBox.critical(self, "Statistics error", message)
-
     def _on_result(self, payload: dict):
         self._finish_statistics_run()
         self._display_statistics_payload(payload)
@@ -2632,7 +2653,6 @@ class StatisticsTab(QWidget):
             self._status_label.setText(f"Batch statistics complete for {len(results)} animals{extra}.")
         else:
             self._status_label.setText(f"No animals needed rerun; {len(skipped)} cached stats were already up to date.")
-
         active_items = results + skipped
         matching_item = next((item for item in active_items if item["animal_id"] == self.animal_id), None)
         if matching_item is None and self.animal_id == "All":
@@ -2675,8 +2695,6 @@ class StatisticsTab(QWidget):
             )
             lines.append(f"  {session}: {state_text}")
         return "\n".join(lines)
-
-
     def _format_batch_result_text(self, payload: dict, active_items: list[dict], selected_item: dict) -> str:
         results = payload.get("results", [])
         skipped = payload.get("skipped", [])
@@ -2684,7 +2702,6 @@ class StatisticsTab(QWidget):
         computed_ids = {str(item.get("animal_id", "")) for item in results if not item.get("cached")}
         loaded_ids = {str(item.get("animal_id", "")) for item in results if item.get("cached")}
         selected_id = str(selected_item.get("animal_id", ""))
-
         lines = [
             f"Batch mode: {payload.get('selection_mode', 'all')}",
             f"Animals processed: {len(active_items)}",
@@ -2702,7 +2719,6 @@ class StatisticsTab(QWidget):
             else:
                 status = "processed"
             lines.append(f"  - {animal_id}: {status}")
-
         lines.extend([
             "",
             f"Showing detailed statistics for: {selected_id}",
@@ -2710,8 +2726,6 @@ class StatisticsTab(QWidget):
             self._format_result_text(selected_item["result"]),
         ])
         return "\n".join(lines)
-
-
 class HabituationMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2734,7 +2748,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self._initializing = True
         self._worker: TaskThread | None = None
         self._stats_prompted_for_entry = False
-
         self.animal_combo = ScrollableComboBox(self, visible_rows=4)
         self.animal_combo.setMinimumWidth(240)
         self.animal_combo.setMinimumContentsLength(12)
@@ -2748,13 +2761,11 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.update_btn = QPushButton("Update dataset", self)
         self.status_label = QLabel("", self)
         self.status_label.setWordWrap(True)
-
         self.animal_combo.currentIndexChanged.connect(self._on_browser_changed)
         self.exp_combo.currentIndexChanged.connect(self._on_browser_changed)
         self.prev_btn.clicked.connect(self._go_prev_session)
         self.next_btn.clicked.connect(self._go_next_session)
         self.update_btn.clicked.connect(self._update_dataset)
-
         top_bar = QHBoxLayout()
         top_bar.addWidget(QLabel("Animal", self))
         top_bar.addWidget(self.animal_combo)
@@ -2763,26 +2774,21 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.exp_combo, stretch=1)
         top_bar.addWidget(self.next_btn)
         top_bar.addWidget(self.update_btn)
-
         top_widget = QWidget(self)
         top_widget.setLayout(top_bar)
-
         self.tabs = QtWidgets.QTabWidget(self)
         self.metrics_tab = MetricsTab(self.store, self)
         self.statistics_tab = StatisticsTab(self.store, self)
         self.tabs.addTab(self.metrics_tab, "Metrics")
         self.tabs.addTab(self.statistics_tab, "Statistics")
         self.tabs.currentChanged.connect(self._on_tab_changed)
-
         main_layout = QVBoxLayout()
         main_layout.addWidget(top_widget)
         main_layout.addWidget(self.tabs, stretch=1)
         main_layout.addWidget(self.status_label)
-
         central = QWidget(self)
         central.setLayout(main_layout)
         self.setCentralWidget(central)
-
         self.metrics_tab.experiment_index.sessionActivated.connect(self._open_index_session)
         self.metrics_tab.reference_sessions.sessionActivated.connect(self._open_index_session)
         self.metrics_tab.thresholds_changed.connect(self._on_scope_changed)
@@ -2793,42 +2799,34 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.metrics_tab.session_state_changed.connect(self.metrics_tab.experiment_index.refresh)
         self.metrics_tab.session_state_changed.connect(self.metrics_tab.reference_sessions.refresh)
         self.metrics_tab.session_state_changed.connect(self.statistics_tab.refresh)
-
         self._populate_browser(initial=True)
         self._apply_saved_state()
         self._initializing = False
         self._sync_browser_state()
         self.statusBar().showMessage(f"Loaded {len(self.index.sessions)} sessions from cache/source trees")
-
     def _animals_for_combo(self) -> list[str]:
         return ["All"] + self.store.animals()
-
     def _sessions_for_scope(self, animal_id: str) -> list[SessionSummary]:
         if animal_id == "All":
             return self.store.dataset_sessions()
         return self.store.sessions_for_animal(animal_id)
-
     def _populate_browser(self, initial: bool = False):
         animal = self.animal_combo.currentText() if self.animal_combo.count() else self.app_state.get("selected_animal", "All")
         exp = self.app_state.get("selected_exp_id", "")
         view = self.app_state.get("view_mode", "Session")
-
         blocker = QtCore.QSignalBlocker(self.animal_combo)
         self.animal_combo.clear()
         self.animal_combo.addItems(self._animals_for_combo())
         del blocker
-
         if animal not in [self.animal_combo.itemText(i) for i in range(self.animal_combo.count())]:
             animal = self.app_state.get("selected_animal", "All")
             if animal not in [self.animal_combo.itemText(i) for i in range(self.animal_combo.count())]:
                 animal = "All"
         self.animal_combo.setCurrentText(animal)
-
         self._populate_exp_combo(animal, exp, prefer_overall=view == "Overall" or animal == "All")
         self._sync_browser_state()
         if initial and self.tabs.currentIndex() != 0:
             self.tabs.setCurrentIndex(0)
-
     def _apply_saved_state(self):
         animal = self.app_state.get("selected_animal", "All")
         exp = self.app_state.get("selected_exp_id", "")
@@ -2837,7 +2835,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
             self.animal_combo.setCurrentText(animal)
         self._populate_exp_combo(self.animal_combo.currentText(), exp, prefer_overall=view == "Overall" or animal == "All")
         self._sync_browser_state()
-
     def _populate_exp_combo(self, animal: str, preferred: str | None = None, *, prefer_overall: bool = False):
         sessions = self._sessions_for_scope(animal)
         blocker = QtCore.QSignalBlocker(self.exp_combo)
@@ -2895,10 +2892,8 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
             self.exp_combo.setCurrentIndex(1)
         elif self.exp_combo.count():
             self.exp_combo.setCurrentIndex(0)
-
     def _current_animal(self) -> str:
         return self.animal_combo.currentText() or "All"
-
     def _current_exp_entry(self) -> dict:
         if self.exp_combo.count() == 0:
             return {"kind": "overall" if self._current_animal() == "All" else "session", "exp_id": ""}
@@ -2909,42 +2904,35 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         if text == "Overall":
             return {"kind": "overall", "exp_id": ""}
         return {"kind": "session", "exp_id": text}
-
     def _current_view_mode(self) -> str:
         return "Overall" if self._current_exp_entry().get("kind") == "overall" else "Session"
-
     def _current_exp_id(self) -> str:
         entry = self._current_exp_entry()
         if entry.get("kind") == "session":
             return str(entry.get("exp_id", ""))
         return ""
-
     def _current_summary(self) -> SessionSummary | None:
         exp_id = self._current_exp_id()
         if not exp_id:
             return None
         return self.store.get_session_summary(exp_id)
-
     def _current_selection_label(self) -> str:
         entry = self._current_exp_entry()
         if entry.get("kind") == "overall":
             return "Overall"
         return self._current_exp_id() or "--"
-
     def _is_placeholder_saved_state(self) -> bool:
         return (
             self.app_state.get("selected_animal", "All") == "All"
             and not self.app_state.get("selected_exp_id", "")
             and self.app_state.get("view_mode", "Session") == "Session"
         )
-
     def _first_available_session(self) -> tuple[str, str]:
         for animal in self.store.animals():
             sessions = self.store.sessions_for_animal(animal)
             if sessions:
                 return animal, sessions[0].exp_id
         return "All", ""
-
     def _sync_browser_state(self):
         if getattr(self, "_initializing", False):
             return
@@ -2962,7 +2950,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.app_state["view_mode"] = self._current_view_mode()
         self.store.save_app_state(self.app_state)
         self._refresh_contexts()
-
     def _refresh_contexts(self):
         if getattr(self, "_initializing", False):
             return
@@ -2977,7 +2964,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.status_label.setText(
             f"Selected scope: {animal} | Selection: {self._current_selection_label()} | View: {view} | Output: {self.store.source_root / 'gui_output'}"
         )
-
     def _on_browser_changed(self):
         if self._updating_browser or getattr(self, "_initializing", False):
             return
@@ -2993,7 +2979,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
             self._sync_browser_state()
         finally:
             self._updating_browser = False
-
     def _open_index_session(self, animal_id: str, exp_id: str):
         self._updating_browser = True
         try:
@@ -3008,7 +2993,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
             self.tabs.setCurrentIndex(0)
         finally:
             self._updating_browser = False
-
     def _go_prev_session(self):
         if self.exp_combo.count() <= 1 or self._current_view_mode() != "Session":
             return
@@ -3016,7 +3000,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         if idx <= 1:
             return
         self.exp_combo.setCurrentIndex(idx - 1)
-
     def _go_next_session(self):
         if self.exp_combo.count() <= 1 or self._current_view_mode() != "Session":
             return
@@ -3027,13 +3010,11 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
     def _on_scope_changed(self):
         self._refresh_contexts()
         self.statusBar().showMessage("Current scope changed; statistics are marked stale.")
-
     def _update_dataset(self):
         if self._worker is not None and self._worker.isRunning():
             return
         self.update_btn.setEnabled(False)
         self.statusBar().showMessage("Refreshing dataset index...")
-
         box = QMessageBox(self)
         box.setWindowTitle("Refresh dataset")
         box.setText("Refresh the dataset index?")
@@ -3047,19 +3028,15 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         if box.exec_() != QMessageBox.Yes:
             return
         refresh_reference_sessions = refresh_reference_checkbox.isChecked()
-
         def job(progress_cb):
             return self.store.update_dataset(progress_cb, refresh_reference_sessions=refresh_reference_sessions)
-
         self._worker = TaskThread(job, self)
         self._worker.progress.connect(self._on_dataset_progress)
         self._worker.result_ready.connect(self._on_dataset_result)
         self._worker.error.connect(self._on_worker_error)
         self._worker.start()
-
     def _on_dataset_progress(self, fraction: float, message: str):
         self.statusBar().showMessage(f"{message} ({fraction * 100.0:.0f}%)")
-
     def _on_dataset_result(self, index):
         self.index = index
         self.update_btn.setEnabled(True)
@@ -3067,7 +3044,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self._sync_browser_state()
         self.metrics_tab.refresh()
         self.statusBar().showMessage(f"Dataset refreshed at {index.generated_at}")
-
     def _on_worker_error(self, message: str):
         self.update_btn.setEnabled(True)
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -3075,7 +3051,6 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         else:
             QMessageBox.critical(self, "Habituation Analysis", message)
         self.statusBar().showMessage("Operation failed")
-
     def _on_tab_changed(self, index: int):
         widget = self.tabs.widget(index)
         if widget is self.statistics_tab:
@@ -3085,15 +3060,12 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
                 self.statistics_tab.maybe_prompt_and_run()
         else:
             self._stats_prompted_for_entry = False
-
     def closeEvent(self, event: QtGui.QCloseEvent):
         self.app_state["selected_animal"] = self._current_animal()
         self.app_state["selected_exp_id"] = self._current_exp_id() or self._last_session_exp_id
         self.app_state["view_mode"] = self._current_view_mode()
         self.store.save_app_state(self.app_state)
         super().closeEvent(event)
-
-
 def main() -> int:
     if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

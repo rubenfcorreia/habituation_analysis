@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import cv2
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -175,6 +176,178 @@ def _longest_interval(intervals: list[tuple[float, float]]) -> tuple[float, floa
     return best
 
 
+def learn_extra_large_reference_band(
+    times: np.ndarray,
+    pupil_brightness: np.ndarray,
+    interval: tuple[float, float],
+) -> dict | None:
+    times = np.asarray(times, dtype=float).reshape(-1)
+    pupil_brightness = np.asarray(pupil_brightness, dtype=float).reshape(-1)
+    if times.size == 0 or pupil_brightness.size == 0:
+        return None
+    n = min(times.size, pupil_brightness.size)
+    times = times[:n]
+    pupil_brightness = pupil_brightness[:n]
+    try:
+        start = float(interval[0])
+        end = float(interval[1])
+    except Exception:
+        return None
+    if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+        return None
+    cal_mask = (times >= start) & (times < end) & np.isfinite(pupil_brightness)
+    if not np.any(cal_mask):
+        return None
+    reference_values = pupil_brightness[cal_mask]
+    reference_mean = float(np.nanmean(reference_values))
+    reference_std = float(np.nanstd(reference_values))
+    if not np.isfinite(reference_mean) or not np.isfinite(reference_std):
+        return None
+    band_low = float(np.clip(reference_mean - reference_std, 0.0, 255.0))
+    band_high = float(np.clip(reference_mean + reference_std, 0.0, 255.0))
+    if band_high < band_low:
+        band_low, band_high = band_high, band_low
+    return {
+        "interval": (float(start), float(end)),
+        "reference_mean": reference_mean,
+        "reference_std": reference_std,
+        "reference_band": (band_low, band_high),
+        "selected_frames": int(np.sum(cal_mask)),
+    }
+
+
+def learn_extra_large_calibration(
+    times: np.ndarray,
+    pupil_brightness: np.ndarray,
+    similarity: np.ndarray,
+    interval: tuple[float, float],
+) -> dict | None:
+    reference = learn_extra_large_reference_band(times, pupil_brightness, interval)
+    if reference is None:
+        return None
+    times = np.asarray(times, dtype=float).reshape(-1)
+    similarity = np.asarray(similarity, dtype=float).reshape(-1)
+    n = min(times.size, similarity.size, np.asarray(pupil_brightness, dtype=float).reshape(-1).size)
+    times = times[:n]
+    similarity = similarity[:n]
+    try:
+        start = float(interval[0])
+        end = float(interval[1])
+    except Exception:
+        return None
+    cal_mask = (times >= start) & (times < end) & np.isfinite(similarity)
+    if not np.any(cal_mask):
+        return None
+    similarity_values = similarity[cal_mask]
+    similarity_mean = float(np.nanmean(similarity_values))
+    similarity_std = float(np.nanstd(similarity_values))
+    if not np.isfinite(similarity_mean) or not np.isfinite(similarity_std):
+        return None
+    reference["similarity_mean"] = similarity_mean
+    reference["similarity_std"] = similarity_std
+    reference["similarity_cutoff"] = float(np.clip(similarity_mean - similarity_std, 0.0, 1.0))
+    reference["selected_frames"] = int(np.sum(cal_mask))
+    reference["confirmed"] = True
+    return reference
+
+
+def build_extra_large_mask(
+    store: HabituationStore,
+    bundle: SessionBundle,
+    calibration: dict | None,
+    manual_masks: list[tuple[float, float]] | None = None,
+    *,
+    manual_buffer_sec: float = 1.0,
+) -> np.ndarray:
+    times = np.asarray(bundle.t, dtype=float).reshape(-1)
+    radius = np.asarray(bundle.radius, dtype=float).reshape(-1)
+    if times.size == 0 or radius.size == 0:
+        return np.zeros(times.shape, dtype=bool)
+    n = min(times.size, radius.size)
+    times = times[:n]
+    radius = radius[:n]
+    manual_mask = _interval_mask(times, manual_masks, pad=manual_buffer_sec)
+    missing = ~np.isfinite(radius)
+    candidate = missing & ~manual_mask
+    extra_large = np.zeros(times.shape, dtype=bool)
+    if not np.any(candidate):
+        return extra_large
+
+    working = dict(calibration or {})
+    interval = working.get("interval")
+    reference_band = working.get("reference_band")
+    similarity_cutoff = working.get("similarity_cutoff")
+    if (reference_band is None or similarity_cutoff is None) and interval is not None:
+        brightness_t, brightness = store.load_pupil_brightness(bundle.summary.exp_id)
+        if brightness_t is not None and brightness is not None and brightness.size:
+            reference = learn_extra_large_reference_band(brightness_t, brightness, interval)
+            if reference is not None:
+                sim_t, similarity = store.load_eye_similarity(bundle.summary.exp_id, reference["reference_band"])
+                if sim_t is not None and similarity is not None and similarity.size:
+                    learned = learn_extra_large_calibration(brightness_t, brightness, similarity, interval)
+                    if learned is not None:
+                        working = learned
+                        reference_band = learned.get("reference_band")
+                        similarity_cutoff = learned.get("similarity_cutoff")
+    if reference_band is None or similarity_cutoff is None:
+        return _extra_large_missing_mask(bundle, manual_masks, min_duration_sec=MIN_EXTRA_LARGE_MISSING_SEC, manual_buffer_sec=manual_buffer_sec)
+    try:
+        band_low, band_high = float(reference_band[0]), float(reference_band[1])
+    except Exception:
+        return _extra_large_missing_mask(bundle, manual_masks, min_duration_sec=MIN_EXTRA_LARGE_MISSING_SEC, manual_buffer_sec=manual_buffer_sec)
+    if band_high < band_low:
+        band_low, band_high = band_high, band_low
+    similarity_t, similarity = store.load_eye_similarity(bundle.summary.exp_id, (band_low, band_high))
+    if similarity_t is None or similarity is None or not similarity.size:
+        return _extra_large_missing_mask(bundle, manual_masks, min_duration_sec=MIN_EXTRA_LARGE_MISSING_SEC, manual_buffer_sec=manual_buffer_sec)
+    n = min(times.size, similarity.size)
+    times = times[:n]
+    radius = radius[:n]
+    similarity = similarity[:n]
+    manual_mask = manual_mask[:n]
+    missing = ~np.isfinite(radius)
+    candidate = missing & ~manual_mask & np.isfinite(similarity)
+    extra_large = np.zeros(times.shape, dtype=bool)
+    extra_large[candidate & (similarity >= float(similarity_cutoff))] = True
+    return extra_large
+
+
+def _calibration_threshold_from_interval(
+    times: np.ndarray,
+    pupil_brightness: np.ndarray,
+    interval: tuple[float, float],
+    *,
+    margin_fraction: float = CALIBRATION_BRIGHTNESS_MARGIN,
+) -> dict | None:
+    times = np.asarray(times, dtype=float).reshape(-1)
+    pupil_brightness = np.asarray(pupil_brightness, dtype=float).reshape(-1)
+    if times.size == 0 or pupil_brightness.size == 0:
+        return None
+    n = min(times.size, pupil_brightness.size)
+    times = times[:n]
+    pupil_brightness = pupil_brightness[:n]
+    try:
+        start = float(interval[0])
+        end = float(interval[1])
+    except Exception:
+        return None
+    if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+        return None
+    cal_mask = (times >= start) & (times < end) & np.isfinite(pupil_brightness)
+    if not np.any(cal_mask):
+        return None
+    reference_mean = float(np.nanmean(pupil_brightness[cal_mask]))
+    if not np.isfinite(reference_mean):
+        return None
+    return {
+        "interval": (float(start), float(end)),
+        "reference_mean": reference_mean,
+        "threshold": float(reference_mean * (1.0 + float(margin_fraction))),
+        "margin_fraction": float(margin_fraction),
+        "selected_frames": int(np.sum(cal_mask)),
+    }
+
+
 def suggest_extra_large_calibration(
     times: np.ndarray,
     radius: np.ndarray,
@@ -223,22 +396,16 @@ def suggest_extra_large_calibration(
     interval = _longest_interval(intervals)
     if interval is None:
         return None
-    start, end = interval
-    cal_mask = (times >= start) & (times < end) & np.isfinite(pupil_brightness)
-    if not np.any(cal_mask):
+    calibration = _calibration_threshold_from_interval(
+        times,
+        pupil_brightness,
+        interval,
+        margin_fraction=margin_fraction,
+    )
+    if calibration is None:
         return None
-    reference_mean = float(np.nanmean(pupil_brightness[cal_mask]))
-    if not np.isfinite(reference_mean):
-        return None
-    threshold = float(reference_mean * (1.0 + float(margin_fraction)))
-    return {
-        "interval": (float(start), float(end)),
-        "reference_mean": reference_mean,
-        "threshold": threshold,
-        "margin_fraction": float(margin_fraction),
-        "selected_frames": int(np.sum(cal_mask)),
-        "candidate_source": candidate_source,
-    }
+    calibration["candidate_source"] = candidate_source
+    return calibration
 
 
 def _extra_large_missing_mask(
@@ -253,7 +420,8 @@ def _extra_large_missing_mask(
         return np.zeros(0, dtype=bool)
 
     manual_mask = _interval_mask(times, manual_masks, pad=manual_buffer_sec)
-    missing = ~np.asarray(bundle.visible_mask_base, dtype=bool)
+    radius = np.asarray(bundle.radius, dtype=float).reshape(-1)
+    missing = ~np.isfinite(radius[: times.size])
     candidate = missing & ~manual_mask
     extra_large = np.zeros(times.shape, dtype=bool)
     if not np.any(candidate):
@@ -488,15 +656,13 @@ def compute_statistics(
         not_visible_mask = _interval_mask(np.asarray(bundle.t, dtype=float), manual_masks)
 
         calibration = store.session_extra_large_calibration(summary.exp_id)
-        extra_large_mask = None
-        if calibration is not None:
-            brightness_t, brightness = store.load_pupil_brightness(summary.exp_id)
-            if brightness_t is not None and brightness is not None and brightness.size:
-                n = min(int(bundle.t.size), int(brightness.size))
-                if n > 0:
-                    extra_large_mask = visible[:n] & np.isfinite(brightness[:n]) & (brightness[:n] >= float(calibration["threshold"]))
-        if extra_large_mask is None:
-            extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
+        extra_large_mask = build_extra_large_mask(
+            store,
+            bundle,
+            calibration,
+            manual_masks,
+            manual_buffer_sec=missing_buffer_sec,
+        )
 
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
@@ -568,15 +734,13 @@ def compute_statistics(
         not_visible_mask = _interval_mask(np.asarray(bundle.t, dtype=float), manual_masks)
 
         calibration = store.session_extra_large_calibration(summary.exp_id)
-        extra_large_mask = None
-        if calibration is not None:
-            brightness_t, brightness = store.load_pupil_brightness(summary.exp_id)
-            if brightness_t is not None and brightness is not None and brightness.size:
-                n = min(int(bundle.t.size), int(brightness.size))
-                if n > 0:
-                    extra_large_mask = visible[:n] & np.isfinite(brightness[:n]) & (brightness[:n] >= float(calibration["threshold"]))
-        if extra_large_mask is None:
-            extra_large_mask = _extra_large_missing_mask(bundle, manual_masks, manual_buffer_sec=missing_buffer_sec)
+        extra_large_mask = build_extra_large_mask(
+            store,
+            bundle,
+            calibration,
+            manual_masks,
+            manual_buffer_sec=missing_buffer_sec,
+        )
 
         z = (bundle.radius.astype(float) - mean) / std
         z[~np.isfinite(z)] = np.nan
