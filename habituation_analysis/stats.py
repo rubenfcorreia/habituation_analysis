@@ -681,26 +681,64 @@ def compute_statistics(
         locomotion_values_by_session.setdefault(session_label, []).append(locomotion_pct)
 
         face_t, face_motion = store.load_face_motion(summary.exp_id)
+
         if face_t is not None and face_motion is not None and face_motion.size:
+            face_t = np.asarray(face_t, dtype=float)
+            face_motion = np.asarray(face_motion, dtype=float)
+
             face_cutoff = store.session_analysis_cutoff_sec(summary.exp_id)
             if face_cutoff is not None:
                 face_mask = analysis_cutoff_mask(face_t, face_cutoff)
+                face_t = apply_time_mask(face_t, face_mask)
                 face_motion = apply_time_mask(face_motion, face_mask)
-            face_thr = robust_face_motion_threshold(face_motion)
-            face_pct = float(np.nanmean((face_motion > face_thr).astype(float)))
-            n = min(int(face_motion.size), int(state.size))
-            if n > 0:
-                aligned_face_motion = np.asarray(face_motion[:n], dtype=float)
-                aligned_state = np.asarray(state[:n], dtype=int)
-                valid_face = np.isfinite(aligned_face_motion)
-                for state_id, state_label in enumerate(STATE_LABELS):
-                    mask = valid_face & (aligned_state == state_id)
-                    if np.any(mask):
-                        face_motion_by_state_values[state_label].append(float(np.nanmean(aligned_face_motion[mask])))
+
+            target_t = np.asarray(bundle.t, dtype=float)
+            observed = np.asarray(bundle.frame_observed, dtype=bool)
+
+            aligned_face_motion = np.full(target_t.shape, np.nan, dtype=float)
+
+            valid_src = np.isfinite(face_t) & np.isfinite(face_motion)
+
+            if np.sum(valid_src) >= 2:
+                src_t = face_t[valid_src]
+                src_motion = face_motion[valid_src]
+
+                in_range = (
+                    np.isfinite(target_t)
+                    & (target_t >= np.nanmin(src_t))
+                    & (target_t <= np.nanmax(src_t))
+                )
+
+                aligned_face_motion[in_range] = np.interp(
+                    target_t[in_range],
+                    src_t,
+                    src_motion,
+                )
+
+            # Do not count inserted dropped-frame placeholders
+            aligned_face_motion[~observed] = np.nan
+
+            face_thr = robust_face_motion_threshold(aligned_face_motion)
+
+            valid_face = np.isfinite(aligned_face_motion)
+            face_pct = (
+                float(np.nanmean((aligned_face_motion[valid_face] > face_thr).astype(float)))
+                if np.any(valid_face)
+                else float("nan")
+            )
+
+            aligned_state = np.asarray(state, dtype=int)
+
+            for state_id, state_label in enumerate(STATE_LABELS):
+                mask = valid_face & (aligned_state == state_id)
+                if np.any(mask):
+                    face_motion_by_state_values[state_label].append(
+                        float(np.nanmean(aligned_face_motion[mask]))
+                    )
         else:
             face_pct = float("nan")
-        face_motion_values_by_session.setdefault(session_label, []).append(face_pct)
 
+        face_motion_values_by_session.setdefault(session_label, []).append(face_pct)
         finite_visible = state >= 0
         denom = float(np.sum(finite_visible)) if np.sum(finite_visible) else 1.0
         for state_id, state_label in enumerate(STATE_LABELS):

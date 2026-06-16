@@ -94,16 +94,18 @@ class LoadedSession:
             visible = visible & (self.qc == 0)
         return visible
     def video_overlay(self) -> dict[str, np.ndarray]:
+        observed = np.asarray(self.frame_observed, dtype=bool)
+
         return {
-            'x': self.x,
-            'y': self.y,
-            'radius': self.radius,
-            'eye_lid_x': self.eye_lid_x,
-            'eye_lid_y': self.eye_lid_y,
-            'eyeX': self.eyeX,
-            'eyeY': self.eyeY,
-            'pupilX': self.pupilX,
-            'pupilY': self.pupilY,
+            "x": self.x[observed],
+            "y": self.y[observed],
+            "radius": self.radius[observed],
+            "eye_lid_x": self.eye_lid_x[observed],
+            "eye_lid_y": self.eye_lid_y[observed],
+            "eyeX": self.eyeX[observed],
+            "eyeY": self.eyeY[observed],
+            "pupilX": self.pupilX[observed],
+            "pupilY": self.pupilY[observed],
         }
 class TaskThread(QtCore.QThread):
     progress = pyqtSignal(float, str)
