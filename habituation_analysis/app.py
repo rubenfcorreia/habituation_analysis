@@ -1699,44 +1699,104 @@ class MetricsTab(QWidget):
         self._clear_threshold_lines()
         self._clear_locomotion_threshold_line()
         self._clear_cursor_lines()
+
         pupil_ax = self.canvas.pupil_ax
         loc_ax = self.canvas.loc_ax
         face_ax = self.canvas.face_ax
         lock_ax = self.canvas.lock_ax
+
         pupil_ax.clear()
         loc_ax.clear()
         face_ax.clear()
         lock_ax.clear()
+
         style_axes(pupil_ax, title="Pupil dynamics", ylabel="z-scored radius")
         style_axes(loc_ax, title="Locomotion", ylabel="Wheel speed")
         style_axes(face_ax, title="Face motion", ylabel="Motion")
         style_axes(lock_ax, title="Lock state", xlabel="Time (s)", ylabel="Lock state")
+
         if not self._metrics_available():
             self._show_unavailable_state()
             return
+
         bounds = None
+
         if self.view_mode == "Session":
             summary = self.store.get_session_summary(self.exp_id)
+
             if summary is None:
                 pupil_ax.text(0.5, 0.5, "Unknown expID", transform=pupil_ax.transAxes, ha="center", va="center")
                 self.canvas.draw_idle()
                 return
+
             self._current_session = summary
             raw_payload = self._load_session_payload(summary)
             self._current_payload = raw_payload
             payload = self._analysis_payload(raw_payload, summary)
+
             if payload.has_pupil and payload.radius.size:
                 z = (payload.radius.astype(float) - self._zscore_mean) / self._zscore_std
                 visible = payload.visible_mask_base
-                z_plot = z.copy()
-                if visible.size == z_plot.size:
-                    z_plot[~visible] = np.nan
-                z_plot[~np.isfinite(z_plot)] = np.nan
-                pupil_ax.plot(payload.t[: z_plot.size], z_plot, color="black", linewidth=1.5, label="pupil z-score")
                 manual_masks = self.store.load_manual_masks(summary.exp_id)
-                for start_t, end_t in manual_masks:
-                    pupil_ax.axvspan(start_t, end_t, color="tab:red", alpha=0.15)
+
+                # Grey: missing/dropped video frames
+                missing_frame_mask = np.zeros_like(payload.radius, dtype=bool)
+                frame_observed = np.asarray(
+                    getattr(payload, "frame_observed", np.ones_like(missing_frame_mask)),
+                    dtype=bool,
+                )
+
+                if frame_observed.size == missing_frame_mask.size:
+                    missing_frame_mask = ~frame_observed
+
+                for idx, (start_t, end_t) in enumerate(mask_to_intervals(payload.t, missing_frame_mask)):
+                    pupil_ax.axvspan(
+                        start_t,
+                        end_t,
+                        facecolor="0.75",
+                        alpha=0.25,
+                        edgecolor="none",
+                        linewidth=0.0,
+                        zorder=0,
+                        label="missing video frames" if idx == 0 else None,
+                    )
+
+                # Orange: detected pupil exists, but rejected by QC/in-eye visibility checks
+                low_conf_mask = np.zeros_like(payload.radius, dtype=bool)
+
+                if visible.size == payload.radius.size:
+                    low_conf_mask = np.isfinite(payload.radius) & ~visible
+
+                    if frame_observed.size == low_conf_mask.size:
+                        low_conf_mask &= frame_observed
+
+                for idx, (start_t, end_t) in enumerate(mask_to_intervals(payload.t, low_conf_mask)):
+                    pupil_ax.axvspan(
+                        start_t,
+                        end_t,
+                        facecolor="tab:orange",
+                        alpha=0.18,
+                        hatch="..",
+                        edgecolor="tab:orange",
+                        linewidth=0.0,
+                        zorder=0,
+                        label="low-confidence pupil" if idx == 0 else None,
+                    )
+
+                # Red: manually marked not-visible intervals
+                for idx, (start_t, end_t) in enumerate(manual_masks):
+                    pupil_ax.axvspan(
+                        start_t,
+                        end_t,
+                        color="tab:red",
+                        alpha=0.15,
+                        zorder=0,
+                        label="manual not-visible" if idx == 0 else None,
+                    )
+
+                # Gold: inferred extra-large missing pupil intervals
                 calibration = self.store.session_extra_large_calibration(summary.exp_id)
+
                 extra_large_mask = build_extra_large_mask(
                     self.store,
                     payload,
@@ -1744,8 +1804,8 @@ class MetricsTab(QWidget):
                     manual_masks,
                     manual_buffer_sec=self.store.global_pupil_missing_buffer_sec(),
                 )
-                extra_large_intervals = mask_to_intervals(payload.t, extra_large_mask)
-                for idx, (start_t, end_t) in enumerate(extra_large_intervals):
+
+                for idx, (start_t, end_t) in enumerate(mask_to_intervals(payload.t, extra_large_mask)):
                     pupil_ax.axvspan(
                         start_t,
                         end_t,
@@ -1754,9 +1814,29 @@ class MetricsTab(QWidget):
                         hatch="//",
                         edgecolor="darkgoldenrod",
                         linewidth=0.0,
+                        zorder=0,
                         label="inferred extra-large missing" if idx == 0 else None,
                     )
+
+                # Black: accepted pupil z-score trace
+                z_plot = z.copy()
+
+                if visible.size == z_plot.size:
+                    z_plot[~visible] = np.nan
+
+                z_plot[~np.isfinite(z_plot)] = np.nan
+
+                pupil_ax.plot(
+                    payload.t[: z_plot.size],
+                    z_plot,
+                    color="black",
+                    linewidth=1.5,
+                    label="pupil z-score",
+                    zorder=3,
+                )
+
                 self._refresh_extra_large_calibration_controls(summary, payload, pupil_ax)
+
             else:
                 self._refresh_extra_large_calibration_controls(summary, payload, pupil_ax)
                 pupil_ax.text(
@@ -1767,74 +1847,98 @@ class MetricsTab(QWidget):
                     ha="center",
                     va="center",
                 )
+
             if payload.locomotion.size:
                 loc_t = np.asarray(payload.locomotion_t, dtype=float)
                 loc_n = min(loc_t.size, payload.locomotion.size)
+
                 if loc_n:
                     loc_ax.plot(loc_t[:loc_n], payload.locomotion[:loc_n], color="tab:blue", linewidth=1.5, label="locomotion")
+
                 loc_thr = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
                 loc_ax.axhline(loc_thr, color="tab:red", linestyle="--", linewidth=1.5, label="threshold")
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data", transform=loc_ax.transAxes, ha="center", va="center")
+
             if payload.face_motion.size:
                 face_t = np.asarray(payload.face_motion_t, dtype=float)
                 face_n = min(face_t.size, payload.face_motion.size)
+
                 if face_n:
                     face_ax.plot(face_t[:face_n], payload.face_motion[:face_n], color="tab:purple", linewidth=1.2, label="face motion")
             else:
                 face_ax.text(0.5, 0.5, "No face motion data", transform=face_ax.transAxes, ha="center", va="center")
+
             self._plot_lock_state(lock_ax, np.asarray(payload.brake_t, dtype=float), np.asarray(payload.brake_raw, dtype=float))
+
             pupil_ax.set_title(f"Pupil dynamics - {summary.exp_id}", pad=10)
             loc_ax.set_title(f"Locomotion - {summary.exp_id}", pad=10)
             face_ax.set_title(f"Face motion - {summary.exp_id}", pad=10)
             lock_ax.set_title(f"Lock state - {summary.exp_id}", pad=10)
+
             self._update_timebase_warning(summary, payload)
             self._update_movie_locomotion_warning(summary, payload)
+
             if self.timebase_warning.isVisible() and payload.t.size:
                 video_end = float(payload.t[-1])
                 for ax in (pupil_ax, loc_ax, face_ax, lock_ax):
                     ax.axvline(video_end, color="0.45", linestyle="--", linewidth=1.1, alpha=0.8, label="session end")
+
             if payload.t.size:
                 self._make_cursor_lines(pupil_ax, loc_ax, face_ax, lock_ax)
                 self._set_cursor_position(float(payload.t[0]))
+
             if payload.has_pupil and payload.radius.size:
                 self._make_threshold_lines(pupil_ax)
             else:
                 self._threshold_lines = []
+
             bounds = self._trace_bounds_from_arrays(payload.t, payload.locomotion_t, payload.brake_t)
+
         else:
             pupil_t, z, loc_t, loc, face_t, face, lock_t, lock, spans, labels = self._build_scope_trace()
+
             if pupil_t.size and z.size:
                 pupil_ax.plot(pupil_t[: z.size], z, color="black", linewidth=1.2)
             else:
                 pupil_ax.text(0.5, 0.5, "No pupil data to display", transform=pupil_ax.transAxes, ha="center", va="center")
+
             if loc_t.size and loc.size:
                 loc_ax.plot(loc_t[: loc.size], loc, color="tab:blue", linewidth=1.2)
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data to display", transform=loc_ax.transAxes, ha="center", va="center")
+
             if face_t.size and face.size:
                 face_ax.plot(face_t[: face.size], face, color="tab:purple", linewidth=1.1)
             else:
                 face_ax.text(0.5, 0.5, "No face motion data to display", transform=face_ax.transAxes, ha="center", va="center")
+
             self._plot_lock_state(lock_ax, lock_t, lock)
+
             for start_t, end_t, label in spans:
                 pupil_ax.axvline(start_t, color="0.65", linestyle=":", linewidth=0.8)
                 loc_ax.axvline(start_t, color="0.65", linestyle=":", linewidth=0.8)
                 lock_ax.axvline(start_t, color="0.65", linestyle=":", linewidth=0.8)
+
                 if len(spans) <= 20:
                     pupil_ax.text(start_t, 0.98, label, transform=pupil_ax.get_xaxis_transform(), rotation=90, fontsize=8, va="top")
+
             pupil_ax.set_title(f"Pupil dynamics - {self.animal_id} overall", pad=10)
             loc_ax.set_title(f"Locomotion - {self.animal_id} overall", pad=10)
             face_ax.set_title(f"Face motion - {self.animal_id} overall", pad=10)
             lock_ax.set_title(f"Lock state - {self.animal_id} overall", pad=10)
+
             self._update_timebase_warning(None, None)
             self._update_movie_locomotion_warning(None, None)
             self._make_threshold_lines(pupil_ax)
+
             bounds = self._trace_bounds_from_arrays(pupil_t, loc_t, face_t, lock_t)
+
         self._refresh_axis_legend(pupil_ax)
         self._refresh_axis_legend(loc_ax)
         self._refresh_axis_legend(face_ax)
         self._refresh_axis_legend(lock_ax)
+
         self._apply_trace_bounds(bounds)
         self.canvas.draw_idle()
     def _refresh_axis_legend(self, ax):
