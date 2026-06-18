@@ -568,7 +568,7 @@ class TracePanZoomCanvas(FigureCanvas):
             return
         delta_x = float(event.xdata) - self._pan_press_xdata
         start_left, start_right = self._pan_start_xlim
-        self._view_xlim = self._clamp_xlim(start_left + delta_x, start_right + delta_x)
+        self._view_xlim = self._clamp_xlim(start_left - delta_x, start_right - delta_x)
         self.apply_view()
         self._set_cursor(Qt.ClosedHandCursor)
 
