@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import numpy as np
+from pathlib import Path
 
 from habituation_analysis.data import SessionBundle, SessionSummary, _expand_frame_gaps
-from habituation_analysis.stats import STATE_LABELS, build_extra_large_mask, compute_statistics, classify_zscores
+from habituation_analysis.stats import (
+    STATE_LABELS,
+    build_extra_large_mask,
+    classify_zscores,
+    compute_statistics,
+    save_statistics_outputs,
+    statistics_panel_paths,
+)
 
 
 def _summary() -> SessionSummary:
@@ -29,6 +37,17 @@ def _summary() -> SessionSummary:
 class FakeStore:
     def __init__(self, bundle: SessionBundle):
         self._bundle = bundle
+        self.source_root = Path("/tmp")
+        self._settings: dict[str, dict] = {}
+
+    def get_animal_settings(self, animal_id: str):
+        return self._settings.setdefault(animal_id, {})
+
+    def set_animal_settings(self, animal_id: str, settings: dict):
+        self._settings[animal_id] = dict(settings)
+
+    def statistics_cache_signature(self, scope: str, animal_id: str, thresholds: dict):
+        return f"{scope}:{animal_id}:{sorted(thresholds.items())}"
 
     def dataset_sessions(self):
         return [self._bundle.summary]
@@ -188,17 +207,48 @@ def test_gap_rows_are_ignored_by_classification_and_statistics():
     np.testing.assert_allclose(gap_result.state_probability, dense_result.state_probability, equal_nan=True)
     np.testing.assert_allclose(gap_result.state_probability_std, dense_result.state_probability_std, equal_nan=True)
     np.testing.assert_allclose(
-        np.array([gap_result.locomotion_pct_by_session["1"]], dtype=float),
-        np.array([dense_result.locomotion_pct_by_session["1"]], dtype=float),
+        np.asarray(gap_result.locomotion_pct_by_session_values["1"], dtype=float),
+        np.asarray(dense_result.locomotion_pct_by_session_values["1"], dtype=float),
         equal_nan=True,
     )
     np.testing.assert_allclose(
-        np.array([gap_result.pupil_pct_by_session["1"][label] for label in STATE_LABELS], dtype=float),
-        np.array([dense_result.pupil_pct_by_session["1"][label] for label in STATE_LABELS], dtype=float),
+        np.asarray([gap_result.pupil_pct_by_session["1"][label] for label in STATE_LABELS], dtype=float),
+        np.asarray([dense_result.pupil_pct_by_session["1"][label] for label in STATE_LABELS], dtype=float),
         equal_nan=True,
     )
     np.testing.assert_allclose(
-        np.array([gap_result.lag_by_session["1"][label] for label in STATE_LABELS], dtype=float),
-        np.array([dense_result.lag_by_session["1"][label] for label in STATE_LABELS], dtype=float),
+        np.asarray([gap_result.lag_by_session["1"][label] for label in STATE_LABELS], dtype=float),
+        np.asarray([dense_result.lag_by_session["1"][label] for label in STATE_LABELS], dtype=float),
         equal_nan=True,
     )
+    assert all(label in gap_result.pupil_zscore_mean_by_state_values for label in STATE_LABELS)
+    assert any(gap_result.pupil_zscore_mean_by_state_values[label] for label in STATE_LABELS)
+    np.testing.assert_allclose(
+        np.asarray([gap_result.pupil_pct_by_session_values["1"][label] for label in STATE_LABELS], dtype=float),
+        np.asarray([dense_result.pupil_pct_by_session_values["1"][label] for label in STATE_LABELS], dtype=float),
+        equal_nan=True,
+    )
+
+
+def test_statistics_outputs_generate_boxplot_panels(tmp_path):
+    raw_t = np.array([0.0, 1.0 / 30.0, 2.0 / 30.0, 4.0 / 30.0, 5.0 / 30.0], dtype=float)
+    radius = np.array([10.0, 11.0, 12.0, 13.0, 14.0], dtype=float)
+    bundle = _make_bundle(raw_t, radius)
+    store = FakeStore(bundle)
+    store.source_root = tmp_path
+
+    result = compute_statistics(
+        store,
+        scope="All",
+        animal_id="M1",
+        percentiles=[25.0, 50.0, 75.0],
+        threshold_values=[-0.5, 0.5, 1.0],
+        locomotion_threshold=0.1,
+    )
+
+    result_path, svg_path, png_path = save_statistics_outputs(store, result)
+    assert result_path.exists()
+    assert svg_path.exists()
+    assert png_path.exists()
+    for _, panel_path in statistics_panel_paths(result_path.parent):
+        assert panel_path.exists()

@@ -30,10 +30,14 @@ class StatisticsResult:
     eligible_session_ids: list[str]
     session_labels: list[str]
     locomotion_pct_by_session: dict[str, float]
+    locomotion_pct_by_session_values: dict[str, list[float]]
     face_motion_pct_by_session: dict[str, float]
+    face_motion_pct_by_session_values: dict[str, list[float]]
     face_motion_mean_by_state: dict[str, float]
     face_motion_std_by_state: dict[str, float]
+    pupil_zscore_mean_by_state_values: dict[str, list[float]]
     pupil_pct_by_session: dict[str, dict[str, float]]
+    pupil_pct_by_session_values: dict[str, dict[str, list[float]]]
     lag_by_session: dict[str, dict[str, float]]
     progress_bins: np.ndarray
     state_probability: np.ndarray
@@ -51,10 +55,14 @@ class StatisticsResult:
             "eligible_session_ids": self.eligible_session_ids,
             "session_labels": self.session_labels,
             "locomotion_pct_by_session": self.locomotion_pct_by_session,
+            "locomotion_pct_by_session_values": self.locomotion_pct_by_session_values,
             "face_motion_pct_by_session": self.face_motion_pct_by_session,
+            "face_motion_pct_by_session_values": self.face_motion_pct_by_session_values,
             "face_motion_mean_by_state": self.face_motion_mean_by_state,
             "face_motion_std_by_state": self.face_motion_std_by_state,
+            "pupil_zscore_mean_by_state_values": self.pupil_zscore_mean_by_state_values,
             "pupil_pct_by_session": self.pupil_pct_by_session,
+            "pupil_pct_by_session_values": self.pupil_pct_by_session_values,
             "lag_by_session": self.lag_by_session,
             "progress_bins": self.progress_bins.tolist(),
             "state_probability": self.state_probability.tolist(),
@@ -77,6 +85,12 @@ class StatisticsResult:
                 mapped.setdefault(str(key), float(value))
             return mapped
 
+        def _series_map(raw: dict) -> dict[str, list[float]]:
+            mapped = {str(label): [float(v) for v in list(raw.get(label, []))] for label in STATE_LABELS}
+            for key, value in dict(raw).items():
+                mapped.setdefault(str(key), [float(v) for v in list(value)])
+            return mapped
+
         def _pad_state_array(values) -> np.ndarray:
             arr = np.asarray(values, dtype=float)
             if arr.ndim != 2:
@@ -96,12 +110,28 @@ class StatisticsResult:
             eligible_session_ids=eligible_session_ids,
             session_labels=session_labels,
             locomotion_pct_by_session={str(k): float(v) for k, v in dict(data.get("locomotion_pct_by_session", data.get("locomotion_pct_by_day", {}))).items()},
+            locomotion_pct_by_session_values={
+                str(k): [float(v) for v in list(vals)]
+                for k, vals in dict(data.get("locomotion_pct_by_session_values", data.get("locomotion_pct_by_day_values", {}))).items()
+            },
             face_motion_pct_by_session={str(k): float(v) for k, v in dict(data.get("face_motion_pct_by_session", data.get("face_motion_pct_by_day", {}))).items()},
+            face_motion_pct_by_session_values={
+                str(k): [float(v) for v in list(vals)]
+                for k, vals in dict(data.get("face_motion_pct_by_session_values", data.get("face_motion_pct_by_day_values", {}))).items()
+            },
             face_motion_mean_by_state=_state_map(dict(data.get("face_motion_mean_by_state", {}))),
             face_motion_std_by_state=_state_map(dict(data.get("face_motion_std_by_state", {}))),
+            pupil_zscore_mean_by_state_values=_series_map(dict(data.get("pupil_zscore_mean_by_state_values", {}))),
             pupil_pct_by_session={
                 str(session): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
                 for session, label_dict in dict(data.get("pupil_pct_by_session", data.get("pupil_pct_by_day", {}))).items()
+            },
+            pupil_pct_by_session_values={
+                str(session): {
+                    str(label): [float(v) for v in list(vals)]
+                    for label, vals in dict(label_dict).items()
+                }
+                for session, label_dict in dict(data.get("pupil_pct_by_session_values", data.get("pupil_pct_by_day_values", {}))).items()
             },
             lag_by_session={
                 str(exp_id): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
@@ -654,6 +684,7 @@ def compute_statistics(
     locomotion_values_by_session: dict[str, list[float]] = {label: [] for label in session_labels}
     face_motion_values_by_session: dict[str, list[float]] = {label: [] for label in session_labels}
     face_motion_by_state_values: dict[str, list[float]] = {label: [] for label in STATE_LABELS}
+    pupil_zscore_mean_by_state_values: dict[str, list[float]] = {label: [] for label in STATE_LABELS}
     pupil_values_by_session: dict[str, dict[str, list[float]]] = {
         label: {state_label: [] for state_label in STATE_LABELS} for label in session_labels
     }
@@ -748,6 +779,11 @@ def compute_statistics(
             face_pct = float("nan")
 
         face_motion_values_by_session.setdefault(session_label, []).append(face_pct)
+        valid_radius = np.isfinite(z)
+        for state_id, state_label in enumerate(STATE_LABELS):
+            mask = valid_radius & (state == state_id)
+            if np.any(mask):
+                pupil_zscore_mean_by_state_values[state_label].append(float(np.nanmean(z[mask])))
         finite_visible = state >= 0
         denom = float(np.sum(finite_visible)) if np.sum(finite_visible) else 1.0
         for state_id, state_label in enumerate(STATE_LABELS):
@@ -835,10 +871,14 @@ def compute_statistics(
         eligible_session_ids=[s.exp_id for s in eligible],
         session_labels=session_labels,
         locomotion_pct_by_session=locomotion_pct_by_session,
+        locomotion_pct_by_session_values=locomotion_values_by_session,
         face_motion_pct_by_session=face_motion_pct_by_session,
+        face_motion_pct_by_session_values=face_motion_values_by_session,
         face_motion_mean_by_state=face_motion_mean_by_state,
         face_motion_std_by_state=face_motion_std_by_state,
+        pupil_zscore_mean_by_state_values=pupil_zscore_mean_by_state_values,
         pupil_pct_by_session=pupil_pct_by_session,
+        pupil_pct_by_session_values=pupil_values_by_session,
         lag_by_session=lag_by_session,
         progress_bins=progress_bins,
         state_probability=state_probability,
@@ -855,10 +895,10 @@ def compute_statistics(
 
 
 STATISTICS_PANEL_SPECS = [
-    ("locomotion", "Locomotion % by session"),
-    ("face_motion", "Face motion % by session"),
-    ("face_motion_by_state", "Face motion by pupil state"),
-    ("pupil_states_by_session", "Pupil states by session"),
+    ("locomotion_boxplot", "Locomotion by session"),
+    ("face_motion_boxplot", "Face motion by session"),
+    ("pupil_zscore_by_state", "Mean z-scored pupil size by state"),
+    ("pupil_state_fraction_by_session", "Pupil state fraction by session"),
     ("lag_by_state", "Lag to first pupil state after 1 min by session"),
     ("state_fraction", "Pupil state fraction vs experiment length"),
 ]
@@ -872,54 +912,91 @@ def statistics_panel_paths(output_dir: Path) -> list[tuple[str, Path]]:
     ]
 
 
+def _finite_series(values) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return arr[np.isfinite(arr)]
+
+
+def _boxplot(ax, data: list[np.ndarray], labels: list[str], *, colors: list[str], title: str, xlabel: str, ylabel: str) -> None:
+    if not any(arr.size for arr in data):
+        ax.text(0.5, 0.5, "No data available", transform=ax.transAxes, ha="center", va="center")
+        style_axes(ax, title=title, xlabel=xlabel, ylabel=ylabel)
+        return
+    plot_data = [arr if arr.size else np.array([np.nan], dtype=float) for arr in data]
+    bp = ax.boxplot(
+        plot_data,
+        patch_artist=True,
+        showmeans=True,
+        meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black", "markersize": 5},
+        medianprops={"color": "black", "linewidth": 1.5},
+        whiskerprops={"color": "0.35", "linewidth": 1.2},
+        capprops={"color": "0.35", "linewidth": 1.2},
+        flierprops={"marker": "o", "markerfacecolor": "0.4", "markeredgecolor": "0.4", "markersize": 3, "alpha": 0.35},
+        widths=0.6,
+    )
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.45)
+        patch.set_edgecolor("0.35")
+        patch.set_linewidth(1.2)
+    style_axes(ax, title=title, xlabel=xlabel, ylabel=ylabel)
+    ax.set_xticks(np.arange(1, len(labels) + 1))
+    ax.set_xticklabels(labels, rotation=90 if len(labels) > 4 else 0, fontsize=8)
+
+
+def _plot_state_fraction_by_session(ax, result: StatisticsResult, sessions: list[str], *, title: str) -> None:
+    x = np.arange(len(sessions), dtype=float)
+    for i, label in enumerate(STATE_LABELS):
+        session_values = [
+            _finite_series(result.pupil_pct_by_session_values.get(session, {}).get(label, []))
+            for session in sessions
+        ]
+        means = np.array([float(np.nanmean(vals)) if vals.size else np.nan for vals in session_values], dtype=float)
+        sds = np.array([float(np.nanstd(vals)) if vals.size else np.nan for vals in session_values], dtype=float)
+        lower = np.clip(means - sds, 0.0, 1.0)
+        upper = np.clip(means + sds, 0.0, 1.0)
+        ax.fill_between(x, lower, upper, color=STATE_COLORS[i], alpha=0.18)
+        ax.plot(x, means, marker="o", color=STATE_COLORS[i], label=label)
+    style_axes(ax, title=title, xlabel="Session", ylabel="Fraction")
+    ax.set_xticks(x)
+    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
+def _state_zscore_boxplot_data(result: StatisticsResult) -> tuple[list[np.ndarray], list[str]]:
+    states = list(STATE_LABELS)
+    data = [_finite_series(result.pupil_zscore_mean_by_state_values.get(state, [])) for state in states]
+    return data, states
+
+
 def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
     sessions = result.session_labels
-    x = np.arange(len(sessions))
-    colors = STATE_COLORS
     figures: list[Figure] = []
 
     fig = Figure(figsize=(10, 6), constrained_layout=True)
     ax = fig.subplots()
-    loc = [result.locomotion_pct_by_session.get(session, np.nan) for session in sessions]
-    ax.bar(x, loc, color="tab:blue")
-    style_axes(ax, title="Locomotion % by session", xlabel="Session", ylabel="Fraction")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
+    locomotion_data = [_finite_series(result.locomotion_pct_by_session_values.get(session, [])) for session in sessions]
+    _boxplot(ax, locomotion_data, sessions, colors=["tab:blue"] * max(1, len(sessions)), title="Locomotion by session", xlabel="Session", ylabel="Fraction")
+    ax.set_ylim(0.0, 1.0)
     figures.append(fig)
 
     fig = Figure(figsize=(10, 6), constrained_layout=True)
     ax = fig.subplots()
-    face = [result.face_motion_pct_by_session.get(session, np.nan) for session in sessions]
-    ax.bar(x, face, color="tab:orange")
-    style_axes(ax, title="Face motion % by session", xlabel="Session", ylabel="Fraction")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
+    face_data = [_finite_series(result.face_motion_pct_by_session_values.get(session, [])) for session in sessions]
+    _boxplot(ax, face_data, sessions, colors=["tab:orange"] * max(1, len(sessions)), title="Face motion by session", xlabel="Session", ylabel="Fraction")
+    ax.set_ylim(0.0, 1.0)
     figures.append(fig)
 
     fig = Figure(figsize=(10, 6), constrained_layout=True)
     ax = fig.subplots()
-    states = list(STATE_LABELS)
-    face_means = [result.face_motion_mean_by_state.get(state, np.nan) for state in states]
-    face_stds = [result.face_motion_std_by_state.get(state, np.nan) for state in states]
-    face_errors = [0.0 if np.isnan(std) else float(std) for std in face_stds]
-    state_x = np.arange(len(states))
-    ax.bar(state_x, face_means, yerr=face_errors, color="tab:cyan", alpha=0.85, capsize=4)
-    style_axes(ax, title="Face motion by pupil state", xlabel="Pupil state", ylabel="Face motion")
-    ax.set_xticks(state_x)
-    ax.set_xticklabels(states, rotation=0, fontsize=9)
+    state_data, states = _state_zscore_boxplot_data(result)
+    _boxplot(ax, state_data, states, colors=STATE_COLORS, title="Mean z-scored pupil size by state", xlabel="Pupil state", ylabel="Mean z-score")
     figures.append(fig)
 
     fig = Figure(figsize=(10, 6), constrained_layout=True)
     ax = fig.subplots()
-    bottom = np.zeros(len(sessions))
-    for i, label in enumerate(STATE_LABELS):
-        vals = [result.pupil_pct_by_session.get(session, {}).get(label, 0.0) for session in sessions]
-        ax.bar(x, vals, bottom=bottom, label=label, color=colors[i])
-        bottom += np.asarray(vals)
-    style_axes(ax, title="Pupil states by session", xlabel="Session", ylabel="Fraction")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    _plot_state_fraction_by_session(ax, result, sessions, title="Pupil state fraction by session")
     figures.append(fig)
 
     fig = Figure(figsize=(10, 6), constrained_layout=True)
@@ -928,7 +1005,7 @@ def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
     lag_x = np.arange(len(lag_labels))
     for i, label in enumerate(STATE_LABELS):
         lag_vals = [result.lag_by_session.get(exp_id, {}).get(label, np.nan) for exp_id in lag_labels]
-        ax.plot(lag_x, lag_vals, marker="o", color=colors[i], label=label)
+        ax.plot(lag_x, lag_vals, marker="o", color=STATE_COLORS[i], label=label)
     style_axes(ax, title="Lag to first pupil state after 1 min by session", xlabel="Session", ylabel="Lag (s)")
     ax.set_xticks(lag_x)
     ax.set_xticklabels(lag_labels, rotation=90, fontsize=8)
@@ -942,8 +1019,8 @@ def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
         std = result.state_probability_std[i]
         lower = np.clip(mean - std, 0.0, 1.0)
         upper = np.clip(mean + std, 0.0, 1.0)
-        ax.fill_between(result.progress_bins, lower, upper, color=colors[i], alpha=0.18)
-        ax.plot(result.progress_bins, mean, label=label, color=colors[i])
+        ax.fill_between(result.progress_bins, lower, upper, color=STATE_COLORS[i], alpha=0.18)
+        ax.plot(result.progress_bins, mean, label=label, color=STATE_COLORS[i])
     style_axes(ax, title="Pupil state fraction vs experiment length", xlabel="Progress (%)", ylabel="Fraction")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
     figures.append(fig)
@@ -969,54 +1046,32 @@ def save_statistics_outputs(store: HabituationStore, result: StatisticsResult) -
 
     fig = Figure(figsize=(16, 14), constrained_layout=True)
     axes = fig.subplots(3, 2).ravel()
-
     sessions = result.session_labels
-    x = np.arange(len(sessions))
-    loc = [result.locomotion_pct_by_session.get(session, np.nan) for session in sessions]
-    face = [result.face_motion_pct_by_session.get(session, np.nan) for session in sessions]
+
+    locomotion_data = [_finite_series(result.locomotion_pct_by_session_values.get(session, [])) for session in sessions]
+    face_data = [_finite_series(result.face_motion_pct_by_session_values.get(session, [])) for session in sessions]
+    state_data, states = _state_zscore_boxplot_data(result)
 
     ax = axes[0]
-    ax.bar(x, loc, color="tab:blue")
-    style_axes(ax, title="Locomotion % by session", xlabel="Session", ylabel="Fraction")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
+    _boxplot(ax, locomotion_data, sessions, colors=["tab:blue"] * max(1, len(sessions)), title="Locomotion by session", xlabel="Session", ylabel="Fraction")
+    ax.set_ylim(0.0, 1.0)
 
     ax = axes[1]
-    ax.bar(x, face, color="tab:orange")
-    style_axes(ax, title="Face motion % by session", xlabel="Session", ylabel="Fraction")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
+    _boxplot(ax, face_data, sessions, colors=["tab:orange"] * max(1, len(sessions)), title="Face motion by session", xlabel="Session", ylabel="Fraction")
+    ax.set_ylim(0.0, 1.0)
 
     ax = axes[2]
-    states = list(STATE_LABELS)
-    face_means = [result.face_motion_mean_by_state.get(state, np.nan) for state in states]
-    face_stds = [result.face_motion_std_by_state.get(state, np.nan) for state in states]
-    face_errors = [0.0 if np.isnan(std) else float(std) for std in face_stds]
-    state_x = np.arange(len(states))
-    ax.bar(state_x, face_means, yerr=face_errors, color="tab:cyan", alpha=0.85, capsize=4)
-    style_axes(ax, title="Face motion by pupil state", xlabel="Pupil state", ylabel="Face motion")
-    ax.set_xticks(state_x)
-    ax.set_xticklabels(states, rotation=0, fontsize=9)
+    _boxplot(ax, state_data, states, colors=STATE_COLORS, title="Mean z-scored pupil size by state", xlabel="Pupil state", ylabel="Mean z-score")
 
     ax = axes[3]
-    bottom = np.zeros(len(sessions))
-    colors = STATE_COLORS
-    for i, label in enumerate(STATE_LABELS):
-        vals = [result.pupil_pct_by_session.get(session, {}).get(label, 0.0) for session in sessions]
-        ax.bar(x, vals, bottom=bottom, label=label, color=colors[i])
-        bottom += np.asarray(vals)
-    style_axes(ax, title="Pupil states by session", xlabel="Session", ylabel="Fraction")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    _plot_state_fraction_by_session(ax, result, sessions, title="Pupil state fraction by session")
 
     ax = axes[4]
     lag_labels = result.session_labels
     lag_x = np.arange(len(lag_labels))
-    lag_colors = STATE_COLORS
     for i, label in enumerate(STATE_LABELS):
         lag_vals = [result.lag_by_session.get(exp_id, {}).get(label, np.nan) for exp_id in lag_labels]
-        ax.plot(lag_x, lag_vals, marker="o", color=lag_colors[i], label=label)
+        ax.plot(lag_x, lag_vals, marker="o", color=STATE_COLORS[i], label=label)
     style_axes(ax, title="Lag to first pupil state after 1 min by session", xlabel="Session", ylabel="Lag (s)")
     ax.set_xticks(lag_x)
     ax.set_xticklabels(lag_labels, rotation=90, fontsize=8)
@@ -1028,8 +1083,8 @@ def save_statistics_outputs(store: HabituationStore, result: StatisticsResult) -
         std = result.state_probability_std[i]
         lower = np.clip(mean - std, 0.0, 1.0)
         upper = np.clip(mean + std, 0.0, 1.0)
-        ax.fill_between(result.progress_bins, lower, upper, color=colors[i], alpha=0.18)
-        ax.plot(result.progress_bins, mean, label=label, color=colors[i])
+        ax.fill_between(result.progress_bins, lower, upper, color=STATE_COLORS[i], alpha=0.18)
+        ax.plot(result.progress_bins, mean, label=label, color=STATE_COLORS[i])
     style_axes(ax, title="Pupil state fraction vs experiment length", xlabel="Progress (%)", ylabel="Fraction")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig.suptitle(f"Habituation statistics - {result.scope} / {result.animal_id}", y=1.02)
@@ -1040,7 +1095,6 @@ def save_statistics_outputs(store: HabituationStore, result: StatisticsResult) -
         save_figure(fig_panel, f"statistics_panel_{idx:02d}_{slug}", output_dir)
 
     return result_path, svg_path, png_path
-
 
 def load_cached_statistics_outputs(
     store: HabituationStore,

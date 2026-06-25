@@ -2820,19 +2820,40 @@ class StatisticsTab(QWidget):
             f"Locomotion threshold: {result.thresholds.get('locomotion_threshold', float('nan'))}",
             f"Missing pupil buffer: {result.thresholds.get('missing_buffer_sec', float('nan')):.2f} s",
             "",
-            "Session-wise locomotion fraction:",
+            "Session-wise locomotion distributions (mean ± SD):",
         ]
         for session in result.session_labels:
-            lines.append(f"  {session}: {result.locomotion_pct_by_session.get(session, float('nan')):.4f}")
+            values = np.asarray(result.locomotion_pct_by_session_values.get(session, []), dtype=float)
+            values = values[np.isfinite(values)]
+            mean = float(np.nanmean(values)) if values.size else float("nan")
+            sd = float(np.nanstd(values)) if values.size else float("nan")
+            lines.append(f"  {session}: mean={mean:.4f}, sd={sd:.4f}, n={values.size}")
         lines.append("")
-        lines.append("Session-wise face motion fraction:")
+        lines.append("Session-wise face motion distributions (mean ± SD):")
         for session in result.session_labels:
-            lines.append(f"  {session}: {result.face_motion_pct_by_session.get(session, float('nan')):.4f}")
+            values = np.asarray(result.face_motion_pct_by_session_values.get(session, []), dtype=float)
+            values = values[np.isfinite(values)]
+            mean = float(np.nanmean(values)) if values.size else float("nan")
+            sd = float(np.nanstd(values)) if values.size else float("nan")
+            lines.append(f"  {session}: mean={mean:.4f}, sd={sd:.4f}, n={values.size}")
         lines.append("")
-        lines.append("Session-wise pupil state fractions:")
+        lines.append("Mean z-scored pupil size by state (mean ± SD across sessions):")
+        for label in STATE_LABELS:
+            values = np.asarray(result.pupil_zscore_mean_by_state_values.get(label, []), dtype=float)
+            values = values[np.isfinite(values)]
+            mean = float(np.nanmean(values)) if values.size else float("nan")
+            sd = float(np.nanstd(values)) if values.size else float("nan")
+            lines.append(f"  {label}: mean={mean:.4f}, sd={sd:.4f}, n={values.size}")
+        lines.append("")
+        lines.append("Pupil state fraction by session (mean ± SD across sessions):")
         for session in result.session_labels:
             state_text = ", ".join(
-                f"{label}={result.pupil_pct_by_session.get(session, {}).get(label, float('nan')):.4f}" for label in STATE_LABELS
+                (
+                    f"{label}=mean:{float(np.nanmean(vals)):.4f} sd:{float(np.nanstd(vals)):.4f} n:{vals.size}"
+                    if (vals := np.asarray(result.pupil_pct_by_session_values.get(session, {}).get(label, []), dtype=float)).size
+                    else f"{label}=mean:nan sd:nan n:0"
+                )
+                for label in STATE_LABELS
             )
             lines.append(f"  {session}: {state_text}")
         return "\n".join(lines)
