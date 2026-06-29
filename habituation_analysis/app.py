@@ -49,7 +49,9 @@ from .stats import (
     percentile_from_value,
     percentile_threshold_values,
     save_statistics_outputs,
+    save_statistics_summary_figure,
     statistics_panel_paths,
+    statistics_summary_panel_specs,
     suggest_extra_large_calibration,
 )
 from .widgets import DraggableHLine, TracePanZoomCanvas, VideoPlayerWidget
@@ -2402,9 +2404,14 @@ class StatisticsTab(QWidget):
         self.run_all_button = QPushButton("Run all animals", self)
         self.run_all_button.clicked.connect(self.run_all_animals)
         self.run_all_button.setToolTip("Run statistics separately for every animal in the dataset.")
+        self.summary_customize_button = QPushButton("Customize summary figure", self)
+        self.summary_customize_button.clicked.connect(self._customize_summary_figure)
+        self.summary_customize_button.setEnabled(False)
+        self.summary_customize_button.setToolTip("Choose which panels appear in the saved summary SVG/PNG after statistics finish.")
         button_row = QHBoxLayout()
         button_row.addWidget(self.run_button)
         button_row.addWidget(self.run_all_button)
+        button_row.addWidget(self.summary_customize_button)
         button_row.addStretch(1)
         layout = QVBoxLayout(self)
         layout.addWidget(self._scope_label)
@@ -2447,6 +2454,7 @@ class StatisticsTab(QWidget):
         self._paths_label.setText("")
         self._current_result = None
         self._current_paths = None
+        self.summary_customize_button.setEnabled(False)
         self._set_plot_pages([])
     def _set_log_visible(self, visible: bool):
         self.log_panel.setVisible(bool(visible))
@@ -2507,12 +2515,65 @@ class StatisticsTab(QWidget):
         result_path, svg_path, png_path = payload["paths"]
         self._current_result = result
         self._current_paths = (result_path, svg_path, png_path)
+        self.summary_customize_button.setEnabled(True)
         self.store.clear_animal_dirty(result.animal_id)
         prefix = status_prefix or ("Loaded cached statistics for" if payload.get("cached") else "Statistics complete for")
         self._status_label.setText(f"{prefix} {result.scope} / {result.animal_id}")
         self._paths_label.setText(f"Saved: {result_path}\nSVG: {svg_path}\nPNG: {png_path}")
         self.summary_edit.setPlainText(self._format_result_text(result))
         self._load_plot_pages_from_output_dir(Path(result_path).parent)
+    def _summary_panel_spec_items(self, result) -> list[tuple[str, str, dict]]:
+        return list(statistics_summary_panel_specs(result))
+
+    def _choose_summary_panels(self, result) -> list[str] | None:
+        specs = self._summary_panel_spec_items(result)
+        if not specs:
+            return []
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return [slug for slug, _, _ in specs]
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Choose summary panels")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Select the panels to include in the saved summary figure:", dialog))
+        checkbox_map = []
+        for slug, title, _config in specs:
+            checkbox = QCheckBox(title, dialog)
+            checkbox.setChecked(True)
+            layout.addWidget(checkbox)
+            checkbox_map.append((slug, checkbox))
+        button_row = QHBoxLayout()
+        all_button = QPushButton("Select all", dialog)
+        none_button = QPushButton("Select none", dialog)
+        button_row.addWidget(all_button)
+        button_row.addWidget(none_button)
+        button_row.addStretch(1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, parent=dialog)
+        layout.addLayout(button_row)
+        layout.addWidget(buttons)
+
+        def _set_all(checked: bool):
+            for _, checkbox in checkbox_map:
+                checkbox.setChecked(checked)
+
+        all_button.clicked.connect(lambda: _set_all(True))
+        none_button.clicked.connect(lambda: _set_all(False))
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+        return [slug for slug, checkbox in checkbox_map if checkbox.isChecked()]
+
+    def _customize_summary_figure(self):
+        if self._current_result is None or self._current_paths is None:
+            self._status_label.setText("Run statistics first to customize the summary figure.")
+            return
+        panel_keys = self._choose_summary_panels(self._current_result)
+        if panel_keys is None:
+            return
+        output_dir = Path(self._current_paths[0]).parent
+        save_statistics_summary_figure(output_dir, self._current_result, summary_panel_keys=panel_keys)
+        self._status_label.setText(f"Updated summary figure with {len(panel_keys)} selected panels for {self._current_result.scope} / {self._current_result.animal_id}.")
+
     def _show_cached_statistics_for_context(self) -> bool:
         if self._worker is not None and self._worker.isRunning():
             return False

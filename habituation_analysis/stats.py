@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import cv2
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +19,7 @@ STATE_COLORS = ["tab:green", "tab:purple", "tab:red", "tab:brown", "tab:gray"]
 MIN_EXTRA_LARGE_MISSING_SEC = 1.0
 MANUAL_INTERVAL_BUFFER_SEC = 1.0
 CALIBRATION_BRIGHTNESS_MARGIN = 0.10
+STATISTICS_PLOT_VERSION = 4
 
 
 @dataclass
@@ -39,18 +40,26 @@ class StatisticsResult:
     pupil_pct_by_session: dict[str, dict[str, float]]
     pupil_pct_by_session_values: dict[str, dict[str, list[float]]]
     lag_by_session: dict[str, dict[str, float]]
+    lag_by_session_values: dict[str, dict[str, list[float]]]
+    locomotion_progress_by_animal_values: dict[str, list[float]]
+    pupil_zscore_progress_by_animal_values: dict[str, list[float]]
     progress_bins: np.ndarray
     state_probability: np.ndarray
     state_probability_std: np.ndarray
     thresholds: dict
     zscore_mean: float
     zscore_std: float
+    plot_version: int = STATISTICS_PLOT_VERSION
+    state_probability_count: np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    progress_series: dict[str, dict] = field(default_factory=dict)
+    pupil_state_fraction_overall: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "scope": self.scope,
             "animal_id": self.animal_id,
             "generated_at": self.generated_at,
+            "plot_version": int(self.plot_version),
             "session_ids": self.session_ids,
             "eligible_session_ids": self.eligible_session_ids,
             "session_labels": self.session_labels,
@@ -64,9 +73,15 @@ class StatisticsResult:
             "pupil_pct_by_session": self.pupil_pct_by_session,
             "pupil_pct_by_session_values": self.pupil_pct_by_session_values,
             "lag_by_session": self.lag_by_session,
+            "lag_by_session_values": self.lag_by_session_values,
+            "locomotion_progress_by_animal_values": self.locomotion_progress_by_animal_values,
+            "pupil_zscore_progress_by_animal_values": self.pupil_zscore_progress_by_animal_values,
             "progress_bins": self.progress_bins.tolist(),
             "state_probability": self.state_probability.tolist(),
             "state_probability_std": self.state_probability_std.tolist(),
+            "state_probability_count": self.state_probability_count.tolist(),
+            "progress_series": self.progress_series,
+            "pupil_state_fraction_overall": self.pupil_state_fraction_overall,
             "thresholds": self.thresholds,
             "zscore_mean": float(self.zscore_mean),
             "zscore_std": float(self.zscore_std),
@@ -137,12 +152,35 @@ class StatisticsResult:
                 str(exp_id): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
                 for exp_id, label_dict in dict(data.get("lag_by_session", {})).items()
             },
+            lag_by_session_values={
+                str(session): {
+                    str(label): [float(v) for v in list(vals)]
+                    for label, vals in dict(label_dict).items()
+                }
+                for session, label_dict in dict(data.get("lag_by_session_values", {})).items()
+            },
+            locomotion_progress_by_animal_values={
+                str(animal_id): [float(v) for v in list(vals)]
+                for animal_id, vals in dict(data.get("locomotion_progress_by_animal_values", data.get("locomotion_progress_by_animal", {}))).items()
+            },
+            pupil_zscore_progress_by_animal_values={
+                str(animal_id): [float(v) for v in list(vals)]
+                for animal_id, vals in dict(data.get("pupil_zscore_progress_by_animal_values", data.get("pupil_zscore_progress_by_animal", {}))).items()
+            },
             progress_bins=np.asarray(data.get("progress_bins", []), dtype=float),
             state_probability=_pad_state_array(data.get("state_probability", [])),
             state_probability_std=_pad_state_array(data.get("state_probability_std", [])),
             thresholds=dict(data.get("thresholds", {})),
             zscore_mean=float(data.get("zscore_mean", 0.0)),
             zscore_std=float(data.get("zscore_std", 1.0)),
+            plot_version=int(data.get("plot_version", 1)),
+            state_probability_count=np.asarray(data.get("state_probability_count", []), dtype=float).reshape(-1),
+            progress_series=dict(data.get("progress_series", {})),
+            pupil_state_fraction_overall={
+                str(key): {str(label): float(value) for label, value in dict(values).items()}
+                for key, values in dict(data.get("pupil_state_fraction_overall", {})).items()
+                if isinstance(values, dict)
+            },
         )
 
 
@@ -685,6 +723,8 @@ def compute_statistics(
     face_motion_values_by_session: dict[str, list[float]] = {label: [] for label in session_labels}
     face_motion_by_state_values: dict[str, list[float]] = {label: [] for label in STATE_LABELS}
     pupil_zscore_mean_by_state_values: dict[str, list[float]] = {label: [] for label in STATE_LABELS}
+    locomotion_progress_by_animal_values: dict[str, list[float]] = {}
+    pupil_zscore_progress_by_animal_values: dict[str, list[float]] = {}
     pupil_values_by_session: dict[str, dict[str, list[float]]] = {
         label: {state_label: [] for state_label in STATE_LABELS} for label in session_labels
     }
@@ -719,6 +759,7 @@ def compute_statistics(
         valid_motion = np.isfinite(bundle.locomotion)
         locomotion_pct = float(np.nanmean((bundle.locomotion[valid_motion] > locomotion_threshold).astype(float))) if np.any(valid_motion) else float("nan")
         locomotion_values_by_session.setdefault(session_label, []).append(locomotion_pct)
+        locomotion_progress_by_animal_values.setdefault(summary.animal_id, []).append(locomotion_pct)
 
         face_t, face_motion = store.load_face_motion(summary.exp_id)
 
@@ -780,6 +821,10 @@ def compute_statistics(
 
         face_motion_values_by_session.setdefault(session_label, []).append(face_pct)
         valid_radius = np.isfinite(z)
+        if np.any(valid_radius):
+            pupil_zscore_progress_by_animal_values.setdefault(summary.animal_id, []).append(float(np.nanmean(z[valid_radius])))
+        else:
+            pupil_zscore_progress_by_animal_values.setdefault(summary.animal_id, []).append(float("nan"))
         for state_id, state_label in enumerate(STATE_LABELS):
             mask = valid_radius & (state == state_id)
             if np.any(mask):
@@ -806,6 +851,7 @@ def compute_statistics(
         label: {state_label: _nanmean_or_nan(values[state_label]) for state_label in STATE_LABELS}
         for label, values in pupil_values_by_session.items()
     }
+    pupil_state_fraction_overall = _build_overall_pupil_state_fractions(pupil_pct_by_session)
     lag_by_session = {
         label: {state_label: _nanmean_or_nan(values[state_label]) for state_label in STATE_LABELS}
         for label, values in lag_values_by_session.items()
@@ -816,7 +862,8 @@ def compute_statistics(
     state_probability_sum = np.zeros((n_states, 100), dtype=float)
     state_probability_sq_sum = np.zeros((n_states, 100), dtype=float)
     state_probability_count = np.zeros((n_states, 100), dtype=float)
-    for summary in eligible or sessions:
+    selected_for_progress = eligible or sessions
+    for summary in selected_for_progress:
         bundle = _trim_bundle_for_cutoff(store, store.load_session_bundle(summary.exp_id))
         manual_masks = store.load_manual_masks(summary.exp_id)
         visible = _visible_mask(bundle, manual_masks)
@@ -862,6 +909,96 @@ def compute_statistics(
         where=state_probability_count > 0,
     ) - np.square(state_probability)
     state_probability_std = np.sqrt(np.clip(state_probability_var, 0.0, None))
+    if scope == "All" and animal_id == "All":
+        overall_series = _build_animal_weighted_progress_series(
+            store,
+            selected_for_progress,
+            mean=mean,
+            std=std,
+            threshold_values=threshold_values,
+            locomotion_threshold=locomotion_threshold,
+            missing_buffer_sec=missing_buffer_sec,
+        )
+    else:
+        overall_series = _build_progress_state_series(
+            store,
+            selected_for_progress,
+            mean=mean,
+            std=std,
+            threshold_values=threshold_values,
+            locomotion_threshold=locomotion_threshold,
+            missing_buffer_sec=missing_buffer_sec,
+            bin_count=100,
+        )
+    progress_series = {"overall": overall_series}
+    if len(selected_for_progress) >= 2:
+        if scope == "All" and animal_id == "All":
+            progress_series["first_2"] = _build_animal_weighted_progress_subset_series(
+                store,
+                selected_for_progress,
+                mean=mean,
+                std=std,
+                threshold_values=threshold_values,
+                locomotion_threshold=locomotion_threshold,
+                missing_buffer_sec=missing_buffer_sec,
+                take_last=False,
+            )
+            progress_series["last_2"] = _build_animal_weighted_progress_subset_series(
+                store,
+                selected_for_progress,
+                mean=mean,
+                std=std,
+                threshold_values=threshold_values,
+                locomotion_threshold=locomotion_threshold,
+                missing_buffer_sec=missing_buffer_sec,
+                take_last=True,
+            )
+        else:
+            progress_series["first_2"] = _build_progress_state_series(
+                store,
+                selected_for_progress[:2],
+                mean=mean,
+                std=std,
+                threshold_values=threshold_values,
+                locomotion_threshold=locomotion_threshold,
+                missing_buffer_sec=missing_buffer_sec,
+                bin_count=100,
+            )
+            progress_series["last_2"] = _build_progress_state_series(
+                store,
+                selected_for_progress[-2:],
+                mean=mean,
+                std=std,
+                threshold_values=threshold_values,
+                locomotion_threshold=locomotion_threshold,
+                missing_buffer_sec=missing_buffer_sec,
+                bin_count=100,
+            )
+    max_duration = max((float(store.effective_session_duration_sec(summary.exp_id)) for summary in selected_for_progress), default=0.0)
+    n_windows = int(max_duration // 1800.0)
+    sessions_by_id = {summary.exp_id: summary for summary in selected_for_progress}
+    for idx in range(n_windows):
+        start_sec = float(idx * 1800.0)
+        end_sec = float((idx + 1) * 1800.0)
+        window_sessions = [
+            summary
+            for summary in selected_for_progress
+            if float(store.effective_session_duration_sec(summary.exp_id)) >= end_sec
+        ]
+        if not window_sessions:
+            continue
+        progress_series[f"window_{idx + 1:02d}"] = _build_progress_state_series(
+            store,
+            window_sessions,
+            mean=mean,
+            std=std,
+            threshold_values=threshold_values,
+            locomotion_threshold=locomotion_threshold,
+            missing_buffer_sec=missing_buffer_sec,
+            bin_count=30,
+            window_start_sec=start_sec,
+            window_end_sec=end_sec,
+        )
 
     return StatisticsResult(
         scope=scope,
@@ -880,9 +1017,15 @@ def compute_statistics(
         pupil_pct_by_session=pupil_pct_by_session,
         pupil_pct_by_session_values=pupil_values_by_session,
         lag_by_session=lag_by_session,
+        lag_by_session_values=lag_values_by_session,
+        locomotion_progress_by_animal_values=locomotion_progress_by_animal_values,
+        pupil_zscore_progress_by_animal_values=pupil_zscore_progress_by_animal_values,
         progress_bins=progress_bins,
         state_probability=state_probability,
         state_probability_std=state_probability_std,
+        state_probability_count=state_probability_count[0].copy(),
+        progress_series=progress_series,
+        pupil_state_fraction_overall=pupil_state_fraction_overall,
         thresholds={
             "percentiles": percentiles,
             "threshold_values": threshold_values,
@@ -891,25 +1034,12 @@ def compute_statistics(
         },
         zscore_mean=float(mean),
         zscore_std=float(std),
+        plot_version=STATISTICS_PLOT_VERSION,
     )
 
 
-STATISTICS_PANEL_SPECS = [
-    ("locomotion_boxplot", "Locomotion by session"),
-    ("face_motion_boxplot", "Face motion by session"),
-    ("pupil_zscore_by_state", "Mean z-scored pupil size by state"),
-    ("pupil_state_fraction_by_session", "Pupil state fraction by session"),
-    ("lag_by_state", "Lag to first pupil state after 1 min by session"),
-    ("state_fraction", "Pupil state fraction vs experiment length"),
-]
 
-
-def statistics_panel_paths(output_dir: Path) -> list[tuple[str, Path]]:
-    output_dir = Path(output_dir)
-    return [
-        (title, output_dir / f"statistics_panel_{idx:02d}_{slug}.png")
-        for idx, (slug, title) in enumerate(STATISTICS_PANEL_SPECS, start=1)
-    ]
+SESSION_INDEX_LIMIT = 7
 
 
 def _finite_series(values) -> np.ndarray:
@@ -917,7 +1047,19 @@ def _finite_series(values) -> np.ndarray:
     return arr[np.isfinite(arr)]
 
 
-def _boxplot(ax, data: list[np.ndarray], labels: list[str], *, colors: list[str], title: str, xlabel: str, ylabel: str) -> None:
+def _boxplot(
+    ax,
+    data: list[np.ndarray],
+    labels: list[str],
+    *,
+    colors: list[str],
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    sample_sizes: list[int] | None = None,
+) -> None:
+    if sample_sizes is not None:
+        labels = [f"{label}\nn={sample_sizes[idx]}" for idx, label in enumerate(labels)]
     if not any(arr.size for arr in data):
         ax.text(0.5, 0.5, "No data available", transform=ax.transAxes, ha="center", va="center")
         style_axes(ax, title=title, xlabel=xlabel, ylabel=ylabel)
@@ -944,9 +1086,137 @@ def _boxplot(ax, data: list[np.ndarray], labels: list[str], *, colors: list[str]
     ax.set_xticklabels(labels, rotation=90 if len(labels) > 4 else 0, fontsize=8)
 
 
-def _plot_state_fraction_by_session(ax, result: StatisticsResult, sessions: list[str], *, title: str) -> None:
+def _session_sample_sizes(values_by_session: dict[str, dict[str, list[float]] | list[float]], sessions: list[str], *, state_label: str | None = None) -> list[int]:
+    sample_sizes: list[int] = []
+    for session in sessions:
+        values = values_by_session.get(session, {})
+        if state_label is None:
+            if isinstance(values, dict):
+                first = next(iter(values.values()), [])
+                sample_sizes.append(int(_finite_series(first).size))
+            else:
+                sample_sizes.append(int(_finite_series(values).size))
+        else:
+            if isinstance(values, dict):
+                sample_sizes.append(int(_finite_series(values.get(state_label, [])).size))
+            else:
+                sample_sizes.append(int(_finite_series(values).size))
+    return sample_sizes
+
+
+def _session_labels_with_counts(labels: list[str], counts: list[int]) -> list[str]:
+    return [f"{label}\nn={count}" for label, count in zip(labels, counts)]
+
+
+def _session_subset(sessions: list[str], *, limit: int | None = None, first_n: int | None = None, last_n: int | None = None) -> list[str]:
+    subset = list(sessions)
+    if limit is not None:
+        subset = [label for label in subset if label.isdigit() and int(label) <= limit]
+    if first_n is not None:
+        subset = subset[:first_n]
+    if last_n is not None:
+        subset = subset[-last_n:]
+    return subset
+
+
+def _state_labels_for_combined_plot() -> list[str]:
+    return [label for label in STATE_LABELS if label != "not_visible"]
+
+
+def _build_overall_pupil_state_fractions(pupil_pct_by_session: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    session_means = {
+        label: _nanmean_or_nan([values.get(label, float("nan")) for values in pupil_pct_by_session.values()])
+        for label in STATE_LABELS
+    }
+    visible_labels = _state_labels_for_combined_plot()
+    visible_total = float(sum(session_means[label] for label in visible_labels if np.isfinite(session_means[label])))
+    visible_only = {}
+    for label in visible_labels:
+        value = session_means[label]
+        visible_only[label] = float(value / visible_total) if visible_total > 0.0 and np.isfinite(value) else float("nan")
+    return {
+        "with_not_visible": session_means,
+        "without_not_visible": visible_only,
+    }
+
+
+def _plot_state_fraction_pies(ax, *, title: str, fractions: dict[str, dict[str, float]], sample_size: int, sample_size_unit: str = "sessions") -> None:
+    ax.set_axis_off()
+    ax.set_title(f"{title} (n={sample_size} {sample_size_unit})", pad=14)
+    fig = ax.figure
+    bbox = ax.get_position()
+    bottom = bbox.y0 + 0.03 * bbox.height
+    height = bbox.height * 0.83
+    width = bbox.width * 0.46
+    gap = bbox.width * 0.08
+    left_ax = fig.add_axes([bbox.x0, bottom, width, height])
+    right_ax = fig.add_axes([bbox.x0 + width + gap, bottom, width, height])
+
+    def _draw_pie(pie_ax, values: dict[str, float], pie_title: str, labels: list[str]) -> None:
+        sizes = [float(values.get(label, float("nan"))) for label in labels]
+        sizes = [0.0 if not np.isfinite(v) or v < 0.0 else float(v) for v in sizes]
+        total = float(np.sum(sizes))
+        if total <= 0.0:
+            pie_ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=pie_ax.transAxes)
+            pie_ax.set_axis_off()
+            return
+        pie_ax.pie(
+            sizes,
+            labels=labels,
+            colors=[STATE_COLORS[STATE_LABELS.index(label)] for label in labels],
+            startangle=90,
+            counterclock=False,
+            autopct=lambda pct: f"{pct:.1f}%" if pct >= 3.0 else "",
+            textprops={"fontsize": 14},
+            wedgeprops={"linewidth": 1.0, "edgecolor": "white"},
+        )
+        pie_ax.set_title(pie_title, fontsize=18, pad=8)
+        pie_ax.set_aspect("equal")
+
+    _draw_pie(left_ax, fractions.get("with_not_visible", {}), "Including not visible", STATE_LABELS)
+    _draw_pie(right_ax, fractions.get("without_not_visible", {}), "Excluding not visible", _state_labels_for_combined_plot())
+
+
+def _plot_session_metric_boxplot(
+    ax,
+    result: StatisticsResult,
+    sessions: list[str],
+    metric_values_by_session: dict[str, list[float]],
+    *,
+    title: str,
+    ylabel: str,
+    color: str,
+    xlabel: str = "Session",
+) -> None:
+    data = [_finite_series(metric_values_by_session.get(session, [])) for session in sessions]
+    counts = [int(arr.size) for arr in data]
+    _boxplot(
+        ax,
+        data,
+        sessions,
+        colors=[color] * max(1, len(sessions)),
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        sample_sizes=counts,
+    )
+    if ylabel == "Fraction":
+        ax.set_ylim(0.0, 1.0)
+
+
+def _plot_state_fraction_by_session(
+    ax,
+    result: StatisticsResult,
+    sessions: list[str],
+    *,
+    title: str,
+    labels: list[str],
+) -> None:
     x = np.arange(len(sessions), dtype=float)
-    for i, label in enumerate(STATE_LABELS):
+    reference_label = labels[0] if labels else STATE_LABELS[0]
+    sample_sizes = _session_sample_sizes(result.pupil_pct_by_session_values, sessions, state_label=reference_label)
+    tick_labels = _session_labels_with_counts(sessions, sample_sizes)
+    for i, label in enumerate(labels):
         session_values = [
             _finite_series(result.pupil_pct_by_session_values.get(session, {}).get(label, []))
             for session in sessions
@@ -955,12 +1225,63 @@ def _plot_state_fraction_by_session(ax, result: StatisticsResult, sessions: list
         sds = np.array([float(np.nanstd(vals)) if vals.size else np.nan for vals in session_values], dtype=float)
         lower = np.clip(means - sds, 0.0, 1.0)
         upper = np.clip(means + sds, 0.0, 1.0)
-        ax.fill_between(x, lower, upper, color=STATE_COLORS[i], alpha=0.18)
-        ax.plot(x, means, marker="o", color=STATE_COLORS[i], label=label)
+        ax.fill_between(x, lower, upper, color=STATE_COLORS[STATE_LABELS.index(label)], alpha=0.18)
+        ax.plot(x, means, marker="o", color=STATE_COLORS[STATE_LABELS.index(label)], label=label)
     style_axes(ax, title=title, xlabel="Session", ylabel="Fraction")
     ax.set_xticks(x)
-    ax.set_xticklabels(sessions, rotation=90, fontsize=8)
+    ax.set_xticklabels(tick_labels, rotation=90, fontsize=8)
     ax.set_ylim(0.0, 1.0)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
+def _plot_state_fraction_stacked_by_session(
+    ax,
+    result: StatisticsResult,
+    sessions: list[str],
+    *,
+    title: str,
+    labels: list[str],
+) -> None:
+    x = np.arange(len(sessions), dtype=float)
+    reference_label = labels[0] if labels else STATE_LABELS[0]
+    sample_sizes = _session_sample_sizes(result.pupil_pct_by_session_values, sessions, state_label=reference_label)
+    tick_labels = _session_labels_with_counts(sessions, sample_sizes)
+    stacked = []
+    for label in labels:
+        session_values = [
+            _finite_series(result.pupil_pct_by_session_values.get(session, {}).get(label, []))
+            for session in sessions
+        ]
+        stacked.append(np.array([float(np.nanmean(vals)) if vals.size else np.nan for vals in session_values], dtype=float))
+    ax.stackplot(x, *stacked, labels=labels, colors=[STATE_COLORS[STATE_LABELS.index(label)] for label in labels], alpha=0.85)
+    style_axes(ax, title=title, xlabel="Session", ylabel="Fraction")
+    ax.set_xticks(x)
+    ax.set_xticklabels(tick_labels, rotation=90, fontsize=8)
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
+def _plot_single_state_fraction_by_session(
+    ax,
+    result: StatisticsResult,
+    sessions: list[str],
+    *,
+    title: str,
+    state_label: str,
+) -> None:
+    _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=[state_label])
+
+
+def _plot_lag_by_session(ax, result: StatisticsResult, sessions: list[str], *, title: str) -> None:
+    x = np.arange(len(sessions), dtype=float)
+    sample_sizes = _session_sample_sizes(result.lag_by_session_values, sessions)
+    tick_labels = _session_labels_with_counts(sessions, sample_sizes)
+    for i, label in enumerate(STATE_LABELS):
+        lag_vals = [result.lag_by_session.get(session, {}).get(label, np.nan) for session in sessions]
+        ax.plot(x, lag_vals, marker="o", color=STATE_COLORS[i], label=label)
+    style_axes(ax, title=title, xlabel="Session", ylabel="Lag (s)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(tick_labels, rotation=90, fontsize=8)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
@@ -970,65 +1291,620 @@ def _state_zscore_boxplot_data(result: StatisticsResult) -> tuple[list[np.ndarra
     return data, states
 
 
-def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
-    sessions = result.session_labels
-    figures: list[Figure] = []
+def _build_progress_state_series(
+    store: HabituationStore,
+    sessions: list,
+    *,
+    mean: float,
+    std: float,
+    threshold_values: list[float],
+    locomotion_threshold: float,
+    missing_buffer_sec: float,
+    bin_count: int,
+    window_start_sec: float | None = None,
+    window_end_sec: float | None = None,
+) -> dict:
+    n_states = len(STATE_LABELS)
+    state_probability_sum = np.zeros((n_states, bin_count), dtype=float)
+    state_probability_sq_sum = np.zeros((n_states, bin_count), dtype=float)
+    state_probability_count = np.zeros(bin_count, dtype=float)
+    sample_size = 0
 
-    fig = Figure(figsize=(10, 6), constrained_layout=True)
-    ax = fig.subplots()
-    locomotion_data = [_finite_series(result.locomotion_pct_by_session_values.get(session, [])) for session in sessions]
-    _boxplot(ax, locomotion_data, sessions, colors=["tab:blue"] * max(1, len(sessions)), title="Locomotion by session", xlabel="Session", ylabel="Fraction")
-    ax.set_ylim(0.0, 1.0)
-    figures.append(fig)
+    for summary in sessions:
+        bundle = _trim_bundle_for_cutoff(store, store.load_session_bundle(summary.exp_id))
+        duration = float(store.effective_session_duration_sec(summary.exp_id))
+        if window_start_sec is None or window_end_sec is None:
+            if duration <= 0.0:
+                continue
+            time_values = np.asarray(bundle.t, dtype=float)
+            bin_values = np.clip((time_values / max(duration, 1e-6)) * 100.0, 0.0, 100.0)
+            bin_indices = np.clip(bin_values.astype(int), 0, bin_count - 1)
+        else:
+            if duration < window_end_sec:
+                continue
+            time_values = np.asarray(bundle.t, dtype=float)
+            mask = np.isfinite(time_values) & (time_values >= window_start_sec) & (time_values < window_end_sec)
+            if not np.any(mask):
+                continue
+            window_minutes = (time_values[mask] - window_start_sec) / 60.0
+            bin_indices = np.clip(np.floor(window_minutes).astype(int), 0, bin_count - 1)
+            time_values = time_values[mask]
+        manual_masks = store.load_manual_masks(summary.exp_id)
+        visible = _visible_mask(bundle, manual_masks)
+        not_visible_mask = _interval_mask(np.asarray(bundle.t, dtype=float), manual_masks)
+        calibration = store.session_extra_large_calibration(summary.exp_id)
+        extra_large_mask = build_extra_large_mask(
+            store,
+            bundle,
+            calibration,
+            manual_masks,
+            manual_buffer_sec=missing_buffer_sec,
+        )
+        z = (bundle.radius.astype(float) - mean) / std
+        z[~np.isfinite(z)] = np.nan
+        state = classify_zscores(z, threshold_values, visible, extra_large_mask, not_visible_mask)
+        if window_start_sec is not None and window_end_sec is not None:
+            state = state[np.isfinite(np.asarray(bundle.t, dtype=float)) & (np.asarray(bundle.t, dtype=float) >= window_start_sec) & (np.asarray(bundle.t, dtype=float) < window_end_sec)]
+        sample_size += 1
+        for b in range(bin_count):
+            mask = bin_indices == b
+            valid = mask & (state >= 0)
+            if not np.any(valid):
+                continue
+            state_probability_count[b] += 1.0
+            for state_id in range(n_states):
+                fraction = float(np.mean(state[valid] == state_id))
+                if np.isfinite(fraction):
+                    state_probability_sum[state_id, b] += fraction
+                    state_probability_sq_sum[state_id, b] += fraction * fraction
 
-    fig = Figure(figsize=(10, 6), constrained_layout=True)
-    ax = fig.subplots()
-    face_data = [_finite_series(result.face_motion_pct_by_session_values.get(session, [])) for session in sessions]
-    _boxplot(ax, face_data, sessions, colors=["tab:orange"] * max(1, len(sessions)), title="Face motion by session", xlabel="Session", ylabel="Fraction")
-    ax.set_ylim(0.0, 1.0)
-    figures.append(fig)
+    mean_values = np.divide(
+        state_probability_sum,
+        state_probability_count,
+        out=np.full((n_states, bin_count), np.nan, dtype=float),
+        where=state_probability_count > 0,
+    )
+    state_probability_var = np.divide(
+        state_probability_sq_sum,
+        state_probability_count,
+        out=np.full((n_states, bin_count), np.nan, dtype=float),
+        where=state_probability_count > 0,
+    ) - np.square(mean_values)
+    state_probability_std = np.sqrt(np.clip(state_probability_var, 0.0, None))
 
-    fig = Figure(figsize=(10, 6), constrained_layout=True)
-    ax = fig.subplots()
-    state_data, states = _state_zscore_boxplot_data(result)
-    _boxplot(ax, state_data, states, colors=STATE_COLORS, title="Mean z-scored pupil size by state", xlabel="Pupil state", ylabel="Mean z-score")
-    figures.append(fig)
+    if window_start_sec is None or window_end_sec is None:
+        bins = np.linspace(0.0, 100.0, bin_count, endpoint=False)
+    else:
+        bins = np.arange(bin_count, dtype=float) + 0.5
 
-    fig = Figure(figsize=(10, 6), constrained_layout=True)
-    ax = fig.subplots()
-    _plot_state_fraction_by_session(ax, result, sessions, title="Pupil state fraction by session")
-    figures.append(fig)
+    return {
+        "kind": "absolute_window" if window_start_sec is not None and window_end_sec is not None else "relative",
+        "bins": bins.tolist(),
+        "state_probability": mean_values.tolist(),
+        "state_probability_std": state_probability_std.tolist(),
+        "state_probability_count": state_probability_count.tolist(),
+        "sample_size": int(sample_size),
+        "window_start_sec": float(window_start_sec) if window_start_sec is not None else None,
+        "window_end_sec": float(window_end_sec) if window_end_sec is not None else None,
+        "sample_size_unit": "sessions",
+    }
 
-    fig = Figure(figsize=(10, 6), constrained_layout=True)
-    ax = fig.subplots()
-    lag_labels = result.session_labels
-    lag_x = np.arange(len(lag_labels))
+
+def _combine_progress_series(series_list: list[dict]) -> dict:
+    if not series_list:
+        return {
+            "kind": "relative",
+            "bins": [],
+            "state_probability": [],
+            "state_probability_std": [],
+            "state_probability_count": [],
+            "sample_size": 0,
+            "window_start_sec": None,
+            "window_end_sec": None,
+            "sample_size_unit": "sessions",
+        }
+    bins = np.asarray(series_list[0].get("bins", []), dtype=float)
+    state_probability = np.asarray([np.asarray(series.get("state_probability", []), dtype=float) for series in series_list], dtype=float)
+    state_probability_std = np.asarray([np.asarray(series.get("state_probability_std", []), dtype=float) for series in series_list], dtype=float)
+    valid = np.isfinite(state_probability)
+    count = np.sum(valid, axis=0)
+    sum_values = np.nansum(state_probability, axis=0)
+    mean = np.divide(sum_values, count, out=np.full_like(sum_values, np.nan, dtype=float), where=count > 0)
+    sq_sum = np.nansum(np.square(state_probability), axis=0)
+    var = np.divide(sq_sum, count, out=np.full_like(sum_values, np.nan, dtype=float), where=count > 0) - np.square(mean)
+    std = np.sqrt(np.clip(var, 0.0, None))
+    sample_size = len(series_list)
+    return {
+        "kind": str(series_list[0].get("kind", "relative")),
+        "bins": bins.tolist(),
+        "state_probability": mean.tolist(),
+        "state_probability_std": std.tolist(),
+        "state_probability_count": [sample_size] * int(bins.size),
+        "sample_size": int(sample_size),
+        "window_start_sec": series_list[0].get("window_start_sec"),
+        "window_end_sec": series_list[0].get("window_end_sec"),
+        "sample_size_unit": str(series_list[0].get("sample_size_unit", "sessions")),
+    }
+
+
+def _build_animal_weighted_progress_series(
+    store: HabituationStore,
+    sessions: list,
+    *,
+    mean: float,
+    std: float,
+    threshold_values: list[float],
+    locomotion_threshold: float,
+    missing_buffer_sec: float,
+) -> dict:
+    sessions_by_animal: dict[str, list] = {}
+    for summary in sessions:
+        sessions_by_animal.setdefault(summary.animal_id, []).append(summary)
+
+    animal_series: list[dict] = []
+    for animal_id, animal_sessions in sessions_by_animal.items():
+        ordered = sorted(animal_sessions, key=lambda s: s.sort_key)
+        selected = ordered[:2]
+        if len(selected) < 2:
+            continue
+        per_session_series = [
+            _build_progress_state_series(
+                store,
+                [summary],
+                mean=mean,
+                std=std,
+                threshold_values=threshold_values,
+                locomotion_threshold=locomotion_threshold,
+                missing_buffer_sec=missing_buffer_sec,
+                bin_count=100,
+            )
+            for summary in selected
+        ]
+        animal_series.append(_combine_progress_series(per_session_series))
+
+    combined = _combine_progress_series(animal_series)
+    combined["sample_size"] = len(animal_series)
+    combined["sample_size_unit"] = "animals"
+    return combined
+
+
+def _build_animal_weighted_progress_subset_series(
+    store: HabituationStore,
+    sessions: list,
+    *,
+    mean: float,
+    std: float,
+    threshold_values: list[float],
+    locomotion_threshold: float,
+    missing_buffer_sec: float,
+    take_last: bool,
+) -> dict:
+    sessions_by_animal: dict[str, list] = {}
+    for summary in sessions:
+        sessions_by_animal.setdefault(summary.animal_id, []).append(summary)
+
+    animal_series: list[dict] = []
+    for animal_id, animal_sessions in sessions_by_animal.items():
+        ordered = sorted(animal_sessions, key=lambda s: s.sort_key)
+        selected = ordered[-2:] if take_last else ordered[:2]
+        if len(selected) < 2:
+            continue
+        animal_series.append(
+            _build_progress_state_series(
+                store,
+                selected,
+                mean=mean,
+                std=std,
+                threshold_values=threshold_values,
+                locomotion_threshold=locomotion_threshold,
+                missing_buffer_sec=missing_buffer_sec,
+                bin_count=100,
+            )
+        )
+
+    combined = _combine_progress_series(animal_series)
+    combined["sample_size"] = len(animal_series)
+    combined["sample_size_unit"] = "animals"
+    return combined
+
+
+def _progress_series_payload(
+    store: HabituationStore,
+    result: StatisticsResult,
+    *,
+    selected_session_ids: list[str],
+    first_last_label: str | None = None,
+) -> dict:
+    sessions_by_id = {summary.exp_id: summary for summary in store.dataset_sessions()}
+    selected_sessions = [sessions_by_id[exp_id] for exp_id in selected_session_ids if exp_id in sessions_by_id]
+    payload = {
+        "selected_session_ids": selected_session_ids,
+        "overall": _build_progress_state_series(
+            store,
+            selected_sessions,
+            mean=result.zscore_mean,
+            std=result.zscore_std,
+            threshold_values=list(result.thresholds.get("threshold_values", [])),
+            locomotion_threshold=float(result.thresholds.get("locomotion_threshold", 0.35)),
+            missing_buffer_sec=float(result.thresholds.get("missing_buffer_sec", 1.0)),
+            bin_count=100,
+        ),
+    }
+    return payload
+
+
+def _animal_progress_series_payload(values_by_animal: dict[str, list[float]]) -> dict:
+    animals = sorted(values_by_animal)
+    if not animals:
+        return {
+            "animals": [],
+            "bins": [],
+            "values_by_animal": {},
+            "mean_values": [],
+            "count_values": [],
+            "sample_size": 0,
+            "sample_size_unit": "animals",
+        }
+    max_len = max((len(values_by_animal.get(animal, [])) for animal in animals), default=0)
+    if max_len <= 0:
+        return {
+            "animals": animals,
+            "bins": [],
+            "values_by_animal": {animal: [float(v) for v in list(values_by_animal.get(animal, []))] for animal in animals},
+            "mean_values": [],
+            "count_values": [],
+            "sample_size": len(animals),
+            "sample_size_unit": "animals",
+        }
+    matrix = np.full((len(animals), max_len), np.nan, dtype=float)
+    values_map: dict[str, list[float]] = {}
+    for row, animal in enumerate(animals):
+        arr = np.asarray(values_by_animal.get(animal, []), dtype=float).reshape(-1)
+        values_map[animal] = [float(v) for v in arr.tolist()]
+        if arr.size:
+            matrix[row, : arr.size] = arr
+    count_values = np.sum(np.isfinite(matrix), axis=0)
+    sum_values = np.nansum(matrix, axis=0)
+    mean_values = np.divide(sum_values, count_values, out=np.full(max_len, np.nan, dtype=float), where=count_values > 0)
+    return {
+        "animals": animals,
+        "bins": np.arange(1, max_len + 1, dtype=float).tolist(),
+        "values_by_animal": values_map,
+        "mean_values": mean_values.tolist(),
+        "count_values": count_values.tolist(),
+        "sample_size": len(animals),
+        "sample_size_unit": "animals",
+    }
+
+
+def _format_progress_title(title: str, sample_size: int, series: dict) -> str:
+    unit = str(series.get("sample_size_unit", "sessions"))
+    extra = f" (n={sample_size} {unit})" if sample_size else ""
+    if series.get("kind") == "absolute_window" and series.get("window_start_sec") is not None and series.get("window_end_sec") is not None:
+        start_min = int(float(series["window_start_sec"]) // 60)
+        end_min = int(float(series["window_end_sec"]) // 60)
+        return f"{title} - {start_min}-{end_min} min{extra}"
+    return f"{title}{extra}"
+
+
+def _plot_progress_series(ax, series: dict, *, title: str, xlabel: str) -> None:
+    bins = np.asarray(series.get("bins", []), dtype=float)
+    state_probability = np.asarray(series.get("state_probability", []), dtype=float)
+    state_probability_std = np.asarray(series.get("state_probability_std", []), dtype=float)
     for i, label in enumerate(STATE_LABELS):
-        lag_vals = [result.lag_by_session.get(exp_id, {}).get(label, np.nan) for exp_id in lag_labels]
-        ax.plot(lag_x, lag_vals, marker="o", color=STATE_COLORS[i], label=label)
-    style_axes(ax, title="Lag to first pupil state after 1 min by session", xlabel="Session", ylabel="Lag (s)")
-    ax.set_xticks(lag_x)
-    ax.set_xticklabels(lag_labels, rotation=90, fontsize=8)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
-    figures.append(fig)
-
-    fig = Figure(figsize=(10, 6), constrained_layout=True)
-    ax = fig.subplots()
-    for i, label in enumerate(STATE_LABELS):
-        mean = result.state_probability[i]
-        std = result.state_probability_std[i]
+        mean = state_probability[i] if i < state_probability.shape[0] else np.asarray([])
+        std = state_probability_std[i] if i < state_probability_std.shape[0] else np.asarray([])
         lower = np.clip(mean - std, 0.0, 1.0)
         upper = np.clip(mean + std, 0.0, 1.0)
-        ax.fill_between(result.progress_bins, lower, upper, color=STATE_COLORS[i], alpha=0.18)
-        ax.plot(result.progress_bins, mean, label=label, color=STATE_COLORS[i])
-    style_axes(ax, title="Pupil state fraction vs experiment length", xlabel="Progress (%)", ylabel="Fraction")
+        ax.fill_between(bins, lower, upper, color=STATE_COLORS[i], alpha=0.18)
+        ax.plot(bins, mean, label=label, color=STATE_COLORS[i])
+    style_axes(ax, title=title, xlabel=xlabel, ylabel="Fraction")
+    ax.set_ylim(0.0, 1.0)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
-    figures.append(fig)
+    counts = np.asarray(series.get("state_probability_count", []), dtype=float)
+    if counts.size:
+        ax.text(
+            0.99,
+            0.02,
+            f"bin n: {int(counts[0])} -> {int(counts[-1])}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=10,
+            color="0.25",
+        )
 
-    return figures
+
+def _plot_progress_stacked_area(ax, series: dict, *, title: str, xlabel: str) -> None:
+    bins = np.asarray(series.get("bins", []), dtype=float)
+    state_probability = np.asarray(series.get("state_probability", []), dtype=float)
+    plot_values = [state_probability[i] if i < state_probability.shape[0] else np.asarray([]) for i in range(len(STATE_LABELS))]
+    ax.stackplot(bins, *plot_values, colors=STATE_COLORS[: len(plot_values)], labels=STATE_LABELS, alpha=0.85)
+    style_axes(ax, title=title, xlabel=xlabel, ylabel="Fraction")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
-def save_statistics_outputs(store: HabituationStore, result: StatisticsResult) -> tuple[Path, Path, Path]:
+def _plot_animal_progress_lines(ax, values_by_animal: dict[str, list[float]], *, title: str, ylabel: str, average_label: str) -> None:
+    series = _animal_progress_series_payload(values_by_animal)
+    bins = np.asarray(series.get("bins", []), dtype=float)
+    animals = list(series.get("animals", []))
+    values_map = dict(series.get("values_by_animal", {}))
+    for animal_id in animals:
+        values = np.asarray(values_map.get(animal_id, []), dtype=float)
+        if not values.size:
+            continue
+        x = np.arange(1, values.size + 1, dtype=float)
+        ax.plot(x, values, marker="o", alpha=0.75, label=animal_id)
+    mean_values = np.asarray(series.get("mean_values", []), dtype=float)
+    if mean_values.size:
+        ax.plot(bins, mean_values, color="black", linewidth=2.5, marker="o", label=f"{average_label} (n={int(series.get('sample_size', 0))} animals)")
+    counts = np.asarray(series.get("count_values", []), dtype=float)
+    tick_labels = [f"{int(bin_idx)}\n(n={int(count)})" for bin_idx, count in zip(bins, counts)] if bins.size else []
+    style_axes(ax, title=_format_progress_title(title, int(series.get("sample_size", 0)), series), xlabel="Session", ylabel=ylabel)
+    ax.set_xticks(bins)
+    ax.set_xticklabels(tick_labels, rotation=90, fontsize=8)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
+def _progress_window_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
+    specs: list[tuple[str, str, dict]] = []
+    for key, series in sorted(
+        ((key, value) for key, value in result.progress_series.items() if key.startswith("window_")),
+        key=lambda item: float(item[1].get("window_start_sec", 0.0)),
+    ):
+        start_min = int(float(series.get("window_start_sec", 0.0)) // 60)
+        end_min = int(float(series.get("window_end_sec", 0.0)) // 60)
+        title = f"Pupil state fraction vs experiment length - {start_min}-{end_min} min"
+        specs.append((f"progress_{key}", title, {"kind": "progress", "series_key": key}))
+    return specs
+
+
+def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
+    specs: list[tuple[str, str, dict]] = []
+
+    session_specs = [
+        ("locomotion_boxplot", "Locomotion by session", {"kind": "session_boxplot", "metric": "locomotion", "subset": None}),
+        ("locomotion_boxplot_le7", "Locomotion by session (<= 7)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le7"}),
+        ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion", "subset": None}),
+        ("face_motion_boxplot_le7", "Face motion by session (<= 7)", {"kind": "session_boxplot", "metric": "face_motion", "subset": "le7"}),
+        ("pupil_state_fraction_by_session", "Pupil state fraction by session", {"kind": "state_fraction", "subset": None, "labels": _state_labels_for_combined_plot()}),
+        ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked", "subset": None, "labels": _state_labels_for_combined_plot()}),
+        ("pupil_state_fraction_pie", "Overall pupil state percentages", {"kind": "state_fraction_pie"}),
+        ("pupil_state_fraction_by_session_le7", "Pupil state fraction by session (<= 7)", {"kind": "state_fraction", "subset": "le7", "labels": _state_labels_for_combined_plot()}),
+        ("pupil_state_fraction_by_session_stacked_le7", "Pupil state fraction by session (stacked area, <= 7)", {"kind": "state_fraction_stacked", "subset": "le7", "labels": _state_labels_for_combined_plot()}),
+    ]
+    for label in STATE_LABELS:
+        slug = f"pupil_state_fraction_by_session_{label}"
+        title = f"Pupil state fraction by session - {label}"
+        session_specs.append((slug, title, {"kind": "single_state", "state_label": label, "subset": None}))
+        session_specs.append((f"{slug}_le7", f"Pupil state fraction by session - {label} (<= 7)", {"kind": "single_state", "state_label": label, "subset": "le7"}))
+    session_specs.extend(
+        [
+            ("lag_by_state", "Lag to first pupil state after 1 min by session", {"kind": "lag", "subset": None}),
+            ("lag_by_state_le7", "Lag to first pupil state after 1 min by session (<= 7)", {"kind": "lag", "subset": "le7"}),
+        ]
+    )
+    specs.extend(session_specs)
+
+    specs.append(("locomotion_progress", "Locomotion progression across sessions", {"kind": "animal_progress", "metric": "locomotion"}))
+    specs.append(("pupil_size_progress", "Mean z-scored pupil size progression across sessions", {"kind": "animal_progress", "metric": "pupil_zscore"}))
+    specs.append(("state_fraction", "Pupil state fraction vs experiment length", {"kind": "progress", "series_key": "overall"}))
+    specs.append(("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall"}))
+    specs.extend(_progress_window_specs(result))
+    if "first_2" in result.progress_series:
+        specs.append(("state_fraction_first_2_sessions", "Pupil state fraction vs experiment length - first 2 sessions", {"kind": "progress", "series_key": "first_2"}))
+    if "last_2" in result.progress_series:
+        specs.append(("state_fraction_last_2_sessions", "Pupil state fraction vs experiment length - last 2 sessions", {"kind": "progress", "series_key": "last_2"}))
+    return specs
+
+
+def statistics_panel_paths(output_dir: Path) -> list[tuple[str, Path]]:
+    output_dir = Path(output_dir)
+    result_path = output_dir / "statistics.json"
+    if result_path.exists():
+        try:
+            result = StatisticsResult.from_dict(json.loads(result_path.read_text()))
+            specs = _statistics_panel_specs(result)
+            return [
+                (title, output_dir / f"statistics_panel_{idx:02d}_{slug}.png")
+                for idx, (slug, title, _config) in enumerate(specs, start=1)
+            ]
+        except Exception:
+            pass
+    return []
+
+
+def _statistics_panel_export_complete(output_dir: Path, result: StatisticsResult) -> bool:
+    output_dir = Path(output_dir)
+    summary_path = output_dir / "statistics_summary.png"
+    if not summary_path.exists():
+        return False
+    for idx, (slug, _title, _config) in enumerate(_statistics_panel_specs(result), start=1):
+        if not (output_dir / f"statistics_panel_{idx:02d}_{slug}.png").exists():
+            return False
+    return True
+
+
+def _build_panel_figure(result: StatisticsResult, config: dict, title: str) -> Figure:
+    kind = config["kind"]
+    if kind == "session_boxplot":
+        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        metric = config["metric"]
+        if metric == "locomotion":
+            _plot_session_metric_boxplot(ax, result, sessions, result.locomotion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:blue")
+        else:
+            _plot_session_metric_boxplot(ax, result, sessions, result.face_motion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:orange")
+        return fig
+    if kind == "state_fraction":
+        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=config.get("labels", _state_labels_for_combined_plot()))
+        return fig
+    if kind == "state_fraction_stacked":
+        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=config.get("labels", _state_labels_for_combined_plot()))
+        return fig
+    if kind == "state_fraction_pie":
+        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session)
+        fig = Figure(figsize=(13, 6), constrained_layout=True)
+        ax = fig.subplots()
+        _plot_state_fraction_pies(ax, title=title, fractions=fractions, sample_size=len(result.pupil_pct_by_session), sample_size_unit="sessions")
+        return fig
+    if kind == "single_state":
+        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        _plot_single_state_fraction_by_session(ax, result, sessions, title=title, state_label=config["state_label"])
+        return fig
+    if kind == "lag":
+        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        _plot_lag_by_session(ax, result, sessions, title=title)
+        return fig
+    if kind == "animal_progress":
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        if config["metric"] == "locomotion":
+            _plot_animal_progress_lines(ax, result.locomotion_progress_by_animal_values, title=title, ylabel="Fraction", average_label="Average")
+        else:
+            _plot_animal_progress_lines(ax, result.pupil_zscore_progress_by_animal_values, title=title, ylabel="Mean z-score", average_label="Average")
+        return fig
+    if kind == "progress":
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        series = result.progress_series.get(config["series_key"], {})
+        title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
+        xlabel = "Progress (%)" if series.get("kind") != "absolute_window" else "Minutes into 30-minute window"
+        _plot_progress_series(ax, series, title=title, xlabel=xlabel)
+        return fig
+    if kind == "progress_stacked":
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        series = result.progress_series.get(config["series_key"], {})
+        title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
+        xlabel = "Progress (%)" if series.get("kind") != "absolute_window" else "Minutes into 30-minute window"
+        _plot_progress_stacked_area(ax, series, title=title, xlabel=xlabel)
+        return fig
+    raise ValueError(f"Unknown panel kind: {kind}")
+
+
+def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
+    return [_build_panel_figure(result, config, title) for _, title, config in _statistics_panel_specs(result)]
+
+
+def _summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
+    series = result.progress_series.get("overall", {})
+    return [
+        ("locomotion_boxplot", "Locomotion by session", {"kind": "session_boxplot", "metric": "locomotion"}),
+        ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion"}),
+        ("pupil_zscore_by_state", "Mean z-scored pupil size by state", {"kind": "state_zscore_boxplot"}),
+        ("pupil_state_fraction_by_session", "Pupil state fraction by session", {"kind": "state_fraction"}),
+        ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked"}),
+        ("pupil_state_fraction_pie", "Overall pupil state percentages", {"kind": "state_fraction_pie"}),
+        ("lag_by_state", "Lag to first pupil state after 1 min by session", {"kind": "lag"}),
+        ("state_fraction", "Pupil state fraction vs experiment length", {"kind": "progress", "series_key": "overall"}),
+        ("locomotion_progress", "Locomotion progression across sessions", {"kind": "animal_progress", "metric": "locomotion"}),
+        ("pupil_size_progress", "Mean z-scored pupil size progression across sessions", {"kind": "animal_progress", "metric": "pupil_zscore"}),
+        ("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall"}),
+    ]
+
+
+def statistics_summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
+    return _summary_panel_specs(result)
+
+
+def _selected_summary_panel_specs(result: StatisticsResult, panel_keys: list[str] | None) -> list[tuple[str, str, dict]]:
+    specs = _summary_panel_specs(result)
+    if panel_keys is None:
+        return specs
+    spec_map = {slug: (slug, title, config) for slug, title, config in specs}
+    selected: list[tuple[str, str, dict]] = []
+    for key in panel_keys:
+        if key in spec_map:
+            selected.append(spec_map[key])
+    return selected
+
+
+def _draw_summary_panel(ax, result: StatisticsResult, config: dict, title: str) -> None:
+    sessions = list(result.session_labels)
+    kind = config["kind"]
+    if kind == "session_boxplot":
+        metric = config.get("metric", "locomotion")
+        if metric == "locomotion":
+            _plot_session_metric_boxplot(ax, result, sessions, result.locomotion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:blue")
+        else:
+            _plot_session_metric_boxplot(ax, result, sessions, result.face_motion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:orange")
+        return
+    if kind == "state_zscore_boxplot":
+        state_data, states = _state_zscore_boxplot_data(result)
+        _boxplot(ax, state_data, states, colors=STATE_COLORS, title=title, xlabel="Pupil state", ylabel="Mean z-score")
+        return
+    if kind == "state_fraction":
+        _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot())
+        return
+    if kind == "state_fraction_stacked":
+        _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot())
+        return
+    if kind == "state_fraction_pie":
+        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session)
+        _plot_state_fraction_pies(ax, title=title, fractions=fractions, sample_size=len(result.pupil_pct_by_session), sample_size_unit="sessions")
+        return
+    if kind == "lag":
+        _plot_lag_by_session(ax, result, sessions, title=title)
+        return
+    if kind == "animal_progress":
+        if config["metric"] == "locomotion":
+            _plot_animal_progress_lines(ax, result.locomotion_progress_by_animal_values, title=title, ylabel="Fraction", average_label="Average")
+        else:
+            _plot_animal_progress_lines(ax, result.pupil_zscore_progress_by_animal_values, title=title, ylabel="Mean z-score", average_label="Average")
+        return
+    if kind == "progress":
+        series = result.progress_series.get(config["series_key"], {})
+        title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
+        _plot_progress_series(ax, series, title=title, xlabel="Progress (%)")
+        return
+    if kind == "progress_stacked":
+        series = result.progress_series.get(config["series_key"], {})
+        title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
+        _plot_progress_stacked_area(ax, series, title=title, xlabel="Progress (%)")
+        return
+    raise ValueError(f"Unknown summary panel kind: {kind}")
+
+
+def _build_summary_figure(result: StatisticsResult, panel_keys: list[str] | None = None) -> Figure:
+    specs = _selected_summary_panel_specs(result, panel_keys)
+    n_panels = max(1, len(specs))
+    if n_panels <= 2:
+        cols = 1
+    elif n_panels <= 6:
+        cols = 2
+    else:
+        cols = 3
+    rows = int(np.ceil(n_panels / cols))
+    fig = Figure(figsize=(8.5 * cols, 5.8 * rows), constrained_layout=True)
+    axes = np.asarray(fig.subplots(rows, cols, squeeze=False)).ravel()
+    for ax, (_, title, config) in zip(axes, specs):
+        _draw_summary_panel(ax, result, config, title)
+    for ax in axes[len(specs):]:
+        ax.axis("off")
+    fig.suptitle(f"Habituation statistics - {result.scope} / {result.animal_id}", y=1.02)
+    return fig
+
+
+def save_statistics_summary_figure(output_dir: Path, result: StatisticsResult, *, summary_panel_keys: list[str] | None = None) -> tuple[Path, Path]:
+    output_dir = Path(output_dir)
+    fig = _build_summary_figure(result, panel_keys=summary_panel_keys)
+    return save_figure(fig, "statistics_summary", output_dir)
+
+
+def save_statistics_outputs(store: HabituationStore, result: StatisticsResult, *, summary_panel_keys: list[str] | None = None) -> tuple[Path, Path, Path]:
     set_poster_style()
     scope_dir = store.source_root / "gui_output" / "stats"
     scope_dir.mkdir(parents=True, exist_ok=True)
@@ -1038,63 +1914,22 @@ def save_statistics_outputs(store: HabituationStore, result: StatisticsResult) -
     result_path = output_dir / "statistics.json"
     payload = result.to_dict()
     payload["cache_signature"] = store.statistics_cache_signature(result.scope, result.animal_id, result.thresholds)
+    payload["plot_version"] = STATISTICS_PLOT_VERSION
     result_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     settings = store.get_animal_settings(result.animal_id)
     settings["last_stats_signature"] = payload["cache_signature"]
     settings["last_stats_output_dir"] = str(output_dir)
     store.set_animal_settings(result.animal_id, settings)
 
-    fig = Figure(figsize=(16, 14), constrained_layout=True)
-    axes = fig.subplots(3, 2).ravel()
-    sessions = result.session_labels
+    svg_path, png_path = save_statistics_summary_figure(output_dir, result, summary_panel_keys=summary_panel_keys)
 
-    locomotion_data = [_finite_series(result.locomotion_pct_by_session_values.get(session, [])) for session in sessions]
-    face_data = [_finite_series(result.face_motion_pct_by_session_values.get(session, [])) for session in sessions]
-    state_data, states = _state_zscore_boxplot_data(result)
-
-    ax = axes[0]
-    _boxplot(ax, locomotion_data, sessions, colors=["tab:blue"] * max(1, len(sessions)), title="Locomotion by session", xlabel="Session", ylabel="Fraction")
-    ax.set_ylim(0.0, 1.0)
-
-    ax = axes[1]
-    _boxplot(ax, face_data, sessions, colors=["tab:orange"] * max(1, len(sessions)), title="Face motion by session", xlabel="Session", ylabel="Fraction")
-    ax.set_ylim(0.0, 1.0)
-
-    ax = axes[2]
-    _boxplot(ax, state_data, states, colors=STATE_COLORS, title="Mean z-scored pupil size by state", xlabel="Pupil state", ylabel="Mean z-score")
-
-    ax = axes[3]
-    _plot_state_fraction_by_session(ax, result, sessions, title="Pupil state fraction by session")
-
-    ax = axes[4]
-    lag_labels = result.session_labels
-    lag_x = np.arange(len(lag_labels))
-    for i, label in enumerate(STATE_LABELS):
-        lag_vals = [result.lag_by_session.get(exp_id, {}).get(label, np.nan) for exp_id in lag_labels]
-        ax.plot(lag_x, lag_vals, marker="o", color=STATE_COLORS[i], label=label)
-    style_axes(ax, title="Lag to first pupil state after 1 min by session", xlabel="Session", ylabel="Lag (s)")
-    ax.set_xticks(lag_x)
-    ax.set_xticklabels(lag_labels, rotation=90, fontsize=8)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
-
-    ax = axes[5]
-    for i, label in enumerate(STATE_LABELS):
-        mean = result.state_probability[i]
-        std = result.state_probability_std[i]
-        lower = np.clip(mean - std, 0.0, 1.0)
-        upper = np.clip(mean + std, 0.0, 1.0)
-        ax.fill_between(result.progress_bins, lower, upper, color=STATE_COLORS[i], alpha=0.18)
-        ax.plot(result.progress_bins, mean, label=label, color=STATE_COLORS[i])
-    style_axes(ax, title="Pupil state fraction vs experiment length", xlabel="Progress (%)", ylabel="Fraction")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
-    fig.suptitle(f"Habituation statistics - {result.scope} / {result.animal_id}", y=1.02)
-    svg_path, png_path = save_figure(fig, "statistics_summary", output_dir)
-
-    for idx, fig_panel in enumerate(_build_statistics_panel_figures(result), start=1):
-        slug = STATISTICS_PANEL_SPECS[idx - 1][0]
+    specs = _statistics_panel_specs(result)
+    for idx, (slug, title, config) in enumerate(specs, start=1):
+        fig_panel = _build_panel_figure(result, config, title)
         save_figure(fig_panel, f"statistics_panel_{idx:02d}_{slug}", output_dir)
 
     return result_path, svg_path, png_path
+
 
 def load_cached_statistics_outputs(
     store: HabituationStore,
@@ -1115,12 +1950,12 @@ def load_cached_statistics_outputs(
             data = json.loads(direct_result.read_text())
         except Exception:
             data = None
-        if data and data.get("cache_signature") == expected_signature:
+        if data and data.get("cache_signature") == expected_signature and int(data.get("plot_version", 1)) == STATISTICS_PLOT_VERSION:
             result = StatisticsResult.from_dict(data)
             output_dir = direct_result.parent
             svg_path = output_dir / "statistics_summary.svg"
             png_path = output_dir / "statistics_summary.png"
-            if png_path.exists():
+            if png_path.exists() and _statistics_panel_export_complete(output_dir, result):
                 return result, (direct_result, svg_path, png_path)
 
     candidates = sorted(
@@ -1135,11 +1970,13 @@ def load_cached_statistics_outputs(
             continue
         if data.get("cache_signature") != expected_signature:
             continue
+        if int(data.get("plot_version", 1)) != STATISTICS_PLOT_VERSION:
+            continue
         result = StatisticsResult.from_dict(data)
         output_dir = result_path.parent
         svg_path = output_dir / "statistics_summary.svg"
         png_path = output_dir / "statistics_summary.png"
-        if not png_path.exists():
+        if not png_path.exists() or not _statistics_panel_export_complete(output_dir, result):
             continue
         return result, (result_path, svg_path, png_path)
     return None
