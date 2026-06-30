@@ -31,7 +31,8 @@ STATS_DIR = GUI_OUTPUT_ROOT / "stats"
 APP_STATE_PATH = GUI_OUTPUT_ROOT / "app_state.json"
 
 CACHE_VERSION = 9
-STATISTICS_RESULTS_VERSION = 10
+STATISTICS_RESULTS_VERSION = 11
+MIN_STATISTICS_SESSIONS_PER_ANIMAL = 4
 MIN_ANALYSIS_SESSION_DURATION_SEC = 1800.0
 SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d+_[A-Za-z0-9]+$")
 EYE_SIMILARITY_CACHE_DIR = GUI_OUTPUT_ROOT / "eye_similarity_cache"
@@ -772,12 +773,7 @@ class HabituationStore:
         return EYE_SIMILARITY_CACHE_DIR / f"{exp_id}_eye_similarity_{signature}.pkl"
 
     def is_session_forced_do_not_use(self, exp_id: str) -> bool:
-        summary = self.get_session_summary(exp_id)
-        if summary is None:
-            return False
-        if summary.animal_id == "TEST":
-            return True
-        return float(summary.video_duration_sec or 0.0) < MIN_ANALYSIS_SESSION_DURATION_SEC
+        return False
 
     def load_session_state(self, exp_id: str) -> dict:
         path = self.session_state_path(exp_id)
@@ -828,11 +824,6 @@ class HabituationStore:
         state.setdefault("threshold_signature", "")
         state["analysis_cutoff_sec"] = _coerce_optional_float(state.get("analysis_cutoff_sec"))
         state["timebase_aligned"] = bool(state.get("timebase_aligned", False))
-        forced_do_not_use = self.is_session_forced_do_not_use(exp_id)
-        if forced_do_not_use and not state.get("do_not_use", False):
-            state["do_not_use"] = True
-            _save_json(path, state)
-            self.mark_all_animals_stats_dirty()
         return state
 
     def save_session_state(self, exp_id: str, state: dict) -> None:
@@ -998,8 +989,6 @@ class HabituationStore:
         return bool(state.get("deeplabcut_reference", False))
 
     def is_session_do_not_use(self, exp_id: str) -> bool:
-        if self.is_session_forced_do_not_use(exp_id):
-            return True
         state = self.load_session_state(exp_id)
         return bool(state.get("do_not_use", False))
 
@@ -1073,8 +1062,6 @@ class HabituationStore:
         self.mark_all_animals_stats_dirty()
 
     def set_session_do_not_use(self, exp_id: str, do_not_use: bool) -> None:
-        if self.is_session_forced_do_not_use(exp_id):
-            do_not_use = True
         state = self.load_session_state(exp_id)
         state["do_not_use"] = bool(do_not_use)
         self.save_session_state(exp_id, state)
@@ -1878,6 +1865,16 @@ class HabituationStore:
             for summary in sessions
             if summary.has_right_pickle and not self.is_deeplabcut_reference_session(summary.exp_id) and not self.is_session_do_not_use(summary.exp_id)
         ]
+        counts_by_animal: dict[str, int] = {}
+        for summary in analysis_sessions:
+            counts_by_animal[summary.animal_id] = counts_by_animal.get(summary.animal_id, 0) + 1
+        allowed_animals = {
+            animal_id_key
+            for animal_id_key, count in counts_by_animal.items()
+            if count >= MIN_STATISTICS_SESSIONS_PER_ANIMAL
+        }
+        if scope == "All" or animal_id == "All":
+            analysis_sessions = [summary for summary in analysis_sessions if summary.animal_id in allowed_animals]
         payload = {
             "scope": scope,
             "animal_id": animal_id,

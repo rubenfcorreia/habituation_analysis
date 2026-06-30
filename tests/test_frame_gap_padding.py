@@ -433,9 +433,13 @@ def test_statistics_outputs_expand_panels_and_window_plots(tmp_path):
     )
 
     panel_specs = statistics_summary_panel_specs(result)
-    assert [slug for slug, _, _ in panel_specs[:3]] == ["locomotion_boxplot", "face_motion_boxplot", "pupil_zscore_by_state"]
+    assert "locomotion_boxplot_le6" in [slug for slug, _, _ in panel_specs]
+    assert "pupil_state_fraction_by_session_stacked_le6" in [slug for slug, _, _ in panel_specs]
     assert "with_not_visible" in result.pupil_state_fraction_overall
     assert "without_not_visible" in result.pupil_state_fraction_overall
+    visible_sum = sum(result.pupil_pct_by_session_visible["1"][label] for label in _state_labels_for_combined_plot())
+    assert np.isclose(visible_sum, 1.0)
+    assert np.isnan(result.pupil_pct_by_session_visible["1"]["not_visible"])
 
     selected_fig = _build_summary_figure(
         result,
@@ -461,9 +465,12 @@ def test_statistics_outputs_expand_panels_and_window_plots(tmp_path):
     assert png_path.exists()
 
     panel_titles = [title for title, _ in statistics_panel_paths(result_path.parent)]
-    assert any(title == "Locomotion by session (<= 7)" for title in panel_titles)
-    assert any(title == "Pupil state fraction by session - small" for title in panel_titles)
-    assert any(title == "Pupil state fraction by session - not_visible" for title in panel_titles)
+    assert any(title == "Locomotion by session (<= 6)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session (stacked area)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session (stacked area, <= 6)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session - small (including not visible)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session - small (excluding not visible)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session - not_visible (including not visible)" for title in panel_titles)
     assert any(title == "Overall pupil state percentages" for title in panel_titles)
     assert any("0-30 min" in title for title in panel_titles)
     assert any("30-60 min" in title for title in panel_titles)
@@ -471,6 +478,60 @@ def test_statistics_outputs_expand_panels_and_window_plots(tmp_path):
     assert any("last 2 sessions" in title for title in panel_titles)
     for _, panel_path in statistics_panel_paths(result_path.parent):
         assert panel_path.exists()
+
+
+def test_statistics_all_scope_excludes_animals_with_fewer_than_four_sessions(tmp_path):
+    times = np.arange(0.0, 35.0 * 60.0, 60.0, dtype=float)
+    radius = np.full(times.shape, 10.0, dtype=float)
+
+    bundles = []
+    for session_number in range(1, 5):
+        bundles.append(
+            _make_bundle(
+                times,
+                radius,
+                summary=_summary(
+                    animal_id="M1",
+                    exp_id=f"2026-01-0{session_number}_{session_number:02d}_M1",
+                    date=f"2026-01-0{session_number}",
+                    session_number=session_number,
+                    exp_dir=f"/tmp/M1_{session_number}",
+                    video_frame_count=int(times.size),
+                    video_duration_sec=float(times[-1] + 60.0),
+                ),
+            )
+        )
+    for session_number in range(1, 4):
+        bundles.append(
+            _make_bundle(
+                times,
+                radius,
+                summary=_summary(
+                    animal_id="M2",
+                    exp_id=f"2026-02-0{session_number}_{session_number:02d}_M2",
+                    date=f"2026-02-0{session_number}",
+                    session_number=session_number,
+                    exp_dir=f"/tmp/M2_{session_number}",
+                    video_frame_count=int(times.size),
+                    video_duration_sec=float(times[-1] + 60.0),
+                ),
+            )
+        )
+
+    store = MultiFakeStore(bundles)
+    store.source_root = tmp_path
+
+    result = compute_statistics(
+        store,
+        scope="All",
+        animal_id="All",
+        percentiles=[25.0, 50.0, 75.0],
+        threshold_values=[-0.5, 0.5, 1.0],
+        locomotion_threshold=0.1,
+    )
+
+    assert set(result.locomotion_progress_by_animal_values) == {"M1", "M2"}
+    assert int(result.progress_series["overall"]["sample_size"]) == 1
 
 
 def test_statistics_all_panel_uses_animal_weighting(tmp_path):
@@ -481,7 +542,8 @@ def test_statistics_all_panel_uses_animal_weighting(tmp_path):
 
     bundles = []
     for animal_id in ("M1", "M2"):
-        for session_number, (times, values) in enumerate(((short_t, radius), (long_t, long_radius)), start=1):
+        session_inputs = ((short_t, radius), (long_t, long_radius), (short_t, radius), (long_t, long_radius))
+        for session_number, (times, values) in enumerate(session_inputs, start=1):
             summary = _summary(
                 animal_id=animal_id,
                 exp_id=f"2026-01-0{session_number}_{session_number:02d}_{animal_id}",
@@ -512,9 +574,13 @@ def test_statistics_all_panel_uses_animal_weighting(tmp_path):
     assert set(result.pupil_zscore_progress_by_animal_values) == {"M1", "M2"}
 
     panel_specs = statistics_summary_panel_specs(result)
-    assert [slug for slug, _, _ in panel_specs[:3]] == ["locomotion_boxplot", "face_motion_boxplot", "pupil_zscore_by_state"]
+    assert "locomotion_boxplot_le6" in [slug for slug, _, _ in panel_specs]
+    assert "pupil_state_fraction_by_session_stacked_le6" in [slug for slug, _, _ in panel_specs]
     assert "with_not_visible" in result.pupil_state_fraction_overall
     assert "without_not_visible" in result.pupil_state_fraction_overall
+    visible_sum = sum(result.pupil_pct_by_session_visible["1"][label] for label in _state_labels_for_combined_plot())
+    assert np.isclose(visible_sum, 1.0)
+    assert np.isnan(result.pupil_pct_by_session_visible["1"]["not_visible"])
 
     selected_fig = _build_summary_figure(
         result,
@@ -543,10 +609,11 @@ def test_statistics_all_panel_uses_animal_weighting(tmp_path):
     assert any(title == "Locomotion progression across sessions" for title in panel_titles)
     assert any(title == "Mean z-scored pupil size progression across sessions" for title in panel_titles)
     assert any(title == "Pupil state fraction by session (stacked area)" for title in panel_titles)
-    assert any(title == "Pupil state fraction by session (stacked area, <= 7)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session (stacked area, <= 6)" for title in panel_titles)
     assert any(title == "Pupil state fraction vs experiment length (stacked area)" for title in panel_titles)
-    assert any(title == "Pupil state fraction by session - small" for title in panel_titles)
-    assert any(title == "Pupil state fraction by session - not_visible" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session - small (including not visible)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session - small (excluding not visible)" for title in panel_titles)
+    assert any(title == "Pupil state fraction by session - not_visible (including not visible)" for title in panel_titles)
     assert any("first 2 sessions" in title for title in panel_titles)
     assert any("last 2 sessions" in title for title in panel_titles)
     for _, panel_path in statistics_panel_paths(result_path.parent):

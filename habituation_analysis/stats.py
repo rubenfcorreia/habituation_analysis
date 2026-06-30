@@ -10,7 +10,13 @@ from pathlib import Path
 import numpy as np
 from matplotlib.figure import Figure
 
-from .data import HabituationStore, SessionBundle, analysis_cutoff_mask, apply_time_mask
+from .data import (
+    MIN_STATISTICS_SESSIONS_PER_ANIMAL,
+    HabituationStore,
+    SessionBundle,
+    analysis_cutoff_mask,
+    apply_time_mask,
+)
 from .plotting import save_figure, set_poster_style, style_axes
 
 
@@ -19,7 +25,7 @@ STATE_COLORS = ["tab:green", "tab:purple", "tab:red", "tab:brown", "tab:gray"]
 MIN_EXTRA_LARGE_MISSING_SEC = 1.0
 MANUAL_INTERVAL_BUFFER_SEC = 1.0
 CALIBRATION_BRIGHTNESS_MARGIN = 0.10
-STATISTICS_PLOT_VERSION = 4
+STATISTICS_PLOT_VERSION = 5
 
 
 @dataclass
@@ -39,6 +45,8 @@ class StatisticsResult:
     pupil_zscore_mean_by_state_values: dict[str, list[float]]
     pupil_pct_by_session: dict[str, dict[str, float]]
     pupil_pct_by_session_values: dict[str, dict[str, list[float]]]
+    pupil_pct_by_session_visible: dict[str, dict[str, float]]
+    pupil_pct_by_session_visible_values: dict[str, dict[str, list[float]]]
     lag_by_session: dict[str, dict[str, float]]
     lag_by_session_values: dict[str, dict[str, list[float]]]
     locomotion_progress_by_animal_values: dict[str, list[float]]
@@ -72,6 +80,8 @@ class StatisticsResult:
             "pupil_zscore_mean_by_state_values": self.pupil_zscore_mean_by_state_values,
             "pupil_pct_by_session": self.pupil_pct_by_session,
             "pupil_pct_by_session_values": self.pupil_pct_by_session_values,
+            "pupil_pct_by_session_visible": self.pupil_pct_by_session_visible,
+            "pupil_pct_by_session_visible_values": self.pupil_pct_by_session_visible_values,
             "lag_by_session": self.lag_by_session,
             "lag_by_session_values": self.lag_by_session_values,
             "locomotion_progress_by_animal_values": self.locomotion_progress_by_animal_values,
@@ -117,6 +127,23 @@ class StatisticsResult:
             padded[:rows, :arr.shape[1]] = arr[:rows, :]
             return padded
 
+        pupil_pct_by_session = {
+            str(session): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
+            for session, label_dict in dict(data.get("pupil_pct_by_session", data.get("pupil_pct_by_day", {}))).items()
+        }
+        pupil_pct_by_session_values = {
+            str(session): _series_map(dict(label_dict))
+            for session, label_dict in dict(data.get("pupil_pct_by_session_values", data.get("pupil_pct_by_day_values", {}))).items()
+        }
+        pupil_pct_by_session_visible = {
+            str(session): _normalize_visible_state_map(dict(label_dict))
+            for session, label_dict in dict(data.get("pupil_pct_by_session_visible", pupil_pct_by_session)).items()
+        }
+        pupil_pct_by_session_visible_values = {
+            str(session): _normalize_visible_state_value_lists(dict(label_dict))
+            for session, label_dict in dict(data.get("pupil_pct_by_session_visible_values", pupil_pct_by_session_values)).items()
+        }
+
         return cls(
             scope=str(data.get("scope", "")),
             animal_id=str(data.get("animal_id", "")),
@@ -137,17 +164,10 @@ class StatisticsResult:
             face_motion_mean_by_state=_state_map(dict(data.get("face_motion_mean_by_state", {}))),
             face_motion_std_by_state=_state_map(dict(data.get("face_motion_std_by_state", {}))),
             pupil_zscore_mean_by_state_values=_series_map(dict(data.get("pupil_zscore_mean_by_state_values", {}))),
-            pupil_pct_by_session={
-                str(session): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
-                for session, label_dict in dict(data.get("pupil_pct_by_session", data.get("pupil_pct_by_day", {}))).items()
-            },
-            pupil_pct_by_session_values={
-                str(session): {
-                    str(label): [float(v) for v in list(vals)]
-                    for label, vals in dict(label_dict).items()
-                }
-                for session, label_dict in dict(data.get("pupil_pct_by_session_values", data.get("pupil_pct_by_day_values", {}))).items()
-            },
+            pupil_pct_by_session=pupil_pct_by_session,
+            pupil_pct_by_session_values=pupil_pct_by_session_values,
+            pupil_pct_by_session_visible=pupil_pct_by_session_visible,
+            pupil_pct_by_session_visible_values=pupil_pct_by_session_visible_values,
             lag_by_session={
                 str(exp_id): {str(label): float(val) for label, val in _state_map(dict(label_dict)).items()}
                 for exp_id, label_dict in dict(data.get("lag_by_session", {})).items()
@@ -540,11 +560,22 @@ def _scope_sessions(store: HabituationStore, scope: str, animal_id: str):
 
 def _analysis_sessions(store: HabituationStore, scope: str, animal_id: str) -> list:
     sessions = _scope_sessions(store, scope, animal_id)
-    return [
+    analysis_sessions = [
         s
         for s in sessions
         if s.has_right_pickle and not store.is_deeplabcut_reference_session(s.exp_id) and not store.is_session_do_not_use(s.exp_id)
     ]
+    counts_by_animal: dict[str, int] = {}
+    for summary in analysis_sessions:
+        counts_by_animal[summary.animal_id] = counts_by_animal.get(summary.animal_id, 0) + 1
+    allowed_animals = {
+        animal_key
+        for animal_key, count in counts_by_animal.items()
+        if count >= MIN_STATISTICS_SESSIONS_PER_ANIMAL
+    }
+    if scope == "All" or animal_id == "All":
+        return [summary for summary in analysis_sessions if summary.animal_id in allowed_animals]
+    return analysis_sessions
 
 
 def compute_animal_baseline(store: HabituationStore, animal_id: str, *, scope: str | None = None) -> tuple[float, float]:
@@ -728,6 +759,9 @@ def compute_statistics(
     pupil_values_by_session: dict[str, dict[str, list[float]]] = {
         label: {state_label: [] for state_label in STATE_LABELS} for label in session_labels
     }
+    pupil_visible_values_by_session: dict[str, dict[str, list[float]]] = {
+        label: {state_label: [] for state_label in STATE_LABELS} for label in session_labels
+    }
     lag_values_by_session: dict[str, dict[str, list[float]]] = {
         label: {state_label: [] for state_label in STATE_LABELS} for label in session_labels
     }
@@ -831,9 +865,18 @@ def compute_statistics(
                 pupil_zscore_mean_by_state_values[state_label].append(float(np.nanmean(z[mask])))
         finite_visible = state >= 0
         denom = float(np.sum(finite_visible)) if np.sum(finite_visible) else 1.0
+        visible_only_mask = finite_visible & (state != STATE_LABELS.index("not_visible"))
+        visible_denom = float(np.sum(visible_only_mask))
         for state_id, state_label in enumerate(STATE_LABELS):
             pct = float(np.sum(state == state_id) / denom)
             pupil_values_by_session.setdefault(session_label, {label: [] for label in STATE_LABELS})[state_label].append(pct)
+            if state_label == "not_visible":
+                visible_pct = float("nan")
+            elif visible_denom > 0.0:
+                visible_pct = float(np.sum(state == state_id) / visible_denom)
+            else:
+                visible_pct = float("nan")
+            pupil_visible_values_by_session.setdefault(session_label, {label: [] for label in STATE_LABELS})[state_label].append(visible_pct)
 
         first_minute = bundle.t >= 60.0
         for state_id, state_label in enumerate(STATE_LABELS):
@@ -851,7 +894,11 @@ def compute_statistics(
         label: {state_label: _nanmean_or_nan(values[state_label]) for state_label in STATE_LABELS}
         for label, values in pupil_values_by_session.items()
     }
-    pupil_state_fraction_overall = _build_overall_pupil_state_fractions(pupil_pct_by_session)
+    pupil_pct_by_session_visible = {
+        label: {state_label: _nanmean_or_nan(values[state_label]) for state_label in STATE_LABELS}
+        for label, values in pupil_visible_values_by_session.items()
+    }
+    pupil_state_fraction_overall = _build_overall_pupil_state_fractions(pupil_pct_by_session, pupil_pct_by_session_visible)
     lag_by_session = {
         label: {state_label: _nanmean_or_nan(values[state_label]) for state_label in STATE_LABELS}
         for label, values in lag_values_by_session.items()
@@ -1016,6 +1063,8 @@ def compute_statistics(
         pupil_zscore_mean_by_state_values=pupil_zscore_mean_by_state_values,
         pupil_pct_by_session=pupil_pct_by_session,
         pupil_pct_by_session_values=pupil_values_by_session,
+        pupil_pct_by_session_visible=pupil_pct_by_session_visible,
+        pupil_pct_by_session_visible_values=pupil_visible_values_by_session,
         lag_by_session=lag_by_session,
         lag_by_session_values=lag_values_by_session,
         locomotion_progress_by_animal_values=locomotion_progress_by_animal_values,
@@ -1039,7 +1088,7 @@ def compute_statistics(
 
 
 
-SESSION_INDEX_LIMIT = 7
+SESSION_INDEX_LIMIT = 6
 
 
 def _finite_series(values) -> np.ndarray:
@@ -1123,17 +1172,68 @@ def _state_labels_for_combined_plot() -> list[str]:
     return [label for label in STATE_LABELS if label != "not_visible"]
 
 
-def _build_overall_pupil_state_fractions(pupil_pct_by_session: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+def _normalize_visible_state_map(values: dict[str, float]) -> dict[str, float]:
+    visible_labels = _state_labels_for_combined_plot()
+    total = float(sum(float(values.get(label, 0.0)) for label in visible_labels if np.isfinite(values.get(label, np.nan))))
+    out: dict[str, float] = {}
+    for label in STATE_LABELS:
+        value = float(values.get(label, float("nan")))
+        if label == "not_visible":
+            out[label] = float("nan")
+        elif total > 0.0 and np.isfinite(value):
+            out[label] = float(value / total)
+        else:
+            out[label] = float("nan")
+    return out
+
+
+def _normalize_visible_state_value_lists(values: dict[str, list[float]]) -> dict[str, list[float]]:
+    visible_labels = _state_labels_for_combined_plot()
+    max_len = max((len(list(values.get(label, []))) for label in STATE_LABELS), default=0)
+    out = {label: [] for label in STATE_LABELS}
+    for idx in range(max_len):
+        total = 0.0
+        per_label: dict[str, float] = {}
+        for label in visible_labels:
+            items = list(values.get(label, []))
+            value = float(items[idx]) if idx < len(items) else float("nan")
+            per_label[label] = value
+            if np.isfinite(value):
+                total += value
+        for label in visible_labels:
+            value = per_label.get(label, float("nan"))
+            out[label].append(float(value / total) if total > 0.0 and np.isfinite(value) else float("nan"))
+        out["not_visible"].append(float("nan"))
+    return out
+
+
+def _pupil_fraction_values(result: StatisticsResult, *, include_not_visible: bool) -> dict[str, dict[str, list[float]]]:
+    if include_not_visible:
+        return result.pupil_pct_by_session_values
+    if result.pupil_pct_by_session_visible_values:
+        return result.pupil_pct_by_session_visible_values
+    return {
+        session: _normalize_visible_state_value_lists(values)
+        for session, values in result.pupil_pct_by_session_values.items()
+    }
+
+
+def _build_overall_pupil_state_fractions(
+    pupil_pct_by_session: dict[str, dict[str, float]],
+    pupil_pct_by_session_visible: dict[str, dict[str, float]] | None = None,
+) -> dict[str, dict[str, float]]:
     session_means = {
         label: _nanmean_or_nan([values.get(label, float("nan")) for values in pupil_pct_by_session.values()])
         for label in STATE_LABELS
     }
-    visible_labels = _state_labels_for_combined_plot()
-    visible_total = float(sum(session_means[label] for label in visible_labels if np.isfinite(session_means[label])))
-    visible_only = {}
-    for label in visible_labels:
-        value = session_means[label]
-        visible_only[label] = float(value / visible_total) if visible_total > 0.0 and np.isfinite(value) else float("nan")
+    visible_source = pupil_pct_by_session_visible or {
+        session: _normalize_visible_state_map(values)
+        for session, values in pupil_pct_by_session.items()
+    }
+    visible_only = {
+        label: _nanmean_or_nan([values.get(label, float("nan")) for values in visible_source.values()])
+        for label in _state_labels_for_combined_plot()
+    }
     return {
         "with_not_visible": session_means,
         "without_not_visible": visible_only,
@@ -1211,14 +1311,16 @@ def _plot_state_fraction_by_session(
     *,
     title: str,
     labels: list[str],
+    include_not_visible: bool = True,
 ) -> None:
+    values_by_session = _pupil_fraction_values(result, include_not_visible=include_not_visible)
     x = np.arange(len(sessions), dtype=float)
     reference_label = labels[0] if labels else STATE_LABELS[0]
-    sample_sizes = _session_sample_sizes(result.pupil_pct_by_session_values, sessions, state_label=reference_label)
+    sample_sizes = _session_sample_sizes(values_by_session, sessions, state_label=reference_label)
     tick_labels = _session_labels_with_counts(sessions, sample_sizes)
-    for i, label in enumerate(labels):
+    for label in labels:
         session_values = [
-            _finite_series(result.pupil_pct_by_session_values.get(session, {}).get(label, []))
+            _finite_series(values_by_session.get(session, {}).get(label, []))
             for session in sessions
         ]
         means = np.array([float(np.nanmean(vals)) if vals.size else np.nan for vals in session_values], dtype=float)
@@ -1241,15 +1343,17 @@ def _plot_state_fraction_stacked_by_session(
     *,
     title: str,
     labels: list[str],
+    include_not_visible: bool = False,
 ) -> None:
+    values_by_session = _pupil_fraction_values(result, include_not_visible=include_not_visible)
     x = np.arange(len(sessions), dtype=float)
     reference_label = labels[0] if labels else STATE_LABELS[0]
-    sample_sizes = _session_sample_sizes(result.pupil_pct_by_session_values, sessions, state_label=reference_label)
+    sample_sizes = _session_sample_sizes(values_by_session, sessions, state_label=reference_label)
     tick_labels = _session_labels_with_counts(sessions, sample_sizes)
     stacked = []
     for label in labels:
         session_values = [
-            _finite_series(result.pupil_pct_by_session_values.get(session, {}).get(label, []))
+            _finite_series(values_by_session.get(session, {}).get(label, []))
             for session in sessions
         ]
         stacked.append(np.array([float(np.nanmean(vals)) if vals.size else np.nan for vals in session_values], dtype=float))
@@ -1268,8 +1372,9 @@ def _plot_single_state_fraction_by_session(
     *,
     title: str,
     state_label: str,
+    include_not_visible: bool = True,
 ) -> None:
-    _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=[state_label])
+    _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=[state_label], include_not_visible=include_not_visible)
 
 
 def _plot_lag_by_session(ax, result: StatisticsResult, sessions: list[str], *, title: str) -> None:
@@ -1618,11 +1723,32 @@ def _plot_progress_series(ax, series: dict, *, title: str, xlabel: str) -> None:
 def _plot_progress_stacked_area(ax, series: dict, *, title: str, xlabel: str) -> None:
     bins = np.asarray(series.get("bins", []), dtype=float)
     state_probability = np.asarray(series.get("state_probability", []), dtype=float)
-    plot_values = [state_probability[i] if i < state_probability.shape[0] else np.asarray([]) for i in range(len(STATE_LABELS))]
-    ax.stackplot(bins, *plot_values, colors=STATE_COLORS[: len(plot_values)], labels=STATE_LABELS, alpha=0.85)
+    visible_labels = _state_labels_for_combined_plot()
+    plot_values = []
+    for label in visible_labels:
+        idx = STATE_LABELS.index(label)
+        values = state_probability[idx] if idx < state_probability.shape[0] else np.asarray([])
+        plot_values.append(values)
+    if plot_values:
+        stacked = np.vstack(plot_values)
+        totals = np.nansum(stacked, axis=0)
+        normalized = [np.divide(values, totals, out=np.full_like(values, np.nan, dtype=float), where=totals > 0) for values in plot_values]
+        ax.stackplot(bins, *normalized, colors=[STATE_COLORS[STATE_LABELS.index(label)] for label in visible_labels], labels=visible_labels, alpha=0.85)
     style_axes(ax, title=title, xlabel=xlabel, ylabel="Fraction")
     ax.set_ylim(0.0, 1.0)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    counts = np.asarray(series.get("state_probability_count", []), dtype=float)
+    if counts.size:
+        ax.text(
+            0.99,
+            0.02,
+            f"bin n: {int(counts[0])} -> {int(counts[-1])}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=10,
+            color="0.25",
+        )
 
 
 def _plot_animal_progress_lines(ax, values_by_animal: dict[str, list[float]], *, title: str, ylabel: str, average_label: str) -> None:
@@ -1656,7 +1782,7 @@ def _progress_window_specs(result: StatisticsResult) -> list[tuple[str, str, dic
         start_min = int(float(series.get("window_start_sec", 0.0)) // 60)
         end_min = int(float(series.get("window_end_sec", 0.0)) // 60)
         title = f"Pupil state fraction vs experiment length - {start_min}-{end_min} min"
-        specs.append((f"progress_{key}", title, {"kind": "progress", "series_key": key}))
+        specs.append((f"progress_{key}", title, {"kind": "progress_stacked", "series_key": key}))
     return specs
 
 
@@ -1665,37 +1791,51 @@ def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, di
 
     session_specs = [
         ("locomotion_boxplot", "Locomotion by session", {"kind": "session_boxplot", "metric": "locomotion", "subset": None}),
-        ("locomotion_boxplot_le7", "Locomotion by session (<= 7)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le7"}),
+        ("locomotion_boxplot_le6", "Locomotion by session (<= 6)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le6"}),
         ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion", "subset": None}),
-        ("face_motion_boxplot_le7", "Face motion by session (<= 7)", {"kind": "session_boxplot", "metric": "face_motion", "subset": "le7"}),
-        ("pupil_state_fraction_by_session", "Pupil state fraction by session", {"kind": "state_fraction", "subset": None, "labels": _state_labels_for_combined_plot()}),
-        ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked", "subset": None, "labels": _state_labels_for_combined_plot()}),
+        ("face_motion_boxplot_le6", "Face motion by session (<= 6)", {"kind": "session_boxplot", "metric": "face_motion", "subset": "le6"}),
+        ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked", "subset": None, "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
+        ("pupil_state_fraction_by_session_stacked_le6", "Pupil state fraction by session (stacked area, <= 6)", {"kind": "state_fraction_stacked", "subset": "le6", "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
         ("pupil_state_fraction_pie", "Overall pupil state percentages", {"kind": "state_fraction_pie"}),
-        ("pupil_state_fraction_by_session_le7", "Pupil state fraction by session (<= 7)", {"kind": "state_fraction", "subset": "le7", "labels": _state_labels_for_combined_plot()}),
-        ("pupil_state_fraction_by_session_stacked_le7", "Pupil state fraction by session (stacked area, <= 7)", {"kind": "state_fraction_stacked", "subset": "le7", "labels": _state_labels_for_combined_plot()}),
     ]
     for label in STATE_LABELS:
-        slug = f"pupil_state_fraction_by_session_{label}"
-        title = f"Pupil state fraction by session - {label}"
-        session_specs.append((slug, title, {"kind": "single_state", "state_label": label, "subset": None}))
-        session_specs.append((f"{slug}_le7", f"Pupil state fraction by session - {label} (<= 7)", {"kind": "single_state", "state_label": label, "subset": "le7"}))
+        session_specs.append((
+            f"pupil_state_fraction_by_session_{label}_with_not_visible",
+            f"Pupil state fraction by session - {label} (including not visible)",
+            {"kind": "single_state", "state_label": label, "subset": None, "include_not_visible": True},
+        ))
+        session_specs.append((
+            f"pupil_state_fraction_by_session_{label}_with_not_visible_le6",
+            f"Pupil state fraction by session - {label} (including not visible, <= 6)",
+            {"kind": "single_state", "state_label": label, "subset": "le6", "include_not_visible": True},
+        ))
+        if label != "not_visible":
+            session_specs.append((
+                f"pupil_state_fraction_by_session_{label}_without_not_visible",
+                f"Pupil state fraction by session - {label} (excluding not visible)",
+                {"kind": "single_state", "state_label": label, "subset": None, "include_not_visible": False},
+            ))
+            session_specs.append((
+                f"pupil_state_fraction_by_session_{label}_without_not_visible_le6",
+                f"Pupil state fraction by session - {label} (excluding not visible, <= 6)",
+                {"kind": "single_state", "state_label": label, "subset": "le6", "include_not_visible": False},
+            ))
     session_specs.extend(
         [
             ("lag_by_state", "Lag to first pupil state after 1 min by session", {"kind": "lag", "subset": None}),
-            ("lag_by_state_le7", "Lag to first pupil state after 1 min by session (<= 7)", {"kind": "lag", "subset": "le7"}),
+            ("lag_by_state_le6", "Lag to first pupil state after 1 min by session (<= 6)", {"kind": "lag", "subset": "le6"}),
         ]
     )
     specs.extend(session_specs)
 
     specs.append(("locomotion_progress", "Locomotion progression across sessions", {"kind": "animal_progress", "metric": "locomotion"}))
     specs.append(("pupil_size_progress", "Mean z-scored pupil size progression across sessions", {"kind": "animal_progress", "metric": "pupil_zscore"}))
-    specs.append(("state_fraction", "Pupil state fraction vs experiment length", {"kind": "progress", "series_key": "overall"}))
     specs.append(("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall"}))
     specs.extend(_progress_window_specs(result))
     if "first_2" in result.progress_series:
-        specs.append(("state_fraction_first_2_sessions", "Pupil state fraction vs experiment length - first 2 sessions", {"kind": "progress", "series_key": "first_2"}))
+        specs.append(("state_fraction_first_2_sessions_stacked", "Pupil state fraction vs experiment length - first 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "first_2"}))
     if "last_2" in result.progress_series:
-        specs.append(("state_fraction_last_2_sessions", "Pupil state fraction vs experiment length - last 2 sessions", {"kind": "progress", "series_key": "last_2"}))
+        specs.append(("state_fraction_last_2_sessions_stacked", "Pupil state fraction vs experiment length - last 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "last_2"}))
     return specs
 
 
@@ -1726,10 +1866,16 @@ def _statistics_panel_export_complete(output_dir: Path, result: StatisticsResult
     return True
 
 
+def _session_subset_for_config(result: StatisticsResult, subset: str | None) -> list[str]:
+    if subset and subset.startswith("le") and subset[2:].isdigit():
+        return _session_subset(result.session_labels, limit=int(subset[2:]))
+    return list(result.session_labels)
+
+
 def _build_panel_figure(result: StatisticsResult, config: dict, title: str) -> Figure:
     kind = config["kind"]
     if kind == "session_boxplot":
-        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        sessions = _session_subset_for_config(result, config.get("subset"))
         fig = Figure(figsize=(10, 6), constrained_layout=True)
         ax = fig.subplots()
         metric = config["metric"]
@@ -1739,31 +1885,52 @@ def _build_panel_figure(result: StatisticsResult, config: dict, title: str) -> F
             _plot_session_metric_boxplot(ax, result, sessions, result.face_motion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:orange")
         return fig
     if kind == "state_fraction":
-        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        sessions = _session_subset_for_config(result, config.get("subset"))
         fig = Figure(figsize=(10, 6), constrained_layout=True)
         ax = fig.subplots()
-        _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=config.get("labels", _state_labels_for_combined_plot()))
+        _plot_state_fraction_by_session(
+            ax,
+            result,
+            sessions,
+            title=title,
+            labels=config.get("labels", _state_labels_for_combined_plot()),
+            include_not_visible=bool(config.get("include_not_visible", True)),
+        )
         return fig
     if kind == "state_fraction_stacked":
-        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        sessions = _session_subset_for_config(result, config.get("subset"))
         fig = Figure(figsize=(10, 6), constrained_layout=True)
         ax = fig.subplots()
-        _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=config.get("labels", _state_labels_for_combined_plot()))
+        _plot_state_fraction_stacked_by_session(
+            ax,
+            result,
+            sessions,
+            title=title,
+            labels=config.get("labels", _state_labels_for_combined_plot()),
+            include_not_visible=bool(config.get("include_not_visible", False)),
+        )
         return fig
     if kind == "state_fraction_pie":
-        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session)
+        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session, result.pupil_pct_by_session_visible)
         fig = Figure(figsize=(13, 6), constrained_layout=True)
         ax = fig.subplots()
         _plot_state_fraction_pies(ax, title=title, fractions=fractions, sample_size=len(result.pupil_pct_by_session), sample_size_unit="sessions")
         return fig
     if kind == "single_state":
-        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        sessions = _session_subset_for_config(result, config.get("subset"))
         fig = Figure(figsize=(10, 6), constrained_layout=True)
         ax = fig.subplots()
-        _plot_single_state_fraction_by_session(ax, result, sessions, title=title, state_label=config["state_label"])
+        _plot_single_state_fraction_by_session(
+            ax,
+            result,
+            sessions,
+            title=title,
+            state_label=config["state_label"],
+            include_not_visible=bool(config.get("include_not_visible", True)),
+        )
         return fig
     if kind == "lag":
-        sessions = _session_subset(result.session_labels, limit=SESSION_INDEX_LIMIT) if config.get("subset") == "le7" else list(result.session_labels)
+        sessions = _session_subset_for_config(result, config.get("subset"))
         fig = Figure(figsize=(10, 6), constrained_layout=True)
         ax = fig.subplots()
         _plot_lag_by_session(ax, result, sessions, title=title)
@@ -1800,16 +1967,17 @@ def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
 
 
 def _summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
-    series = result.progress_series.get("overall", {})
     return [
         ("locomotion_boxplot", "Locomotion by session", {"kind": "session_boxplot", "metric": "locomotion"}),
+        ("locomotion_boxplot_le6", "Locomotion by session (<= 6)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le6"}),
         ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion"}),
+        ("face_motion_boxplot_le6", "Face motion by session (<= 6)", {"kind": "session_boxplot", "metric": "face_motion", "subset": "le6"}),
         ("pupil_zscore_by_state", "Mean z-scored pupil size by state", {"kind": "state_zscore_boxplot"}),
-        ("pupil_state_fraction_by_session", "Pupil state fraction by session", {"kind": "state_fraction"}),
-        ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked"}),
+        ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked", "include_not_visible": False}),
+        ("pupil_state_fraction_by_session_stacked_le6", "Pupil state fraction by session (stacked area, <= 6)", {"kind": "state_fraction_stacked", "subset": "le6", "include_not_visible": False}),
         ("pupil_state_fraction_pie", "Overall pupil state percentages", {"kind": "state_fraction_pie"}),
         ("lag_by_state", "Lag to first pupil state after 1 min by session", {"kind": "lag"}),
-        ("state_fraction", "Pupil state fraction vs experiment length", {"kind": "progress", "series_key": "overall"}),
+        ("lag_by_state_le6", "Lag to first pupil state after 1 min by session (<= 6)", {"kind": "lag", "subset": "le6"}),
         ("locomotion_progress", "Locomotion progression across sessions", {"kind": "animal_progress", "metric": "locomotion"}),
         ("pupil_size_progress", "Mean z-scored pupil size progression across sessions", {"kind": "animal_progress", "metric": "pupil_zscore"}),
         ("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall"}),
@@ -1833,7 +2001,7 @@ def _selected_summary_panel_specs(result: StatisticsResult, panel_keys: list[str
 
 
 def _draw_summary_panel(ax, result: StatisticsResult, config: dict, title: str) -> None:
-    sessions = list(result.session_labels)
+    sessions = _session_subset_for_config(result, config.get("subset"))
     kind = config["kind"]
     if kind == "session_boxplot":
         metric = config.get("metric", "locomotion")
@@ -1847,13 +2015,13 @@ def _draw_summary_panel(ax, result: StatisticsResult, config: dict, title: str) 
         _boxplot(ax, state_data, states, colors=STATE_COLORS, title=title, xlabel="Pupil state", ylabel="Mean z-score")
         return
     if kind == "state_fraction":
-        _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot())
+        _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot(), include_not_visible=bool(config.get("include_not_visible", True)))
         return
     if kind == "state_fraction_stacked":
-        _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot())
+        _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot(), include_not_visible=bool(config.get("include_not_visible", False)))
         return
     if kind == "state_fraction_pie":
-        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session)
+        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session, result.pupil_pct_by_session_visible)
         _plot_state_fraction_pies(ax, title=title, fractions=fractions, sample_size=len(result.pupil_pct_by_session), sample_size_unit="sessions")
         return
     if kind == "lag":

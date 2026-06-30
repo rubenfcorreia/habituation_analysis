@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from .data import HabituationStore, SessionSummary, analysis_cutoff_mask, apply_time_mask
+from .data import MIN_STATISTICS_SESSIONS_PER_ANIMAL, HabituationStore, SessionSummary, analysis_cutoff_mask, apply_time_mask
 from .plotting import style_axes
 from .stats import (
     STATE_LABELS,
@@ -1273,14 +1273,11 @@ class MetricsTab(QWidget):
             return
         state = self.store.load_session_state(self.exp_id)
         do_not_use = bool(state.get("do_not_use", False))
-        forced_do_not_use = self.store.is_session_forced_do_not_use(self.exp_id)
         self.do_not_use_check.blockSignals(True)
-        self.do_not_use_check.setChecked(do_not_use or forced_do_not_use)
+        self.do_not_use_check.setChecked(do_not_use)
         self.do_not_use_check.blockSignals(False)
-        self.do_not_use_check.setEnabled(not forced_do_not_use)
-        if forced_do_not_use:
-            tip = "Sessions under 30 minutes and TEST sessions are always excluded from statistics."
-        elif do_not_use:
+        self.do_not_use_check.setEnabled(True)
+        if do_not_use:
             tip = "This expID is excluded from statistics."
         else:
             tip = "Mark this expID as excluded from statistics."
@@ -2763,10 +2760,12 @@ class StatisticsTab(QWidget):
     def _analysis_animals(self) -> list[str]:
         animals = []
         for animal in self.store.animals():
-            if any(
-                s.has_right_pickle and not self.store.is_deeplabcut_reference_session(s.exp_id) and not self.store.is_session_do_not_use(s.exp_id)
+            usable_sessions = [
+                s
                 for s in self.store.sessions_for_animal(animal)
-            ):
+                if s.has_right_pickle and not self.store.is_deeplabcut_reference_session(s.exp_id) and not self.store.is_session_do_not_use(s.exp_id)
+            ]
+            if len(usable_sessions) >= MIN_STATISTICS_SESSIONS_PER_ANIMAL:
                 animals.append(animal)
         return animals
     def _threshold_inputs_for_animal(self, animal_id: str):
