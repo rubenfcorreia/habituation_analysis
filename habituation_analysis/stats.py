@@ -882,7 +882,7 @@ def compute_statistics(
         for state_id, state_label in enumerate(STATE_LABELS):
             idxs = np.where(first_minute & (state == state_id))[0]
             if idxs.size:
-                lag_values_by_session.setdefault(session_label, {label: [] for label in STATE_LABELS})[state_label].append(float(bundle.t[idxs[0]] - 60.0))
+                lag_values_by_session.setdefault(session_label, {label: [] for label in STATE_LABELS})[state_label].append(float((bundle.t[idxs[0]] - 60.0) / 60.0))
             else:
                 lag_values_by_session.setdefault(session_label, {label: [] for label in STATE_LABELS})[state_label].append(float("nan"))
 
@@ -1379,12 +1379,23 @@ def _plot_single_state_fraction_by_session(
 
 def _plot_lag_by_session(ax, result: StatisticsResult, sessions: list[str], *, title: str) -> None:
     x = np.arange(len(sessions), dtype=float)
-    sample_sizes = _session_sample_sizes(result.lag_by_session_values, sessions)
+    sample_sizes = [
+        max((len(list(values)) for values in result.lag_by_session_values.get(session, {}).values()), default=0)
+        for session in sessions
+    ]
     tick_labels = _session_labels_with_counts(sessions, sample_sizes)
     for i, label in enumerate(STATE_LABELS):
-        lag_vals = [result.lag_by_session.get(session, {}).get(label, np.nan) for session in sessions]
-        ax.plot(x, lag_vals, marker="o", color=STATE_COLORS[i], label=label)
-    style_axes(ax, title=title, xlabel="Session", ylabel="Lag (s)")
+        session_values = [
+            _finite_series(result.lag_by_session_values.get(session, {}).get(label, []))
+            for session in sessions
+        ]
+        means = np.array([float(np.nanmean(vals)) if vals.size else np.nan for vals in session_values], dtype=float)
+        sds = np.array([float(np.nanstd(vals)) if vals.size else np.nan for vals in session_values], dtype=float)
+        lower = means - sds
+        upper = means + sds
+        ax.fill_between(x, lower, upper, color=STATE_COLORS[i], alpha=0.18)
+        ax.plot(x, means, marker="o", color=STATE_COLORS[i], label=label)
+    style_axes(ax, title=title, xlabel="Session", ylabel="Lag (min)")
     ax.set_xticks(x)
     ax.set_xticklabels(tick_labels, rotation=90, fontsize=8)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
@@ -1720,20 +1731,23 @@ def _plot_progress_series(ax, series: dict, *, title: str, xlabel: str) -> None:
         )
 
 
-def _plot_progress_stacked_area(ax, series: dict, *, title: str, xlabel: str) -> None:
+def _plot_progress_stacked_area(ax, series: dict, *, title: str, xlabel: str, include_not_visible: bool = False) -> None:
     bins = np.asarray(series.get("bins", []), dtype=float)
     state_probability = np.asarray(series.get("state_probability", []), dtype=float)
-    visible_labels = _state_labels_for_combined_plot()
+    labels = list(STATE_LABELS) if include_not_visible else _state_labels_for_combined_plot()
     plot_values = []
-    for label in visible_labels:
+    for label in labels:
         idx = STATE_LABELS.index(label)
         values = state_probability[idx] if idx < state_probability.shape[0] else np.asarray([])
         plot_values.append(values)
     if plot_values:
-        stacked = np.vstack(plot_values)
-        totals = np.nansum(stacked, axis=0)
-        normalized = [np.divide(values, totals, out=np.full_like(values, np.nan, dtype=float), where=totals > 0) for values in plot_values]
-        ax.stackplot(bins, *normalized, colors=[STATE_COLORS[STATE_LABELS.index(label)] for label in visible_labels], labels=visible_labels, alpha=0.85)
+        if include_not_visible:
+            stacked_values = plot_values
+        else:
+            stacked = np.vstack(plot_values)
+            totals = np.nansum(stacked, axis=0)
+            stacked_values = [np.divide(values, totals, out=np.full_like(values, np.nan, dtype=float), where=totals > 0) for values in plot_values]
+        ax.stackplot(bins, *stacked_values, colors=[STATE_COLORS[STATE_LABELS.index(label)] for label in labels], labels=labels, alpha=0.85)
     style_axes(ax, title=title, xlabel=xlabel, ylabel="Fraction")
     ax.set_ylim(0.0, 1.0)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
@@ -1782,7 +1796,8 @@ def _progress_window_specs(result: StatisticsResult) -> list[tuple[str, str, dic
         start_min = int(float(series.get("window_start_sec", 0.0)) // 60)
         end_min = int(float(series.get("window_end_sec", 0.0)) // 60)
         title = f"Pupil state fraction vs experiment length - {start_min}-{end_min} min"
-        specs.append((f"progress_{key}", title, {"kind": "progress_stacked", "series_key": key}))
+        specs.append((f"progress_{key}", title, {"kind": "progress_stacked", "series_key": key, "include_not_visible": False}))
+        specs.append((f"progress_{key}_with_not_visible", f"{title} (including not visible)", {"kind": "progress_stacked", "series_key": key, "include_not_visible": True}))
     return specs
 
 
@@ -1830,12 +1845,15 @@ def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, di
 
     specs.append(("locomotion_progress", "Locomotion progression across sessions", {"kind": "animal_progress", "metric": "locomotion"}))
     specs.append(("pupil_size_progress", "Mean z-scored pupil size progression across sessions", {"kind": "animal_progress", "metric": "pupil_zscore"}))
-    specs.append(("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall"}))
+    specs.append(("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall", "include_not_visible": False}))
+    specs.append(("state_fraction_stacked_with_not_visible", "Pupil state fraction vs experiment length (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "overall", "include_not_visible": True}))
     specs.extend(_progress_window_specs(result))
     if "first_2" in result.progress_series:
-        specs.append(("state_fraction_first_2_sessions_stacked", "Pupil state fraction vs experiment length - first 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "first_2"}))
+        specs.append(("state_fraction_first_2_sessions_stacked", "Pupil state fraction vs experiment length - first 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": False}))
+        specs.append(("state_fraction_first_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - first 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": True}))
     if "last_2" in result.progress_series:
-        specs.append(("state_fraction_last_2_sessions_stacked", "Pupil state fraction vs experiment length - last 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "last_2"}))
+        specs.append(("state_fraction_last_2_sessions_stacked", "Pupil state fraction vs experiment length - last 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": False}))
+        specs.append(("state_fraction_last_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - last 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": True}))
     return specs
 
 
@@ -1957,7 +1975,7 @@ def _build_panel_figure(result: StatisticsResult, config: dict, title: str) -> F
         series = result.progress_series.get(config["series_key"], {})
         title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
         xlabel = "Progress (%)" if series.get("kind") != "absolute_window" else "Minutes into 30-minute window"
-        _plot_progress_stacked_area(ax, series, title=title, xlabel=xlabel)
+        _plot_progress_stacked_area(ax, series, title=title, xlabel=xlabel, include_not_visible=bool(config.get("include_not_visible", False)))
         return fig
     raise ValueError(f"Unknown panel kind: {kind}")
 
@@ -1967,7 +1985,7 @@ def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
 
 
 def _summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
-    return [
+    specs: list[tuple[str, str, dict]] = [
         ("locomotion_boxplot", "Locomotion by session", {"kind": "session_boxplot", "metric": "locomotion"}),
         ("locomotion_boxplot_le6", "Locomotion by session (<= 6)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le6"}),
         ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion"}),
@@ -1980,8 +1998,17 @@ def _summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]
         ("lag_by_state_le6", "Lag to first pupil state after 1 min by session (<= 6)", {"kind": "lag", "subset": "le6"}),
         ("locomotion_progress", "Locomotion progression across sessions", {"kind": "animal_progress", "metric": "locomotion"}),
         ("pupil_size_progress", "Mean z-scored pupil size progression across sessions", {"kind": "animal_progress", "metric": "pupil_zscore"}),
-        ("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall"}),
+        ("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall", "include_not_visible": False}),
+        ("state_fraction_stacked_with_not_visible", "Pupil state fraction vs experiment length (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "overall", "include_not_visible": True}),
     ]
+    specs.extend(_progress_window_specs(result))
+    if "first_2" in result.progress_series:
+        specs.append(("state_fraction_first_2_sessions_stacked", "Pupil state fraction vs experiment length - first 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": False}))
+        specs.append(("state_fraction_first_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - first 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": True}))
+    if "last_2" in result.progress_series:
+        specs.append(("state_fraction_last_2_sessions_stacked", "Pupil state fraction vs experiment length - last 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": False}))
+        specs.append(("state_fraction_last_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - last 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": True}))
+    return specs
 
 
 def statistics_summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
@@ -2041,7 +2068,7 @@ def _draw_summary_panel(ax, result: StatisticsResult, config: dict, title: str) 
     if kind == "progress_stacked":
         series = result.progress_series.get(config["series_key"], {})
         title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
-        _plot_progress_stacked_area(ax, series, title=title, xlabel="Progress (%)")
+        _plot_progress_stacked_area(ax, series, title=title, xlabel="Progress (%)", include_not_visible=bool(config.get("include_not_visible", False)))
         return
     raise ValueError(f"Unknown summary panel kind: {kind}")
 
