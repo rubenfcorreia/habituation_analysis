@@ -17,7 +17,7 @@ from .data import (
     analysis_cutoff_mask,
     apply_time_mask,
 )
-from .plotting import save_figure, set_poster_style, style_axes
+from .plotting import poster_boxplot, save_figure, set_poster_style, style_axes
 
 
 STATE_LABELS = ["small", "medium", "large", "extra_large", "not_visible"]
@@ -25,7 +25,7 @@ STATE_COLORS = ["tab:green", "tab:purple", "tab:red", "tab:brown", "tab:gray"]
 MIN_EXTRA_LARGE_MISSING_SEC = 1.0
 MANUAL_INTERVAL_BUFFER_SEC = 1.0
 CALIBRATION_BRIGHTNESS_MARGIN = 0.10
-STATISTICS_PLOT_VERSION = 5
+STATISTICS_PLOT_VERSION = 8
 
 
 @dataclass
@@ -1107,33 +1107,22 @@ def _boxplot(
     ylabel: str,
     sample_sizes: list[int] | None = None,
 ) -> None:
-    if sample_sizes is not None:
-        labels = [f"{label}\nn={sample_sizes[idx]}" for idx, label in enumerate(labels)]
-    if not any(arr.size for arr in data):
-        ax.text(0.5, 0.5, "No data available", transform=ax.transAxes, ha="center", va="center")
-        style_axes(ax, title=title, xlabel=xlabel, ylabel=ylabel)
-        return
-    plot_data = [arr if arr.size else np.array([np.nan], dtype=float) for arr in data]
-    bp = ax.boxplot(
-        plot_data,
-        patch_artist=True,
-        showmeans=True,
-        meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black", "markersize": 5},
-        medianprops={"color": "black", "linewidth": 1.5},
-        whiskerprops={"color": "0.35", "linewidth": 1.2},
-        capprops={"color": "0.35", "linewidth": 1.2},
-        flierprops={"marker": "o", "markerfacecolor": "0.4", "markeredgecolor": "0.4", "markersize": 3, "alpha": 0.35},
-        widths=0.6,
+    poster_boxplot(
+        ax,
+        data,
+        labels,
+        colors=colors,
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        sample_sizes=sample_sizes,
+        show_violin=False,
+        show_points=True,
+        show_summary_markers=True,
+        show_legend=False,
     )
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.45)
-        patch.set_edgecolor("0.35")
-        patch.set_linewidth(1.2)
-    style_axes(ax, title=title, xlabel=xlabel, ylabel=ylabel)
-    ax.set_xticks(np.arange(1, len(labels) + 1))
-    ax.set_xticklabels(labels, rotation=90 if len(labels) > 4 else 0, fontsize=8)
-
+    if ylabel == "Fraction":
+        ax.set_ylim(0.0, 1.0)
 
 def _session_sample_sizes(values_by_session: dict[str, dict[str, list[float]] | list[float]], sessions: list[str], *, state_label: str | None = None) -> list[int]:
     sample_sizes: list[int] = []
@@ -1240,17 +1229,13 @@ def _build_overall_pupil_state_fractions(
     }
 
 
-def _plot_state_fraction_pies(ax, *, title: str, fractions: dict[str, dict[str, float]], sample_size: int, sample_size_unit: str = "sessions") -> None:
-    ax.set_axis_off()
-    ax.set_title(f"{title} (n={sample_size} {sample_size_unit})", pad=14)
-    fig = ax.figure
-    bbox = ax.get_position()
-    bottom = bbox.y0 + 0.03 * bbox.height
-    height = bbox.height * 0.83
-    width = bbox.width * 0.46
-    gap = bbox.width * 0.08
-    left_ax = fig.add_axes([bbox.x0, bottom, width, height])
-    right_ax = fig.add_axes([bbox.x0 + width + gap, bottom, width, height])
+def _plot_state_fraction_pies(fig: Figure, subspec, *, title: str, fractions: dict[str, dict[str, float]], sample_size: int, sample_size_unit: str = "sessions") -> None:
+    inner = subspec.subgridspec(2, 2, height_ratios=[0.16, 1.0], hspace=0.08, wspace=0.18)
+    header_ax = fig.add_subplot(inner[0, :])
+    header_ax.axis("off")
+    header_ax.text(0.5, 0.45, f"{title} (n={sample_size} {sample_size_unit})", ha="center", va="center", fontsize=18, fontweight="bold")
+    left_ax = fig.add_subplot(inner[1, 0])
+    right_ax = fig.add_subplot(inner[1, 1])
 
     def _draw_pie(pie_ax, values: dict[str, float], pie_title: str, labels: list[str]) -> None:
         sizes = [float(values.get(label, float("nan"))) for label in labels]
@@ -1275,7 +1260,6 @@ def _plot_state_fraction_pies(ax, *, title: str, fractions: dict[str, dict[str, 
 
     _draw_pie(left_ax, fractions.get("with_not_visible", {}), "Including not visible", STATE_LABELS)
     _draw_pie(right_ax, fractions.get("without_not_visible", {}), "Excluding not visible", _state_labels_for_combined_plot())
-
 
 def _plot_session_metric_boxplot(
     ax,
@@ -1809,6 +1793,11 @@ def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, di
         ("locomotion_boxplot_le6", "Locomotion by session (<= 6)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le6"}),
         ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion", "subset": None}),
         ("face_motion_boxplot_le6", "Face motion by session (<= 6)", {"kind": "session_boxplot", "metric": "face_motion", "subset": "le6"}),
+        ("pupil_zscore_by_state", "Mean z-scored pupil size by state", {"kind": "state_zscore_boxplot"}),
+        ("pupil_state_fraction_by_session", "Pupil state percentage by session (including not visible)", {"kind": "state_fraction", "subset": None, "labels": STATE_LABELS, "include_not_visible": True}),
+        ("pupil_state_fraction_by_session_le6", "Pupil state percentage by session (including not visible, <= 6)", {"kind": "state_fraction", "subset": "le6", "labels": STATE_LABELS, "include_not_visible": True}),
+        ("pupil_state_fraction_by_session_without_not_visible", "Pupil state percentage by session (excluding not visible)", {"kind": "state_fraction", "subset": None, "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
+        ("pupil_state_fraction_by_session_without_not_visible_le6", "Pupil state percentage by session (excluding not visible, <= 6)", {"kind": "state_fraction", "subset": "le6", "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
         ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked", "subset": None, "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
         ("pupil_state_fraction_by_session_stacked_le6", "Pupil state fraction by session (stacked area, <= 6)", {"kind": "state_fraction_stacked", "subset": "le6", "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
         ("pupil_state_fraction_pie", "Overall pupil state percentages", {"kind": "state_fraction_pie"}),
@@ -1901,6 +1890,12 @@ def _build_panel_figure(result: StatisticsResult, config: dict, title: str) -> F
             _plot_session_metric_boxplot(ax, result, sessions, result.locomotion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:blue")
         else:
             _plot_session_metric_boxplot(ax, result, sessions, result.face_motion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:orange")
+        return fig
+    if kind == "state_zscore_boxplot":
+        fig = Figure(figsize=(10, 6), constrained_layout=True)
+        ax = fig.subplots()
+        state_data, states = _state_zscore_boxplot_data(result)
+        _boxplot(ax, state_data, states, colors=STATE_COLORS, title=title, xlabel="Pupil state", ylabel="Mean z-score")
         return fig
     if kind == "state_fraction":
         sessions = _session_subset_for_config(result, config.get("subset"))
@@ -2027,9 +2022,29 @@ def _selected_summary_panel_specs(result: StatisticsResult, panel_keys: list[str
     return selected
 
 
-def _draw_summary_panel(ax, result: StatisticsResult, config: dict, title: str) -> None:
-    sessions = _session_subset_for_config(result, config.get("subset"))
+def _summary_panel_span(kind: str) -> tuple[int, int]:
+    if kind == "state_fraction_pie":
+        return 1, 2
+    return 1, 1
+
+
+def _summary_panel_axis_sharing(kind: str) -> tuple[bool, bool]:
+    if kind in {"state_fraction_stacked", "progress_stacked", "lag"}:
+        return True, True
+    if kind == "animal_progress":
+        return True, False
+    return False, False
+
+
+def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: dict, title: str, *, sharex=None, sharey=None) -> None:
     kind = config["kind"]
+    if kind == "state_fraction_pie":
+        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session, result.pupil_pct_by_session_visible)
+        _plot_state_fraction_pies(fig, subspec, title=title, fractions=fractions, sample_size=len(result.pupil_pct_by_session), sample_size_unit="sessions")
+        return
+
+    ax = fig.add_subplot(subspec, sharex=sharex, sharey=sharey)
+    sessions = _session_subset_for_config(result, config.get("subset"))
     if kind == "session_boxplot":
         metric = config.get("metric", "locomotion")
         if metric == "locomotion":
@@ -2046,10 +2061,6 @@ def _draw_summary_panel(ax, result: StatisticsResult, config: dict, title: str) 
         return
     if kind == "state_fraction_stacked":
         _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot(), include_not_visible=bool(config.get("include_not_visible", False)))
-        return
-    if kind == "state_fraction_pie":
-        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session, result.pupil_pct_by_session_visible)
-        _plot_state_fraction_pies(ax, title=title, fractions=fractions, sample_size=len(result.pupil_pct_by_session), sample_size_unit="sessions")
         return
     if kind == "lag":
         _plot_lag_by_session(ax, result, sessions, title=title)
@@ -2076,22 +2087,55 @@ def _draw_summary_panel(ax, result: StatisticsResult, config: dict, title: str) 
 def _build_summary_figure(result: StatisticsResult, panel_keys: list[str] | None = None) -> Figure:
     specs = _selected_summary_panel_specs(result, panel_keys)
     n_panels = max(1, len(specs))
-    if n_panels <= 2:
+    has_pie = any(config["kind"] == "state_fraction_pie" for _, _, config in specs)
+    if n_panels <= 2 and not has_pie:
         cols = 1
-    elif n_panels <= 6:
+    elif n_panels <= 6 and not has_pie:
         cols = 2
     else:
         cols = 3
-    rows = int(np.ceil(n_panels / cols))
+    placements: list[tuple[str, str, dict, int, int, int, int]] = []
+    row = 0
+    col = 0
+    max_row = 0
+    for slug, title, config in specs:
+        row_span, col_span = _summary_panel_span(config["kind"])
+        col_span = min(col_span, cols)
+        if col + col_span > cols:
+            row += 1
+            col = 0
+        placements.append((slug, title, config, row, col, row_span, col_span))
+        max_row = max(max_row, row + row_span)
+        col += col_span
+        if col >= cols:
+            row += row_span
+            col = 0
+    rows = max(1, max_row)
     fig = Figure(figsize=(8.5 * cols, 5.8 * rows), constrained_layout=True)
-    axes = np.asarray(fig.subplots(rows, cols, squeeze=False)).ravel()
-    for ax, (_, title, config) in zip(axes, specs):
-        _draw_summary_panel(ax, result, config, title)
-    for ax in axes[len(specs):]:
-        ax.axis("off")
+    grid = fig.add_gridspec(rows, cols, wspace=0.30, hspace=0.42)
+    share_axes: dict[str, tuple[object | None, object | None]] = {}
+    for _, title, config, r, c, row_span, col_span in placements:
+        kind = config["kind"]
+        sharex_enabled, sharey_enabled = _summary_panel_axis_sharing(kind)
+        sharex = share_axes.get(kind, (None, None))[0] if sharex_enabled else None
+        sharey = share_axes.get(kind, (None, None))[1] if sharey_enabled else None
+        subspec = grid[r:r + row_span, c:c + col_span]
+        _draw_summary_panel(fig, subspec, result, config, title, sharex=sharex, sharey=sharey)
+        if kind not in share_axes:
+            share_axes[kind] = (None, None)
+        if sharex_enabled or sharey_enabled:
+            # Capture the first axes created for this kind from the current subplot spec.
+            if kind == "state_fraction_pie":
+                continue
+            anchor = fig.axes[-1]
+            current_sharex, current_sharey = share_axes.get(kind, (None, None))
+            if sharex_enabled and current_sharex is None:
+                current_sharex = anchor
+            if sharey_enabled and current_sharey is None:
+                current_sharey = anchor
+            share_axes[kind] = (current_sharex, current_sharey)
     fig.suptitle(f"Habituation statistics - {result.scope} / {result.animal_id}", y=1.02)
     return fig
-
 
 def save_statistics_summary_figure(output_dir: Path, result: StatisticsResult, *, summary_panel_keys: list[str] | None = None) -> tuple[Path, Path]:
     output_dir = Path(output_dir)

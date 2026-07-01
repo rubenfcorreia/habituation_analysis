@@ -2358,58 +2358,81 @@ class StatisticsTab(QWidget):
         self._current_paths: tuple[Path, Path, Path] | None = None
         self._plot_pages: list[tuple[str, Path]] = []
         self._plot_index = 0
+
         self._scope_label = QLabel("Statistics are not running yet.", self)
         self._scope_label.setWordWrap(True)
-        self._status_label = QLabel("Open this tab to run or review statistics.", self)
+        self._status_label = QLabel("Use Load cached stats or Re-run statistics.", self)
         self._status_label.setWordWrap(True)
         self._paths_label = QLabel("", self)
         self._paths_label.setWordWrap(True)
         self._current_figure_pixmap = QtGui.QPixmap()
+
         self.log_toggle = QCheckBox("Show log window", self)
         self.log_toggle.setChecked(True)
         self.log_toggle.toggled.connect(self._set_log_visible)
         self.log_toggle.setToolTip("Show or hide the statistics log and file paths.")
+
         self.summary_edit = QPlainTextEdit(self)
         self.summary_edit.setReadOnly(True)
         self.summary_edit.setPlaceholderText("Statistics output will appear here after the analysis runs.")
         self.summary_edit.setMinimumHeight(220)
+
         self.log_panel = QWidget(self)
         log_layout = QVBoxLayout(self.log_panel)
         log_layout.setContentsMargins(0, 0, 0, 0)
         log_layout.addWidget(self._paths_label)
         log_layout.addWidget(self.summary_edit, stretch=1)
+
         self._plot_title_label = QLabel("No plot selected.", self)
         self._plot_title_label.setAlignment(Qt.AlignCenter)
         self._plot_title_label.setWordWrap(True)
+
         self.figure_label = QLabel("No statistics figure yet.", self)
         self.figure_label.setAlignment(Qt.AlignCenter)
         self.figure_label.setMinimumSize(0, 0)
         self.figure_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+
         self.figure_scroll = QScrollArea(self)
         self.figure_scroll.setWidgetResizable(True)
         self.figure_scroll.setWidget(self.figure_label)
+
         self._plot_prev_button = QToolButton(self)
         self._plot_prev_button.setArrowType(Qt.LeftArrow)
         self._plot_prev_button.clicked.connect(lambda: self._step_plot(-1))
+
         self._plot_next_button = QToolButton(self)
         self._plot_next_button.setArrowType(Qt.RightArrow)
         self._plot_next_button.clicked.connect(lambda: self._step_plot(1))
+
         self._plot_counter_label = QLabel("", self)
         self._plot_counter_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.run_button = QPushButton("Run statistics now", self)
+
+        self.load_cache_button = QPushButton("Load cached stats", self)
+        self.load_cache_button.clicked.connect(self.load_cached_current_scope)
+        self.load_cache_button.setToolTip("Load saved statistics for this scope without recomputing.")
+
+        self.run_button = QPushButton("Re-run statistics", self)
         self.run_button.clicked.connect(self.run_current_scope)
+        self.run_button.setToolTip("Force recomputation even if cached statistics already exist.")
+
         self.run_all_button = QPushButton("Run all animals", self)
         self.run_all_button.clicked.connect(self.run_all_animals)
         self.run_all_button.setToolTip("Run statistics separately for every animal in the dataset.")
+
         self.summary_customize_button = QPushButton("Customize summary figure", self)
         self.summary_customize_button.clicked.connect(self._customize_summary_figure)
         self.summary_customize_button.setEnabled(False)
-        self.summary_customize_button.setToolTip("Choose which panels appear in the saved summary SVG/PNG after statistics finish.")
+        self.summary_customize_button.setToolTip(
+            "Choose the summary figure size, grid, and place each panel into a specific square."
+        )
+
         button_row = QHBoxLayout()
+        button_row.addWidget(self.load_cache_button)
         button_row.addWidget(self.run_button)
         button_row.addWidget(self.run_all_button)
         button_row.addWidget(self.summary_customize_button)
         button_row.addStretch(1)
+
         layout = QVBoxLayout(self)
         layout.addWidget(self._scope_label)
         layout.addWidget(self._status_label)
@@ -2418,12 +2441,14 @@ class StatisticsTab(QWidget):
         layout.addWidget(self.log_panel, stretch=1)
         layout.addWidget(self._plot_title_label)
         layout.addWidget(self.figure_scroll, stretch=2)
+
         plot_nav = QHBoxLayout()
         plot_nav.addWidget(self._plot_prev_button)
         plot_nav.addWidget(self._plot_next_button)
         plot_nav.addStretch(1)
         plot_nav.addWidget(self._plot_counter_label)
         layout.addLayout(plot_nav)
+
     def set_context(self, animal_id: str, view_mode: str):
         changed = animal_id != self.animal_id or view_mode != self.view_mode
         self.animal_id = animal_id
@@ -2432,19 +2457,20 @@ class StatisticsTab(QWidget):
         if changed:
             self._prompted_for_entry = False
         self._reload_current_context(changed=changed)
+
     def refresh(self):
         self._reload_current_context(changed=True)
+
     def _reload_current_context(self, *, changed: bool):
         if self._worker is not None and self._worker.isRunning():
             return
         if not changed:
             return
-        self._set_placeholder(f"Loading statistics for {self.animal_id}...")
-        QApplication.processEvents()
-        if self._show_cached_statistics_for_context():
-            self._prompted_for_entry = True
-        else:
-            self._set_placeholder(f"Statistics for {self.animal_id} are not running yet.")
+        self._set_placeholder(
+            f"Statistics for {self.animal_id} are not loaded. "
+            "Use Load cached stats to review saved outputs, or Re-run statistics to recompute."
+        )
+
     def _set_placeholder(self, message: str):
         self._status_label.setText(message)
         self.summary_edit.setPlainText(message)
@@ -2453,12 +2479,15 @@ class StatisticsTab(QWidget):
         self._current_paths = None
         self.summary_customize_button.setEnabled(False)
         self._set_plot_pages([])
+
     def _set_log_visible(self, visible: bool):
         self.log_panel.setVisible(bool(visible))
+
     def _set_plot_pages(self, pages: list[tuple[str, Path]]):
         self._plot_pages = [(title, Path(path)) for title, path in pages if Path(path).exists()]
         self._plot_index = 0
         self._show_current_plot_page()
+
     def _load_plot_pages_from_output_dir(self, output_dir: Path):
         pages: list[tuple[str, Path]] = []
         for title, path in statistics_panel_paths(output_dir):
@@ -2470,6 +2499,7 @@ class StatisticsTab(QWidget):
             if summary_path.exists():
                 pages.append(("Statistics summary", summary_path))
         self._set_plot_pages(pages)
+
     def _show_current_plot_page(self):
         if not self._plot_pages:
             self._plot_title_label.setText("No plot selected.")
@@ -2479,6 +2509,7 @@ class StatisticsTab(QWidget):
             self._current_figure_pixmap = QtGui.QPixmap()
             self._update_plot_controls()
             return
+
         title, path = self._plot_pages[self._plot_index]
         pixmap = QtGui.QPixmap(str(path))
         if pixmap.isNull():
@@ -2489,11 +2520,13 @@ class StatisticsTab(QWidget):
             self._current_figure_pixmap = QtGui.QPixmap()
             self._update_plot_controls()
             return
+
         self._plot_title_label.setText(title)
         self._current_figure_pixmap = QtGui.QPixmap(pixmap)
         self.figure_label.setText("")
         self._refresh_figure_preview()
         self._update_plot_controls()
+
     def _update_plot_controls(self):
         enabled = len(self._plot_pages) > 1
         self._plot_prev_button.setEnabled(enabled)
@@ -2502,11 +2535,13 @@ class StatisticsTab(QWidget):
             self._plot_counter_label.setText(f"{self._plot_index + 1}/{len(self._plot_pages)}")
         else:
             self._plot_counter_label.setText("")
+
     def _step_plot(self, delta: int):
         if not self._plot_pages:
             return
         self._plot_index = (self._plot_index + int(delta)) % len(self._plot_pages)
         self._show_current_plot_page()
+
     def _display_statistics_payload(self, payload: dict, *, status_prefix: str | None = None):
         result = payload["result"]
         result_path, svg_path, png_path = payload["paths"]
@@ -2514,78 +2549,280 @@ class StatisticsTab(QWidget):
         self._current_paths = (result_path, svg_path, png_path)
         self.summary_customize_button.setEnabled(True)
         self.store.clear_animal_dirty(result.animal_id)
+
         prefix = status_prefix or ("Loaded cached statistics for" if payload.get("cached") else "Statistics complete for")
         self._status_label.setText(f"{prefix} {result.scope} / {result.animal_id}")
         self._paths_label.setText(f"Saved: {result_path}\nSVG: {svg_path}\nPNG: {png_path}")
         self.summary_edit.setPlainText(self._format_result_text(result))
         self._load_plot_pages_from_output_dir(Path(result_path).parent)
+
     def _summary_panel_spec_items(self, result) -> list[tuple[str, str, dict]]:
         return list(statistics_summary_panel_specs(result))
 
-    def _choose_summary_panels(self, result) -> list[str] | None:
+    def _choose_summary_panels(self, result) -> dict | None:
         specs = self._summary_panel_spec_items(result)
         if not specs:
-            return []
+            return {
+                "panel_keys": [],
+                "figure_size_cm": (18.0, 14.0),
+                "grid_shape": (1, 1),
+            }
+
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
-            return [slug for slug, _, _ in specs]
+            panel_count = len(specs)
+            cols = 1 if panel_count <= 2 else 2 if panel_count <= 6 else 3
+            rows = int(np.ceil(max(1, panel_count) / cols))
+            panel_keys = [slug for slug, _, _ in specs]
+            return {
+                "panel_keys": panel_keys,
+                "figure_size_cm": (21.0 * cols, 14.5 * rows),
+                "grid_shape": (rows, cols),
+            }
+
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Choose summary panels")
-        dialog.resize(720, 640)
+        dialog.setWindowTitle("Customize summary figure")
+        dialog.resize(980, 780)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("Select the panels to include in the saved summary figure:", dialog))
-        scroll = QScrollArea(dialog)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_content = QWidget(scroll)
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(0, 0, 0, 0)
-        scroll_layout.setSpacing(6)
-        checkbox_map = []
-        for slug, title, _config in specs:
-            checkbox = QCheckBox(title, scroll_content)
-            checkbox.setChecked(True)
-            scroll_layout.addWidget(checkbox)
-            checkbox_map.append((slug, checkbox))
-        scroll_layout.addStretch(1)
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll, stretch=1)
-        button_row = QHBoxLayout()
-        all_button = QPushButton("Select all", dialog)
-        none_button = QPushButton("Select none", dialog)
-        button_row.addWidget(all_button)
-        button_row.addWidget(none_button)
-        button_row.addStretch(1)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, parent=dialog)
-        layout.addLayout(button_row)
+
+        intro = QLabel(
+            "Choose the summary figure size and grid. Then assign a panel to each square. "
+            "Leave a square as Empty to keep it blank.",
+            dialog,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        settings_group = QGroupBox("Figure layout", dialog)
+        settings_layout = QFormLayout(settings_group)
+
+        width_spin = QDoubleSpinBox(settings_group)
+        width_spin.setRange(5.0, 300.0)
+        width_spin.setDecimals(1)
+        width_spin.setSingleStep(1.0)
+        width_spin.setSuffix(" cm")
+
+        height_spin = QDoubleSpinBox(settings_group)
+        height_spin.setRange(5.0, 300.0)
+        height_spin.setDecimals(1)
+        height_spin.setSingleStep(1.0)
+        height_spin.setSuffix(" cm")
+
+        rows_spin = QtWidgets.QSpinBox(settings_group)
+        rows_spin.setRange(1, 20)
+
+        cols_spin = QtWidgets.QSpinBox(settings_group)
+        cols_spin.setRange(1, 20)
+
+        default_count = len(specs)
+        default_cols = 1 if default_count <= 2 else 2 if default_count <= 6 else 3
+        default_rows = int(np.ceil(max(1, default_count) / default_cols))
+
+        width_spin.setValue(float(21.0 * default_cols))
+        height_spin.setValue(float(14.5 * default_rows))
+        rows_spin.setValue(default_rows)
+        cols_spin.setValue(default_cols)
+
+        settings_layout.addRow("Width", width_spin)
+        settings_layout.addRow("Height", height_spin)
+        settings_layout.addRow("Rows", rows_spin)
+        settings_layout.addRow("Columns", cols_spin)
+        layout.addWidget(settings_group)
+
+        status_label = QLabel("", dialog)
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        grid_scroll = QScrollArea(dialog)
+        grid_scroll.setWidgetResizable(True)
+        grid_container = QWidget(grid_scroll)
+        grid_layout = QGridLayout(grid_container)
+        grid_layout.setContentsMargins(4, 4, 4, 4)
+        grid_layout.setSpacing(8)
+        grid_scroll.setWidget(grid_container)
+        layout.addWidget(grid_scroll, stretch=1)
+
+        combo_grid: list[list[QComboBox]] = []
+
+        def _clear_grid_layout():
+            while grid_layout.count():
+                item = grid_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+
+        def _make_combo(default_slug: str | None = None) -> QComboBox:
+            combo = QComboBox(grid_container)
+            combo.addItem("Empty", None)
+            for slug, title, _config in specs:
+                combo.addItem(title, slug)
+            if default_slug is not None:
+                idx = combo.findData(default_slug)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.currentIndexChanged.connect(lambda _idx: _refresh_status())
+            return combo
+
+        def _rebuild_grid():
+            previous = _grid_panel_keys()
+            _clear_grid_layout()
+            combo_grid.clear()
+
+            rows = int(rows_spin.value())
+            cols = int(cols_spin.value())
+            max_slots = rows * cols
+
+            for r in range(rows):
+                row_combos: list[QComboBox] = []
+                for c in range(cols):
+                    idx = r * cols + c
+                    label = QLabel(f"Row {r + 1}, Col {c + 1}", grid_container)
+                    combo = _make_combo(previous[idx] if idx < len(previous) else None)
+                    grid_layout.addWidget(label, r * 2, c)
+                    grid_layout.addWidget(combo, r * 2 + 1, c)
+                    row_combos.append(combo)
+                combo_grid.append(row_combos)
+
+            if len(previous) == 0:
+                for idx, (slug, _title, _config) in enumerate(specs[:max_slots]):
+                    r = idx // cols
+                    c = idx % cols
+                    combo_grid[r][c].setCurrentIndex(combo_grid[r][c].findData(slug))
+
+            _refresh_status()
+
+        def _grid_panel_keys() -> list[str | None]:
+            keys: list[str | None] = []
+            for row in combo_grid:
+                for combo in row:
+                    value = combo.currentData()
+                    keys.append(str(value) if value else None)
+            return keys
+
+        def _selected_non_empty_keys() -> list[str]:
+            return [key for key in _grid_panel_keys() if key is not None]
+
+        def _refresh_status():
+            keys = _selected_non_empty_keys()
+            duplicates = sorted({key for key in keys if keys.count(key) > 1})
+            create_button.setEnabled(False)
+
+            if not keys:
+                status_label.setText("Assign at least one panel to a grid square.")
+                status_label.setStyleSheet("color: #b00020; font-weight: 600;")
+                return
+
+            if duplicates:
+                duplicate_titles = []
+                for duplicate in duplicates:
+                    title = next((title for slug, title, _config in specs if slug == duplicate), duplicate)
+                    duplicate_titles.append(title)
+                status_label.setText(
+                    "Each panel can only be used once. Duplicates: "
+                    + ", ".join(duplicate_titles)
+                )
+                status_label.setStyleSheet("color: #b00020; font-weight: 600;")
+                return
+
+            total_slots = int(rows_spin.value()) * int(cols_spin.value())
+            status_label.setText(f"Assigned panels: {len(keys)}; grid slots: {total_slots}. Empty slots are allowed.")
+            status_label.setStyleSheet("color: #1b5e20; font-weight: 600;")
+            create_button.setEnabled(True)
+
+        def _fill_grid_row_major():
+            rows = int(rows_spin.value())
+            cols = int(cols_spin.value())
+            slots = rows * cols
+            for row in combo_grid:
+                for combo in row:
+                    combo.setCurrentIndex(0)
+            for idx, (slug, _title, _config) in enumerate(specs[:slots]):
+                r = idx // cols
+                c = idx % cols
+                combo_grid[r][c].setCurrentIndex(combo_grid[r][c].findData(slug))
+            _refresh_status()
+
+        def _clear_assignments():
+            for row in combo_grid:
+                for combo in row:
+                    combo.setCurrentIndex(0)
+            _refresh_status()
+
+        control_row = QHBoxLayout()
+        fill_button = QPushButton("Fill row-major", dialog)
+        clear_button = QPushButton("Clear grid", dialog)
+        control_row.addWidget(fill_button)
+        control_row.addWidget(clear_button)
+        control_row.addStretch(1)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel, parent=dialog)
+        create_button = buttons.addButton("Create", QtWidgets.QDialogButtonBox.AcceptRole)
+        create_button.setDefault(True)
+
+        layout.addLayout(control_row)
         layout.addWidget(buttons)
 
-        def _set_all(checked: bool):
-            for _, checkbox in checkbox_map:
-                checkbox.setChecked(checked)
-
-        all_button.clicked.connect(lambda: _set_all(True))
-        none_button.clicked.connect(lambda: _set_all(False))
+        rows_spin.valueChanged.connect(lambda _value: _rebuild_grid())
+        cols_spin.valueChanged.connect(lambda _value: _rebuild_grid())
+        fill_button.clicked.connect(_fill_grid_row_major)
+        clear_button.clicked.connect(_clear_assignments)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
+
+        _rebuild_grid()
+
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
-        return [slug for slug, checkbox in checkbox_map if checkbox.isChecked()]
+
+        panel_keys = _grid_panel_keys()
+        if not any(key is not None for key in panel_keys):
+            return None
+
+        return {
+            "panel_keys": panel_keys,
+            "figure_size_cm": (float(width_spin.value()), float(height_spin.value())),
+            "grid_shape": (int(rows_spin.value()), int(cols_spin.value())),
+        }
 
     def _customize_summary_figure(self):
         if self._current_result is None or self._current_paths is None:
-            self._status_label.setText("Run statistics first to customize the summary figure.")
+            self._status_label.setText("Run or load statistics first to customize the summary figure.")
             return
-        panel_keys = self._choose_summary_panels(self._current_result)
-        if panel_keys is None:
+
+        options = self._choose_summary_panels(self._current_result)
+        if options is None:
             return
+
         output_dir = Path(self._current_paths[0]).parent
-        save_statistics_summary_figure(output_dir, self._current_result, summary_panel_keys=panel_keys)
-        self._status_label.setText(f"Updated summary figure with {len(panel_keys)} selected panels for {self._current_result.scope} / {self._current_result.animal_id}.")
+        try:
+            svg_path, png_path = save_statistics_summary_figure(
+                output_dir,
+                self._current_result,
+                summary_panel_keys=options["panel_keys"],
+                summary_figure_size_cm=options["figure_size_cm"],
+                summary_grid_shape=options["grid_shape"],
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Customize summary figure", str(exc))
+            return
+
+        self._current_paths = (self._current_paths[0], svg_path, png_path)
+        self._paths_label.setText(f"Saved: {self._current_paths[0]}\nSVG: {svg_path}\nPNG: {png_path}")
+        assigned_count = sum(1 for key in options["panel_keys"] if key is not None)
+        self._status_label.setText(
+            f"Updated summary figure with {assigned_count} assigned panels for "
+            f"{self._current_result.scope} / {self._current_result.animal_id}."
+        )
+
+        pages = [("Customized statistics summary", png_path)]
+        pages.extend(statistics_panel_paths(output_dir))
+        self._set_plot_pages(pages)
+        self._plot_index = 0
+        self._show_current_plot_page()
 
     def _show_cached_statistics_for_context(self) -> bool:
         if self._worker is not None and self._worker.isRunning():
             return False
+
         scope = self.animal_id
         thresholds = self._threshold_payload(*self._threshold_inputs_for_animal(scope))
         cached = load_cached_statistics_outputs(
@@ -2596,102 +2833,149 @@ class StatisticsTab(QWidget):
         )
         if cached is None:
             return False
+
         result, result_paths = cached
         self._display_statistics_payload({"result": result, "paths": result_paths, "cached": True})
         return True
+
+    def load_cached_current_scope(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+
+        self._set_placeholder(f"Loading cached statistics for {self.animal_id}...")
+        QApplication.processEvents()
+
+        if not self._show_cached_statistics_for_context():
+            self._set_placeholder(
+                f"No valid cached statistics found for {self.animal_id}. "
+                "Use Re-run statistics to compute them."
+            )
+
     def _set_figure_preview(self, pixmap: QtGui.QPixmap):
         self._current_figure_pixmap = QtGui.QPixmap(pixmap)
         self._refresh_figure_preview()
+
     def _refresh_figure_preview(self):
         if self._current_figure_pixmap.isNull():
             return
+
         viewport = self.figure_scroll.viewport()
         if viewport is None:
             self.figure_label.setPixmap(self._current_figure_pixmap)
             return
+
         target = viewport.size()
         if target.width() <= 0 or target.height() <= 0:
             self.figure_label.setPixmap(self._current_figure_pixmap)
             return
+
         scaled = self._current_figure_pixmap.scaled(
             target,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
         self.figure_label.setPixmap(scaled)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_figure_preview()
+
     def maybe_prompt_and_run(self):
         if self._worker is not None and self._worker.isRunning():
             return
         if self._prompted_for_entry:
             return
+
         self._prompted_for_entry = True
+
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             self.run_current_scope()
             return
-        answer = QMessageBox.question(
-            self,
-            "Run statistics?",
-            "Do you want to run the statistical analysis for the current scope?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if answer == QMessageBox.Yes:
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Statistics")
+        box.setText("What do you want to do for the current statistics scope?")
+        load_button = box.addButton("Load cached stats", QMessageBox.AcceptRole)
+        rerun_button = box.addButton("Re-run statistics", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(load_button)
+        box.exec_()
+
+        clicked = box.clickedButton()
+        if clicked == load_button:
+            self.load_cached_current_scope()
+        elif clicked == rerun_button:
             self.run_current_scope()
+
     def _set_statistics_running(self, message: str):
         self._status_label.setText(message)
+        self.load_cache_button.setEnabled(False)
         self.run_button.setEnabled(False)
         self.run_all_button.setEnabled(False)
+        self.summary_customize_button.setEnabled(False)
+
     def _finish_statistics_run(self):
+        self.load_cache_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self.run_all_button.setEnabled(True)
+        self.summary_customize_button.setEnabled(self._current_result is not None)
         self._worker = None
+
     def _start_statistics_worker(self, job, on_result):
         self._worker = TaskThread(job, self)
         self._worker.progress.connect(self._on_progress)
         self._worker.result_ready.connect(on_result)
         self._worker.error.connect(self._on_error)
         self._worker.start()
+
     def _ask_all_animals_mode(self) -> str | None:
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             return "all"
+
         box = QMessageBox(self)
         box.setWindowTitle("Run all animals")
-        box.setText("Do you want to run statistics for all animals or only the ones without saved stats?")
+        box.setText("Do you want to recompute all animals or only compute missing statistics?")
         all_button = box.addButton("All animals", QMessageBox.AcceptRole)
         missing_button = box.addButton("Only missing stats", QMessageBox.ActionRole)
         box.addButton(QMessageBox.Cancel)
         box.setDefaultButton(all_button)
         box.exec_()
+
         clicked = box.clickedButton()
         if clicked == all_button:
             return "all"
         if clicked == missing_button:
             return "missing"
         return None
+
     def run_current_scope(self):
         if self._worker is not None and self._worker.isRunning():
             return
+
         scope = self.animal_id
-        self._set_statistics_running(f"Running statistics for {scope}...")
-        self._start_statistics_worker(self._build_statistics_job(scope), self._on_result)
+        self._set_statistics_running(f"Re-running statistics for {scope}...")
+        self._start_statistics_worker(self._build_statistics_job(scope, force_recompute=True), self._on_result)
+
     def run_all_animals(self):
         if self._worker is not None and self._worker.isRunning():
             return
+
         animals = self._analysis_animals()
         if not animals:
             self._status_label.setText("No animals with analysis sessions were found.")
             return
+
         if "All" not in animals:
             animals.append("All")
+
         mode = self._ask_all_animals_mode()
         if mode is None:
             return
-        mode_label = "all animals + overall" if mode == "all" else "animals without saved stats + overall"
+
+        mode_label = "recompute all animals + overall" if mode == "all" else "only missing stats + overall"
         self._set_statistics_running(f"Running statistics for {len(animals)} scopes ({mode_label})...")
         self._start_statistics_worker(self._build_all_statistics_job(animals, mode), self._on_batch_result)
+
     @staticmethod
     def _threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec) -> dict:
         return {
@@ -2700,19 +2984,23 @@ class StatisticsTab(QWidget):
             "locomotion_threshold": float(locomotion_threshold),
             "missing_buffer_sec": float(missing_buffer_sec),
         }
-    def _build_statistics_job(self, scope: str):
+
+    def _build_statistics_job(self, scope: str, *, force_recompute: bool = True):
         percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = self._threshold_inputs_for_animal(scope)
         thresholds = self._threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec)
+
         def job(progress_cb):
-            cached = load_cached_statistics_outputs(
-                self.store,
-                scope=scope,
-                animal_id=scope,
-                thresholds=thresholds,
-            )
-            if cached is not None:
-                result, result_paths = cached
-                return {"result": result, "paths": result_paths, "cached": True}
+            if not force_recompute:
+                cached = load_cached_statistics_outputs(
+                    self.store,
+                    scope=scope,
+                    animal_id=scope,
+                    thresholds=thresholds,
+                )
+                if cached is not None:
+                    result, result_paths = cached
+                    return {"result": result, "paths": result_paths, "cached": True}
+
             result = compute_statistics(
                 self.store,
                 scope=scope,
@@ -2725,36 +3013,45 @@ class StatisticsTab(QWidget):
             )
             result_paths = save_statistics_outputs(self.store, result)
             return {"result": result, "paths": result_paths, "cached": False}
+
         return job
+
     def _build_all_statistics_job(self, animals: list[str], mode: str):
         threshold_inputs = {animal: self._threshold_inputs_for_animal(animal) for animal in animals}
+
         def job(progress_cb):
             outputs = []
             skipped = []
             total = max(1, len(animals))
+
             for idx, animal in enumerate(animals):
                 percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = threshold_inputs[animal]
                 thresholds = self._threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec)
-                if animal != "All":
+
+                if mode == "missing":
                     cached = load_cached_statistics_outputs(
                         self.store,
                         scope=animal,
                         animal_id=animal,
                         thresholds=thresholds,
                     )
-                    if cached is not None and mode == "missing":
-                        result, result_paths = cached
-                        skipped.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
-                        progress_cb((idx + 1) / total, f"{animal}: cached statistics already exist")
-                        continue
                     if cached is not None:
                         result, result_paths = cached
-                        outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": True})
-                        progress_cb((idx + 1) / total, f"{animal}: loaded cached statistics")
+                        skipped.append(
+                            {
+                                "animal_id": animal,
+                                "result": result,
+                                "paths": result_paths,
+                                "cached": True,
+                            }
+                        )
+                        progress_cb((idx + 1) / total, f"{animal}: cached statistics already exist")
                         continue
+
                 def animal_progress(fraction: float, message: str, *, idx=idx, animal=animal):
                     overall = (idx + float(fraction)) / total
                     progress_cb(overall, f"{animal}: {message}")
+
                 result = compute_statistics(
                     self.store,
                     scope=animal,
@@ -2766,24 +3063,43 @@ class StatisticsTab(QWidget):
                     progress_cb=animal_progress,
                 )
                 result_paths = save_statistics_outputs(self.store, result)
-                outputs.append({"animal_id": animal, "result": result, "paths": result_paths, "cached": False})
-            return {"mode": "all_animals", "selection_mode": mode, "results": outputs, "skipped": skipped}
+                outputs.append(
+                    {
+                        "animal_id": animal,
+                        "result": result,
+                        "paths": result_paths,
+                        "cached": False,
+                    }
+                )
+
+            return {
+                "mode": "all_animals",
+                "selection_mode": mode,
+                "results": outputs,
+                "skipped": skipped,
+            }
+
         return job
+
     def _analysis_animals(self) -> list[str]:
         animals = []
         for animal in self.store.animals():
             usable_sessions = [
                 s
                 for s in self.store.sessions_for_animal(animal)
-                if s.has_right_pickle and not self.store.is_deeplabcut_reference_session(s.exp_id) and not self.store.is_session_do_not_use(s.exp_id)
+                if s.has_right_pickle
+                and not self.store.is_deeplabcut_reference_session(s.exp_id)
+                and not self.store.is_session_do_not_use(s.exp_id)
             ]
             if len(usable_sessions) >= MIN_STATISTICS_SESSIONS_PER_ANIMAL:
                 animals.append(animal)
         return animals
+
     def _threshold_inputs_for_animal(self, animal_id: str):
         global_percentiles = self.store.global_pupil_percentile_cutoffs()
         locomotion_threshold = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
         missing_buffer_sec = float(self.store.global_pupil_missing_buffer_sec())
+
         if self.parent() is not None:
             main_window = self.window()
             metrics = getattr(main_window, "metrics_tab", None)
@@ -2800,47 +3116,76 @@ class StatisticsTab(QWidget):
                     locomotion_threshold,
                     float(metrics.missing_buffer_spin.value()),
                 )
+
         if animal_id == "All":
             mean, std = compute_animal_baseline(self.store, "All", scope="All")
             zmap = animal_zscores(self.store, "All", mean=mean, std=std)
             pooled = [values[np.isfinite(values)] for values in zmap.values() if np.any(np.isfinite(values))]
             distribution = np.concatenate(pooled) if pooled else np.array([], dtype=float)
-            threshold_values = percentile_threshold_values(distribution, global_percentiles) if distribution.size else [0.0, 0.0, 0.0]
-            return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
+            threshold_values = (
+                percentile_threshold_values(distribution, global_percentiles)
+                if distribution.size
+                else [0.0, 0.0, 0.0]
+            )
+            return (
+                list(map(float, global_percentiles)),
+                list(map(float, threshold_values)),
+                locomotion_threshold,
+                missing_buffer_sec,
+            )
+
         settings = self.store.get_animal_settings(animal_id)
         threshold_values = settings.get("threshold_values", [0.0, 0.5, 1.0])
         threshold_signature = str(settings.get("threshold_signature", ""))
         global_signature = self.store.pupil_percentile_signature(global_percentiles)
+
         if not isinstance(threshold_values, list) or len(threshold_values) != 3 or threshold_signature != global_signature:
             mean, std = compute_animal_baseline(self.store, animal_id)
             zmap = animal_zscores(self.store, animal_id, mean=mean, std=std)
             pooled = [values[np.isfinite(values)] for values in zmap.values() if np.any(np.isfinite(values))]
             distribution = np.concatenate(pooled) if pooled else np.array([], dtype=float)
-            threshold_values = percentile_threshold_values(distribution, global_percentiles) if distribution.size else [0.0, 0.0, 0.0]
+            threshold_values = (
+                percentile_threshold_values(distribution, global_percentiles)
+                if distribution.size
+                else [0.0, 0.0, 0.0]
+            )
             settings["threshold_values"] = [float(v) for v in threshold_values]
             settings["threshold_signature"] = global_signature
             self.store.set_animal_settings(animal_id, settings)
-        return list(map(float, global_percentiles)), list(map(float, threshold_values)), locomotion_threshold, missing_buffer_sec
+
+        return (
+            list(map(float, global_percentiles)),
+            list(map(float, threshold_values)),
+            locomotion_threshold,
+            missing_buffer_sec,
+        )
+
     def _current_threshold_inputs(self):
         return self._threshold_inputs_for_animal(self.animal_id)
+
     def _on_progress(self, fraction: float, message: str):
         self._status_label.setText(f"{message} ({fraction * 100.0:.0f}%)")
+
     def _on_error(self, message: str):
         self._finish_statistics_run()
         self._status_label.setText("Statistics failed.")
         self._set_message_box_error(message)
+
     def _set_message_box_error(self, message: str):
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             print(message)
             return
         QMessageBox.critical(self, "Statistics error", message)
+
     def _on_result(self, payload: dict):
         self._finish_statistics_run()
         self._display_statistics_payload(payload)
+
     def _on_batch_result(self, payload: dict):
         self._finish_statistics_run()
         results = payload.get("results", [])
         skipped = payload.get("skipped", [])
+
         if not results and not skipped:
             self._status_label.setText("No batch statistics were generated.")
             self.summary_edit.setPlainText("No batch statistics were generated.")
@@ -2849,23 +3194,22 @@ class StatisticsTab(QWidget):
             self._current_result = None
             self._current_paths = None
             return
+
         for item in results + skipped:
             self.store.clear_animal_dirty(item["animal_id"])
-        if results:
-            loaded_count = sum(1 for item in results if item.get("cached"))
-            computed_count = len(results) - loaded_count
-            skipped_count = len(skipped)
-            status_bits = []
-            if computed_count:
-                status_bits.append(f"{computed_count} computed")
-            if loaded_count:
-                status_bits.append(f"{loaded_count} loaded from cache")
-            if skipped_count:
-                status_bits.append(f"{skipped_count} skipped because cached stats already exist")
-            extra = f" ({'; '.join(status_bits)})" if status_bits else ""
-            self._status_label.setText(f"Batch statistics complete for {len(results)} animals{extra}.")
-        else:
-            self._status_label.setText(f"No animals needed rerun; {len(skipped)} cached stats were already up to date.")
+
+        computed_count = sum(1 for item in results if not item.get("cached"))
+        skipped_count = len(skipped)
+
+        status_bits = []
+        if computed_count:
+            status_bits.append(f"{computed_count} computed")
+        if skipped_count:
+            status_bits.append(f"{skipped_count} skipped because cached stats already exist")
+
+        extra = f" ({'; '.join(status_bits)})" if status_bits else ""
+        self._status_label.setText(f"Batch statistics complete for {len(results) + len(skipped)} scopes{extra}.")
+
         active_items = results + skipped
         matching_item = next((item for item in active_items if item["animal_id"] == self.animal_id), None)
         if matching_item is None and self.animal_id == "All":
@@ -2874,12 +3218,19 @@ class StatisticsTab(QWidget):
             matching_item = active_items[0]
         if matching_item is None:
             return
+
         self._display_statistics_payload(
-            {"result": matching_item["result"], "paths": matching_item["paths"], "cached": matching_item.get("cached", False)}
+            {
+                "result": matching_item["result"],
+                "paths": matching_item["paths"],
+                "cached": matching_item.get("cached", False),
+            }
         )
+
         if len(active_items) > 1:
             batch_text = self._format_batch_result_text(payload, active_items, matching_item)
             self.summary_edit.setPlainText(batch_text)
+
     def _format_result_text(self, result) -> str:
         lines = [
             f"Scope: {result.scope}",
@@ -2894,12 +3245,14 @@ class StatisticsTab(QWidget):
             "",
             "Session-wise locomotion distributions (mean ± SD):",
         ]
+
         for session in result.session_labels:
             values = np.asarray(result.locomotion_pct_by_session_values.get(session, []), dtype=float)
             values = values[np.isfinite(values)]
             mean = float(np.nanmean(values)) if values.size else float("nan")
             sd = float(np.nanstd(values)) if values.size else float("nan")
             lines.append(f"  {session}: mean={mean:.4f}, sd={sd:.4f}, n={values.size}")
+
         lines.append("")
         lines.append("Session-wise face motion distributions (mean ± SD):")
         for session in result.session_labels:
@@ -2908,6 +3261,7 @@ class StatisticsTab(QWidget):
             mean = float(np.nanmean(values)) if values.size else float("nan")
             sd = float(np.nanstd(values)) if values.size else float("nan")
             lines.append(f"  {session}: mean={mean:.4f}, sd={sd:.4f}, n={values.size}")
+
         lines.append("")
         lines.append("Mean z-scored pupil size by state (mean ± SD across sessions):")
         for label in STATE_LABELS:
@@ -2916,6 +3270,7 @@ class StatisticsTab(QWidget):
             mean = float(np.nanmean(values)) if values.size else float("nan")
             sd = float(np.nanstd(values)) if values.size else float("nan")
             lines.append(f"  {label}: mean={mean:.4f}, sd={sd:.4f}, n={values.size}")
+
         lines.append("")
         lines.append("Pupil state fraction by session (mean ± SD across sessions):")
         for session in result.session_labels:
@@ -2928,37 +3283,41 @@ class StatisticsTab(QWidget):
                 for label in STATE_LABELS
             )
             lines.append(f"  {session}: {state_text}")
+
         return "\n".join(lines)
+
     def _format_batch_result_text(self, payload: dict, active_items: list[dict], selected_item: dict) -> str:
         results = payload.get("results", [])
         skipped = payload.get("skipped", [])
         skipped_ids = {str(item.get("animal_id", "")) for item in skipped}
         computed_ids = {str(item.get("animal_id", "")) for item in results if not item.get("cached")}
-        loaded_ids = {str(item.get("animal_id", "")) for item in results if item.get("cached")}
         selected_id = str(selected_item.get("animal_id", ""))
+
         lines = [
             f"Batch mode: {payload.get('selection_mode', 'all')}",
-            f"Animals processed: {len(active_items)}",
+            f"Scopes processed: {len(active_items)}",
             "",
-            "Animal IDs:",
+            "Scope IDs:",
         ]
+
         for item in active_items:
             animal_id = str(item.get("animal_id", ""))
             if animal_id in skipped_ids:
                 status = "cached, skipped rerun"
-            elif animal_id in loaded_ids:
-                status = "loaded from cache"
             elif animal_id in computed_ids:
                 status = "computed"
             else:
                 status = "processed"
             lines.append(f"  - {animal_id}: {status}")
-        lines.extend([
-            "",
-            f"Showing detailed statistics for: {selected_id}",
-            "",
-            self._format_result_text(selected_item["result"]),
-        ])
+
+        lines.extend(
+            [
+                "",
+                f"Showing detailed statistics for: {selected_id}",
+                "",
+                self._format_result_text(selected_item["result"]),
+            ]
+        )
         return "\n".join(lines)
 class HabituationMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
