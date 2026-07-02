@@ -18,7 +18,7 @@ from .data import (
     analysis_cutoff_mask,
     apply_time_mask,
 )
-from .plotting import poster_boxplot, save_figure, set_poster_style, style_axes
+from .plotting import poster_boxplot, save_figure, set_poster_style, scale_axes_text, style_axes
 
 
 STATE_LABELS = ["small", "medium", "large", "extra_large", "not_visible"]
@@ -2039,12 +2039,81 @@ def _summary_panel_span(kind: str) -> tuple[int, int]:
     return 1, 1
 
 
+def _summary_panel_grid_placements(result: StatisticsResult, panel_keys: list[str], rows: int, cols: int) -> list[tuple[str, str, dict, int, int, int, int]]:
+    specs = _selected_summary_panel_specs(result, panel_keys)
+    spec_map = {slug: (slug, title, config) for slug, title, config in specs}
+    flat_keys = list(panel_keys)
+    total_slots = max(1, rows) * max(1, cols)
+    if len(flat_keys) < total_slots:
+        flat_keys.extend([None] * (total_slots - len(flat_keys)))
+    elif len(flat_keys) > total_slots:
+        flat_keys = flat_keys[:total_slots]
+    grid = [flat_keys[row * cols:(row + 1) * cols] for row in range(rows)]
+    visited: set[tuple[int, int]] = set()
+    placements: list[tuple[str, str, dict, int, int, int, int]] = []
+
+    for row in range(rows):
+        for col in range(cols):
+            slug = grid[row][col]
+            if slug is None or (row, col) in visited or slug not in spec_map:
+                continue
+            stack = [(row, col)]
+            component: set[tuple[int, int]] = set()
+            while stack:
+                rr, cc = stack.pop()
+                if (rr, cc) in visited:
+                    continue
+                if grid[rr][cc] != slug:
+                    continue
+                visited.add((rr, cc))
+                component.add((rr, cc))
+                if rr > 0:
+                    stack.append((rr - 1, cc))
+                if rr + 1 < rows:
+                    stack.append((rr + 1, cc))
+                if cc > 0:
+                    stack.append((rr, cc - 1))
+                if cc + 1 < cols:
+                    stack.append((rr, cc + 1))
+
+            if not component:
+                continue
+            row_min = min(rr for rr, _cc in component)
+            row_max = max(rr for rr, _cc in component)
+            col_min = min(cc for _rr, cc in component)
+            col_max = max(cc for _rr, cc in component)
+            expected_size = (row_max - row_min + 1) * (col_max - col_min + 1)
+            if len(component) != expected_size:
+                title = spec_map[slug][1]
+                raise ValueError(
+                    f"Summary panel '{title}' does not form a rectangle in the grid. "
+                    "Use the same panel in a contiguous rectangular block if you want it to span squares."
+                )
+            for rr in range(row_min, row_max + 1):
+                for cc in range(col_min, col_max + 1):
+                    if grid[rr][cc] != slug:
+                        title = spec_map[slug][1]
+                        raise ValueError(
+                            f"Summary panel '{title}' is repeated in a non-rectangular shape. "
+                            "Repeated panels must fill a complete rectangle to span multiple squares."
+                        )
+            placements.append((slug, spec_map[slug][1], spec_map[slug][2], row_min, col_min, row_max - row_min + 1, col_max - col_min + 1))
+    return placements
+
+
 def _summary_panel_axis_sharing(kind: str) -> tuple[bool, bool]:
     if kind in {"state_fraction_stacked", "progress_stacked", "lag"}:
         return True, True
     if kind == "animal_progress":
         return True, False
     return False, False
+
+
+def _summary_panel_text_scale(fig_width_cm: float, fig_height_cm: float, rows: int, cols: int, *, row_span: int = 1, col_span: int = 1) -> float:
+    panel_width_cm = fig_width_cm * max(1, col_span) / max(1, cols)
+    panel_height_cm = fig_height_cm * max(1, row_span) / max(1, rows)
+    scale = min(panel_width_cm / 10.0, panel_height_cm / 7.0)
+    return float(np.clip(scale, 0.55, 1.20))
 
 
 def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: dict, title: str, *, sharex=None, sharey=None) -> None:
@@ -2091,6 +2160,15 @@ def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: 
             include_not_visible=bool(config.get("include_not_visible", True)),
         )
         return
+    if kind == "lag":
+        _plot_lag_by_session(ax, result, sessions, title=title)
+        return
+    if kind == "animal_progress":
+        if config["metric"] == "locomotion":
+            _plot_animal_progress_lines(ax, result.locomotion_progress_by_animal_values, title=title, ylabel="Fraction", average_label="Average")
+        else:
+            _plot_animal_progress_lines(ax, result.pupil_zscore_progress_by_animal_values, title=title, ylabel="Mean z-score", average_label="Average")
+        return
     if kind == "progress":
         series = result.progress_series.get(config["series_key"], {})
         title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
@@ -2099,7 +2177,8 @@ def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: 
     if kind == "progress_stacked":
         series = result.progress_series.get(config["series_key"], {})
         title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
-        _plot_progress_stacked_area(ax, series, title=title, xlabel="Progress (%)", include_not_visible=bool(config.get("include_not_visible", False)))
+        xlabel = "Progress (%)" if series.get("kind") != "absolute_window" else "Minutes into 30-minute window"
+        _plot_progress_stacked_area(ax, series, title=title, xlabel=xlabel, include_not_visible=bool(config.get("include_not_visible", False)))
         return
     raise ValueError(f"Unknown summary panel kind: {kind}")
 
@@ -2122,31 +2201,38 @@ def _build_summary_figure(
         rows, cols = int(np.ceil(n_panels / 2)), 2
     else:
         rows, cols = int(np.ceil(n_panels / 3)), 3
-    placements: list[tuple[str, str, dict, int, int, int, int]] = []
-    row = 0
-    col = 0
-    max_row = 0
-    for slug, title, config in specs:
-        row_span, col_span = _summary_panel_span(config["kind"])
-        col_span = min(col_span, cols)
-        if col + col_span > cols:
-            row += 1
-            col = 0
-        placements.append((slug, title, config, row, col, row_span, col_span))
-        max_row = max(max_row, row + row_span)
-        col += col_span
-        if col >= cols:
-            row += row_span
-            col = 0
-    rows = max(rows, max_row, 1)
+
     if figure_size_cm is None:
         fig_width = 8.5 * cols
         fig_height = 5.8 * rows
     else:
         fig_width, fig_height = float(figure_size_cm[0]), float(figure_size_cm[1])
     fig = Figure(figsize=(fig_width / 2.54, fig_height / 2.54), constrained_layout=True)
+    summary_scale = _summary_panel_text_scale(fig_width, fig_height, rows, cols)
     grid = fig.add_gridspec(rows, cols, wspace=0.30, hspace=0.42)
     share_axes: dict[tuple[str, str], object] = {}
+
+    if panel_keys is not None and grid_shape is not None:
+        placements = _summary_panel_grid_placements(result, panel_keys, rows, cols)
+    else:
+        placements = []
+        row = 0
+        col = 0
+        max_row = 0
+        for slug, title, config in specs:
+            row_span, col_span = _summary_panel_span(config["kind"])
+            col_span = min(col_span, cols)
+            if col + col_span > cols:
+                row += 1
+                col = 0
+            placements.append((slug, title, config, row, col, row_span, col_span))
+            max_row = max(max_row, row + row_span)
+            col += col_span
+            if col >= cols:
+                row += row_span
+                col = 0
+        rows = max(rows, max_row, 1)
+
     for _, title, config, r, c, row_span, col_span in placements:
         kind = config["kind"]
         sharex_enabled, sharey_enabled = _summary_panel_axis_sharing(kind)
@@ -2154,11 +2240,13 @@ def _build_summary_figure(
         sharey = share_axes.get((kind, "y")) if sharey_enabled else None
         subspec = grid[r:r + row_span, c:c + col_span]
         _draw_summary_panel(fig, subspec, result, config, title, sharex=sharex, sharey=sharey)
+        panel_scale = _summary_panel_text_scale(fig_width, fig_height, rows, cols, row_span=row_span, col_span=col_span)
+        scale_axes_text(fig.axes[-1], scale=panel_scale)
         if sharex_enabled and (kind, "x") not in share_axes:
             share_axes[(kind, "x")] = fig.axes[-1]
         if sharey_enabled and (kind, "y") not in share_axes:
             share_axes[(kind, "y")] = fig.axes[-1]
-    fig.suptitle(f"Habituation statistics - {result.scope} / {result.animal_id}", y=1.02)
+    fig.suptitle(f"Habituation statistics - {result.scope} / {result.animal_id}", y=1.02, fontsize=float(np.clip(24 * summary_scale, 12.0, 28.0)))
     return fig
 
 def save_statistics_summary_figure(
@@ -2179,7 +2267,7 @@ def save_statistics_summary_figure(
     return save_figure(fig, "statistics_summary", output_dir)
 
 
-def save_statistics_outputs(store: HabituationStore, result: StatisticsResult, *, summary_panel_keys: list[str] | None = None) -> tuple[Path, Path, Path]:
+def save_statistics_outputs(store: HabituationStore, result: StatisticsResult, *, summary_panel_keys: list[str] | None = None, summary_figure_size_cm: tuple[float, float] | None = None, summary_grid_shape: tuple[int, int] | None = None) -> tuple[Path, Path, Path]:
     set_poster_style()
     scope_dir = store.source_root / "gui_output" / "stats"
     scope_dir.mkdir(parents=True, exist_ok=True)
@@ -2197,7 +2285,7 @@ def save_statistics_outputs(store: HabituationStore, result: StatisticsResult, *
     settings["last_stats_output_dir"] = str(output_dir)
     store.set_animal_settings(result.animal_id, settings)
 
-    svg_path, png_path = save_statistics_summary_figure(output_dir, result, summary_panel_keys=summary_panel_keys)
+    svg_path, png_path = save_statistics_summary_figure(output_dir, result, summary_panel_keys=summary_panel_keys, summary_figure_size_cm=summary_figure_size_cm, summary_grid_shape=summary_grid_shape)
 
     specs = _statistics_panel_specs(result)
     for idx, (slug, title, config) in enumerate(specs, start=1):

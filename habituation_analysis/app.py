@@ -2658,8 +2658,22 @@ class StatisticsTab(QWidget):
     def _summary_panel_spec_items(self, result) -> list[tuple[str, str, dict]]:
         return list(statistics_summary_panel_specs(result))
 
+    def _saved_summary_scheme(self) -> dict | None:
+        scheme = self.store.settings.get("global", {}).get("summary_figure_scheme")
+        return scheme if isinstance(scheme, dict) else None
+
+    def _store_summary_scheme(self, options: dict) -> None:
+        self.store.settings.setdefault("global", {})
+        self.store.settings["global"]["summary_figure_scheme"] = {
+            "panel_keys": list(options.get("panel_keys", [])),
+            "figure_size_cm": [float(v) for v in options.get("figure_size_cm", (18.0, 14.0))],
+            "grid_shape": [int(v) for v in options.get("grid_shape", (1, 1))],
+        }
+        self.store.save_settings()
+
     def _choose_summary_panels(self, result) -> dict | None:
         specs = self._summary_panel_spec_items(result)
+        saved_scheme = self._saved_summary_scheme()
         if not specs:
             return {
                 "panel_keys": [],
@@ -2668,6 +2682,12 @@ class StatisticsTab(QWidget):
             }
 
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            if saved_scheme is not None:
+                return {
+                    "panel_keys": list(saved_scheme.get("panel_keys", [])),
+                    "figure_size_cm": tuple(saved_scheme.get("figure_size_cm", (18.0, 14.0))),
+                    "grid_shape": tuple(saved_scheme.get("grid_shape", (1, 1))),
+                }
             panel_count = len(specs)
             cols = 1 if panel_count <= 2 else 2 if panel_count <= 6 else 3
             rows = int(np.ceil(max(1, panel_count) / cols))
@@ -2685,7 +2705,8 @@ class StatisticsTab(QWidget):
 
         intro = QLabel(
             "Choose the summary figure size and grid. Then assign a panel to each square. "
-            "Leave a square as Empty to keep it blank.",
+            "Leave a square as Empty to keep it blank. Repeating the same panel across adjacent "
+            "squares will make that panel span those squares.",
             dialog,
         )
         intro.setWordWrap(True)
@@ -2713,19 +2734,33 @@ class StatisticsTab(QWidget):
         cols_spin.setRange(1, 20)
 
         default_count = len(specs)
+        saved_panel_keys = list(saved_scheme.get("panel_keys", [])) if isinstance(saved_scheme, dict) else []
+        saved_figure_size_cm = saved_scheme.get("figure_size_cm") if isinstance(saved_scheme, dict) else None
+        saved_grid_shape = saved_scheme.get("grid_shape") if isinstance(saved_scheme, dict) else None
         default_cols = 1 if default_count <= 2 else 2 if default_count <= 6 else 3
         default_rows = int(np.ceil(max(1, default_count) / default_cols))
 
-        width_spin.setValue(float(21.0 * default_cols))
-        height_spin.setValue(float(14.5 * default_rows))
-        rows_spin.setValue(default_rows)
-        cols_spin.setValue(default_cols)
+        if isinstance(saved_figure_size_cm, (list, tuple)) and len(saved_figure_size_cm) == 2:
+            width_spin.setValue(float(saved_figure_size_cm[0]))
+            height_spin.setValue(float(saved_figure_size_cm[1]))
+        else:
+            width_spin.setValue(float(21.0 * default_cols))
+            height_spin.setValue(float(14.5 * default_rows))
+        if isinstance(saved_grid_shape, (list, tuple)) and len(saved_grid_shape) == 2:
+            rows_spin.setValue(max(1, int(saved_grid_shape[0])))
+            cols_spin.setValue(max(1, int(saved_grid_shape[1])))
+        else:
+            rows_spin.setValue(default_rows)
+            cols_spin.setValue(default_cols)
 
         settings_layout.addRow("Width", width_spin)
         settings_layout.addRow("Height", height_spin)
         settings_layout.addRow("Rows", rows_spin)
         settings_layout.addRow("Columns", cols_spin)
         layout.addWidget(settings_group)
+        remember_check = QCheckBox("Remember this scheme for future summary figures", dialog)
+        remember_check.setChecked(bool(saved_scheme))
+        layout.addWidget(remember_check)
 
         status_label = QLabel("", dialog)
         status_label.setWordWrap(True)
@@ -2763,6 +2798,8 @@ class StatisticsTab(QWidget):
 
         def _rebuild_grid():
             previous = _grid_panel_keys()
+            if not combo_grid and saved_panel_keys:
+                previous = list(saved_panel_keys)
             _clear_grid_layout()
             combo_grid.clear()
 
@@ -2802,7 +2839,6 @@ class StatisticsTab(QWidget):
 
         def _refresh_status():
             keys = _selected_non_empty_keys()
-            duplicates = sorted({key for key in keys if keys.count(key) > 1})
             create_button.setEnabled(False)
 
             if not keys:
@@ -2810,20 +2846,20 @@ class StatisticsTab(QWidget):
                 status_label.setStyleSheet("color: #b00020; font-weight: 600;")
                 return
 
-            if duplicates:
-                duplicate_titles = []
-                for duplicate in duplicates:
-                    title = next((title for slug, title, _config in specs if slug == duplicate), duplicate)
-                    duplicate_titles.append(title)
-                status_label.setText(
-                    "Each panel can only be used once. Duplicates: "
-                    + ", ".join(duplicate_titles)
-                )
-                status_label.setStyleSheet("color: #b00020; font-weight: 600;")
-                return
-
             total_slots = int(rows_spin.value()) * int(cols_spin.value())
-            status_label.setText(f"Assigned panels: {len(keys)}; grid slots: {total_slots}. Empty slots are allowed.")
+            repeated = sorted({key for key in keys if keys.count(key) > 1})
+            if repeated:
+                repeated_titles = []
+                for duplicate in repeated:
+                    title = next((title for slug, title, _config in specs if slug == duplicate), duplicate)
+                    repeated_titles.append(title)
+                status_label.setText(
+                    "Repeated panels will span adjacent squares when they form a rectangle. "
+                    f"Assigned panels: {len(keys)}; grid slots: {total_slots}. Repeated: "
+                    + ", ".join(repeated_titles)
+                )
+            else:
+                status_label.setText(f"Assigned panels: {len(keys)}; grid slots: {total_slots}. Empty slots are allowed.")
             status_label.setStyleSheet("color: #1b5e20; font-weight: 600;")
             create_button.setEnabled(True)
 
@@ -2879,6 +2915,7 @@ class StatisticsTab(QWidget):
         return {
             "panel_keys": panel_keys,
             "figure_size_cm": (float(width_spin.value()), float(height_spin.value())),
+            "remember_scheme": bool(remember_check.isChecked()),
             "grid_shape": (int(rows_spin.value()), int(cols_spin.value())),
         }
 
@@ -2900,9 +2937,12 @@ class StatisticsTab(QWidget):
                 summary_figure_size_cm=options["figure_size_cm"],
                 summary_grid_shape=options["grid_shape"],
             )
+            if options.get("remember_scheme"):
+                self._store_summary_scheme(options)
         except Exception as exc:
             QMessageBox.warning(self, "Customize summary figure", str(exc))
             return
+
 
         self._current_paths = (self._current_paths[0], svg_path, png_path)
         self._paths_label.setText(f"Saved: {self._current_paths[0]}\nSVG: {svg_path}\nPNG: {png_path}")
@@ -3085,6 +3125,7 @@ class StatisticsTab(QWidget):
         }
 
     def _build_statistics_job(self, scope: str, *, force_recompute: bool = True):
+        summary_scheme = self._saved_summary_scheme()
         percentiles, threshold_values, locomotion_threshold, missing_buffer_sec = self._threshold_inputs_for_animal(scope)
         thresholds = self._threshold_payload(percentiles, threshold_values, locomotion_threshold, missing_buffer_sec)
 
@@ -3110,12 +3151,13 @@ class StatisticsTab(QWidget):
                 missing_buffer_sec=missing_buffer_sec,
                 progress_cb=progress_cb,
             )
-            result_paths = save_statistics_outputs(self.store, result)
+            result_paths = save_statistics_outputs(self.store, result, summary_panel_keys=list(summary_scheme.get("panel_keys", [])) if isinstance(summary_scheme, dict) else None, summary_figure_size_cm=(tuple(summary_scheme.get("figure_size_cm")) if isinstance(summary_scheme, dict) and isinstance(summary_scheme.get("figure_size_cm"), (list, tuple)) and len(summary_scheme.get("figure_size_cm")) == 2 else None), summary_grid_shape=(tuple(summary_scheme.get("grid_shape")) if isinstance(summary_scheme, dict) and isinstance(summary_scheme.get("grid_shape"), (list, tuple)) and len(summary_scheme.get("grid_shape")) == 2 else None))
             return {"result": result, "paths": result_paths, "cached": False}
 
         return job
 
     def _build_all_statistics_job(self, animals: list[str], mode: str):
+        summary_scheme = self._saved_summary_scheme()
         threshold_inputs = {animal: self._threshold_inputs_for_animal(animal) for animal in animals}
 
         def job(progress_cb):
@@ -3161,7 +3203,7 @@ class StatisticsTab(QWidget):
                     missing_buffer_sec=missing_buffer_sec,
                     progress_cb=animal_progress,
                 )
-                result_paths = save_statistics_outputs(self.store, result)
+                result_paths = save_statistics_outputs(self.store, result, summary_panel_keys=list(summary_scheme.get("panel_keys", [])) if isinstance(summary_scheme, dict) else None, summary_figure_size_cm=(tuple(summary_scheme.get("figure_size_cm")) if isinstance(summary_scheme, dict) and isinstance(summary_scheme.get("figure_size_cm"), (list, tuple)) and len(summary_scheme.get("figure_size_cm")) == 2 else None), summary_grid_shape=(tuple(summary_scheme.get("grid_shape")) if isinstance(summary_scheme, dict) and isinstance(summary_scheme.get("grid_shape"), (list, tuple)) and len(summary_scheme.get("grid_shape")) == 2 else None))
                 outputs.append(
                     {
                         "animal_id": animal,

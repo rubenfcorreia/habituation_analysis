@@ -99,6 +99,44 @@ def style_axes(
     return ax
 
 
+def _clamp_font_size(value: float, *, minimum: float, maximum: float) -> float:
+    return float(max(minimum, min(maximum, float(value))))
+
+
+def scale_axes_text(ax, *, scale: float) -> None:
+    """Scale title, labels, tick labels, legends, and annotations for an axes."""
+    try:
+        scale = float(scale)
+    except Exception:
+        scale = 1.0
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+
+    title_size = _clamp_font_size(POSTER_TITLE_SIZE * scale, minimum=10.0, maximum=28.0)
+    label_size = _clamp_font_size(POSTER_LABEL_SIZE * scale, minimum=9.0, maximum=22.0)
+    tick_size = _clamp_font_size(POSTER_FONT_SIZE * scale, minimum=8.0, maximum=18.0)
+    legend_size = _clamp_font_size(POSTER_LEGEND_SIZE * scale, minimum=8.0, maximum=16.0)
+    note_size = _clamp_font_size(POSTER_NOTE_SIZE * scale, minimum=7.0, maximum=14.0)
+    if ax.title.get_text():
+        ax.title.set_fontsize(title_size)
+    if ax.xaxis.label.get_text():
+        ax.xaxis.label.set_fontsize(label_size)
+    if ax.yaxis.label.get_text():
+        ax.yaxis.label.set_fontsize(label_size)
+    for tick in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+        tick.set_fontsize(tick_size)
+    for text in ax.texts:
+        if text is ax.title or text is ax.xaxis.label or text is ax.yaxis.label:
+            continue
+        text.set_fontsize(note_size)
+    legend = ax.get_legend()
+    if legend is not None:
+        for text in legend.get_texts():
+            text.set_fontsize(legend_size)
+        title = legend.get_title()
+        if title is not None and title.get_text():
+            title.set_fontsize(legend_size)
+
 def set_sparse_numeric_ticks(ax, *, xbins: int = 6, ybins: int = 5) -> None:
     ax.xaxis.set_major_locator(MaxNLocator(nbins=xbins, prune=None))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=ybins, prune=None))
