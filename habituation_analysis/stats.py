@@ -2349,9 +2349,6 @@ def _build_summary_figure(
     summary_scale = _summary_panel_text_scale(fig_width, fig_height, rows, cols)
     fixed_panel_scale = summary_scale
 
-    grid = fig.add_gridspec(rows, cols, wspace=0.30, hspace=0.42)
-    share_axes: dict[tuple[str, str], object] = {}
-
     if panel_keys is not None and grid_shape is not None:
         placements = _summary_panel_grid_placements(result, panel_keys, rows, cols)
     else:
@@ -2378,6 +2375,18 @@ def _build_summary_figure(
 
         rows = max(rows, max_row, 1)
 
+    # Add one extra bottom row dedicated to the shared legend.
+    # This is more stable than fig.legend(..., bbox_to_anchor=...) because
+    # constrained_layout knows this row exists.
+    grid = fig.add_gridspec(
+        rows + 1,
+        cols,
+        height_ratios=[1.0] * rows + [0.10],
+        wspace=0.30,
+        hspace=0.42,
+    )
+    share_axes: dict[tuple[str, str], object] = {}
+
     for _, title, config, r, c, row_span, col_span in placements:
         kind = config["kind"]
 
@@ -2391,7 +2400,6 @@ def _build_summary_figure(
         panel_scale = fixed_panel_scale
 
         # Summary-only boxplot point scaling.
-        # Lower numerator = smaller raw points and mean/median markers.
         point_scale = float(np.clip(0.35 / max(panel_scale, 1e-6), 0.20, 0.45))
 
         _draw_summary_panel(
@@ -2405,12 +2413,44 @@ def _build_summary_figure(
             point_scale=point_scale,
         )
 
-        scale_axes_text(fig.axes[-1], scale=panel_scale)
+        ax = fig.axes[-1]
+
+        # Remove per-panel legends in the summary figure only.
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.remove()
+
+        scale_axes_text(ax, scale=panel_scale)
 
         if sharex_enabled and (kind, "x") not in share_axes:
-            share_axes[(kind, "x")] = fig.axes[-1]
+            share_axes[(kind, "x")] = ax
         if sharey_enabled and (kind, "y") not in share_axes:
-            share_axes[(kind, "y")] = fig.axes[-1]
+            share_axes[(kind, "y")] = ax
+
+    # Dedicated bottom legend axis.
+    legend_ax = fig.add_subplot(grid[rows, :])
+    legend_ax.set_axis_off()
+
+    shared_labels = list(reversed(STATE_LABELS))
+    shared_handles = [
+        Patch(
+            facecolor=STATE_COLORS[STATE_LABELS.index(label)],
+            edgecolor="none",
+            label=label,
+        )
+        for label in shared_labels
+    ]
+
+    legend_ax.legend(
+        handles=shared_handles,
+        labels=shared_labels,
+        loc="center",
+        ncol=len(shared_labels),
+        frameon=False,
+        fontsize=float(np.clip(15.0 * fixed_panel_scale, 7.0, 13.0)),
+        handlelength=1.4,
+        columnspacing=1.0,
+    )
 
     fig.suptitle(
         f"Habituation statistics - {result.scope} / {result.animal_id}",

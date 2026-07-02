@@ -390,12 +390,12 @@ def save_figure(fig, stem: str, output_dir: str | Path) -> tuple[Path, Path]:
             "ps.fonttype": 42,
         }
     ):
-        fig.savefig(svg_path, bbox_inches="tight", pad_inches=0.22)
+        fig.savefig(svg_path, bbox_inches="tight", pad_inches=0.32)
 
     fig.savefig(
         png_path,
         bbox_inches="tight",
-        pad_inches=0.22,
+        pad_inches=0.32,
         dpi=POSTER_DPI,
     )
     return svg_path, png_path
