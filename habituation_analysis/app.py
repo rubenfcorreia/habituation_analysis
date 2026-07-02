@@ -2392,8 +2392,8 @@ class StatisticsTab(QWidget):
         self.viewer_mode_combo = ScrollableComboBox(self, visible_rows=4)
         self.viewer_mode_combo.addItem("All sessions, include no_pupil", ("all", True))
         self.viewer_mode_combo.addItem("All sessions, exclude no_pupil", ("all", False))
-        self.viewer_mode_combo.addItem("7 sessions, include no_pupil", ("le7", True))
-        self.viewer_mode_combo.addItem("7 sessions, exclude no_pupil", ("le7", False))
+        self.viewer_mode_combo.addItem("6 sessions, include no_pupil", ("le6", True))
+        self.viewer_mode_combo.addItem("6 sessions, exclude no_pupil", ("le6", False))
         self.viewer_mode_combo.setToolTip(
             "Choose which stats viewer pages are shown. This does not change the summary figure."
         )
@@ -2513,9 +2513,9 @@ class StatisticsTab(QWidget):
         match = re.match(r"^statistics_panel_\d+_(.+)$", stem)
         slug = match.group(1) if match else stem
         include_not_visible: bool | None = None
-        if slug.endswith("_le7"):
-            slug = slug[: -len("_le7")]
-            subset = "le7"
+        if slug.endswith("_le6"):
+            slug = slug[: -len("_le6")]
+            subset = "le6"
         else:
             subset = "all"
         if slug.endswith("_with_not_visible"):
@@ -2537,8 +2537,8 @@ class StatisticsTab(QWidget):
         subset_groups: dict[str, list[tuple[str, Path, str, bool | None]]] = {}
         for variant in variants:
             subset_groups.setdefault(variant[2], []).append(variant)
-        if subset_mode == "le7" and "le7" in subset_groups:
-            chosen_subset = "le7"
+        if subset_mode == "le6" and "le6" in subset_groups:
+            chosen_subset = "le6"
         elif "all" in subset_groups:
             chosen_subset = "all"
         else:

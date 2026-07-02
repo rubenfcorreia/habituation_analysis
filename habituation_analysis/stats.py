@@ -1089,7 +1089,7 @@ def compute_statistics(
 
 
 
-SESSION_INDEX_LIMIT = 7
+SESSION_INDEX_LIMIT = 6
 
 
 def _finite_series(values) -> np.ndarray:
@@ -1807,16 +1807,16 @@ def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, di
 
     session_specs = [
         ("locomotion_boxplot", "Locomotion by session", {"kind": "session_boxplot", "metric": "locomotion", "subset": None}),
-        ("locomotion_boxplot_le7", "Locomotion by session (<= 7)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le7"}),
+        ("locomotion_boxplot_le6", "Locomotion by session (<= 6)", {"kind": "session_boxplot", "metric": "locomotion", "subset": "le6"}),
         ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion", "subset": None}),
-        ("face_motion_boxplot_le7", "Face motion by session (<= 7)", {"kind": "session_boxplot", "metric": "face_motion", "subset": "le7"}),
+        ("face_motion_boxplot_le6", "Face motion by session (<= 6)", {"kind": "session_boxplot", "metric": "face_motion", "subset": "le6"}),
         ("pupil_zscore_by_state", "Mean z-scored pupil size by state", {"kind": "state_zscore_boxplot"}),
         ("pupil_state_fraction_by_session", "Pupil state percentage by session (including not visible)", {"kind": "state_fraction", "subset": None, "labels": list(reversed(STATE_LABELS)), "include_not_visible": True}),
-        ("pupil_state_fraction_by_session_le7", "Pupil state percentage by session (including not visible, <= 7)", {"kind": "state_fraction", "subset": "le7", "labels": list(reversed(STATE_LABELS)), "include_not_visible": True}),
+        ("pupil_state_fraction_by_session_le6", "Pupil state percentage by session (including not visible, <= 6)", {"kind": "state_fraction", "subset": "le6", "labels": list(reversed(STATE_LABELS)), "include_not_visible": True}),
         ("pupil_state_fraction_by_session_without_not_visible", "Pupil state percentage by session (excluding not visible)", {"kind": "state_fraction", "subset": None, "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
-        ("pupil_state_fraction_by_session_without_not_visible_le7", "Pupil state percentage by session (excluding not visible, <= 7)", {"kind": "state_fraction", "subset": "le7", "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
+        ("pupil_state_fraction_by_session_without_not_visible_le6", "Pupil state percentage by session (excluding not visible, <= 6)", {"kind": "state_fraction", "subset": "le6", "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
         ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked", "subset": None, "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
-        ("pupil_state_fraction_by_session_stacked_le7", "Pupil state fraction by session (stacked area, <= 7)", {"kind": "state_fraction_stacked", "subset": "le7", "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
+        ("pupil_state_fraction_by_session_stacked_le6", "Pupil state fraction by session (stacked area, <= 6)", {"kind": "state_fraction_stacked", "subset": "le6", "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
         ("pupil_state_fraction_pie_with_not_visible", "Overall pupil state percentages (including not visible)", {"kind": "state_fraction_pie", "include_not_visible": True}),
         ("pupil_state_fraction_pie_without_not_visible", "Overall pupil state percentages (excluding not visible)", {"kind": "state_fraction_pie", "include_not_visible": False}),
     ]
@@ -1827,9 +1827,9 @@ def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, di
             {"kind": "single_state", "state_label": label, "subset": None, "include_not_visible": True},
         ))
         session_specs.append((
-            f"pupil_state_fraction_by_session_{label}_with_not_visible_le7",
-            f"Pupil state fraction by session - {label} (including not visible, <= 7)",
-            {"kind": "single_state", "state_label": label, "subset": "le7", "include_not_visible": True},
+            f"pupil_state_fraction_by_session_{label}_with_not_visible_le6",
+            f"Pupil state fraction by session - {label} (including not visible, <= 6)",
+            {"kind": "single_state", "state_label": label, "subset": "le6", "include_not_visible": True},
         ))
         if label != "not_visible":
             session_specs.append((
@@ -1838,14 +1838,14 @@ def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, di
                 {"kind": "single_state", "state_label": label, "subset": None, "include_not_visible": False},
             ))
             session_specs.append((
-                f"pupil_state_fraction_by_session_{label}_without_not_visible_le7",
-                f"Pupil state fraction by session - {label} (excluding not visible, <= 7)",
-                {"kind": "single_state", "state_label": label, "subset": "le7", "include_not_visible": False},
+                f"pupil_state_fraction_by_session_{label}_without_not_visible_le6",
+                f"Pupil state fraction by session - {label} (excluding not visible, <= 6)",
+                {"kind": "single_state", "state_label": label, "subset": "le6", "include_not_visible": False},
             ))
     session_specs.extend(
         [
             ("lag_by_state", "Lag to first pupil state after 1 min by session", {"kind": "lag", "subset": None}),
-            ("lag_by_state_le7", "Lag to first pupil state after 1 min by session (<= 7)", {"kind": "lag", "subset": "le7"}),
+            ("lag_by_state_le6", "Lag to first pupil state after 1 min by session (<= 6)", {"kind": "lag", "subset": "le6"}),
         ]
     )
     specs.extend(session_specs)
@@ -1867,12 +1867,10 @@ def _statistics_panel_specs(result: StatisticsResult) -> list[tuple[str, str, di
                 f"Pupil state fraction by session - {label} (excluding not visible)",
                 {"kind": "single_state", "state_label": label, "subset": None, "include_not_visible": False},
             ))
-    if "first_2" in result.progress_series:
-        specs.append(("state_fraction_first_2_sessions_stacked", "Pupil state fraction vs experiment length - first 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": False}))
-        specs.append(("state_fraction_first_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - first 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": True}))
-    if "last_2" in result.progress_series:
-        specs.append(("state_fraction_last_2_sessions_stacked", "Pupil state fraction vs experiment length - last 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": False}))
-        specs.append(("state_fraction_last_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - last 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": True}))
+    specs.append(("state_fraction_first_2_sessions_stacked_le6", "Pupil state fraction vs experiment length - first 2 sessions (stacked area, <= 6)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": False}))
+    specs.append(("state_fraction_first_2_sessions_stacked_with_not_visible_le6", "Pupil state fraction vs experiment length - first 2 sessions (stacked area, including not visible, <= 6)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": True}))
+    specs.append(("state_fraction_last_2_sessions_stacked_le6", "Pupil state fraction vs experiment length - last 2 sessions (stacked area, <= 6)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": False}))
+    specs.append(("state_fraction_last_2_sessions_stacked_with_not_visible_le6", "Pupil state fraction vs experiment length - last 2 sessions (stacked area, including not visible, <= 6)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": True}))
     return specs
 
 
@@ -2017,34 +2015,12 @@ def _build_statistics_panel_figures(result: StatisticsResult) -> list[Figure]:
 
 
 def _summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
-    specs: list[tuple[str, str, dict]] = []
+    return _statistics_panel_specs(result)
 
-    specs.extend([
-        ("locomotion_boxplot", "Locomotion by session", {"kind": "session_boxplot", "metric": "locomotion", "subset": None}),
-        ("face_motion_boxplot", "Face motion by session", {"kind": "session_boxplot", "metric": "face_motion", "subset": None}),
-        ("pupil_zscore_by_state", "Mean z-scored pupil size by state", {"kind": "state_zscore_boxplot"}),
-        ("pupil_state_fraction_by_session", "Pupil state percentage by session (including not visible)", {"kind": "state_fraction", "subset": None, "labels": STATE_LABELS, "include_not_visible": True}),
-        ("pupil_state_fraction_by_session_without_not_visible", "Pupil state percentage by session (excluding not visible)", {"kind": "state_fraction", "subset": None, "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
-        ("pupil_state_fraction_by_session_stacked", "Pupil state fraction by session (stacked area)", {"kind": "state_fraction_stacked", "subset": None, "labels": _state_labels_for_combined_plot(), "include_not_visible": False}),
-        ("pupil_state_fraction_pie_with_not_visible", "Overall pupil state percentages (including not visible)", {"kind": "state_fraction_pie", "include_not_visible": True}),
-        ("pupil_state_fraction_pie_without_not_visible", "Overall pupil state percentages (excluding not visible)", {"kind": "state_fraction_pie", "include_not_visible": False}),
-        ("lag_by_state", "Lag to first pupil state after 1 min by session", {"kind": "lag", "subset": None}),
-        ("locomotion_progress", "Locomotion progression across sessions", {"kind": "animal_progress", "metric": "locomotion"}),
-        ("pupil_size_progress", "Mean z-scored pupil size progression across sessions", {"kind": "animal_progress", "metric": "pupil_zscore"}),
-        ("state_fraction_stacked", "Pupil state fraction vs experiment length (stacked area)", {"kind": "progress_stacked", "series_key": "overall", "include_not_visible": False}),
-        ("state_fraction_stacked_with_not_visible", "Pupil state fraction vs experiment length (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "overall", "include_not_visible": True}),
-    ])
-    specs.extend(_progress_window_specs(result))
-    if "first_2" in result.progress_series:
-        specs.append(("state_fraction_first_2_sessions_stacked", "Pupil state fraction vs experiment length - first 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": False}))
-        specs.append(("state_fraction_first_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - first 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "first_2", "include_not_visible": True}))
-    if "last_2" in result.progress_series:
-        specs.append(("state_fraction_last_2_sessions_stacked", "Pupil state fraction vs experiment length - last 2 sessions (stacked area)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": False}))
-        specs.append(("state_fraction_last_2_sessions_stacked_with_not_visible", "Pupil state fraction vs experiment length - last 2 sessions (stacked area, including not visible)", {"kind": "progress_stacked", "series_key": "last_2", "include_not_visible": True}))
-    return specs
 
 def statistics_summary_panel_specs(result: StatisticsResult) -> list[tuple[str, str, dict]]:
     return _summary_panel_specs(result)
+
 
 
 def _selected_summary_panel_specs(result: StatisticsResult, panel_keys: list[str] | None) -> list[tuple[str, str, dict]]:
@@ -2105,14 +2081,15 @@ def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: 
     if kind == "state_fraction_stacked":
         _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot(), include_not_visible=bool(config.get("include_not_visible", False)))
         return
-    if kind == "lag":
-        _plot_lag_by_session(ax, result, sessions, title=title)
-        return
-    if kind == "animal_progress":
-        if config["metric"] == "locomotion":
-            _plot_animal_progress_lines(ax, result.locomotion_progress_by_animal_values, title=title, ylabel="Fraction", average_label="Average")
-        else:
-            _plot_animal_progress_lines(ax, result.pupil_zscore_progress_by_animal_values, title=title, ylabel="Mean z-score", average_label="Average")
+    if kind == "single_state":
+        _plot_single_state_fraction_by_session(
+            ax,
+            result,
+            sessions,
+            title=title,
+            state_label=config["state_label"],
+            include_not_visible=bool(config.get("include_not_visible", True)),
+        )
         return
     if kind == "progress":
         series = result.progress_series.get(config["series_key"], {})
@@ -2141,7 +2118,7 @@ def _build_summary_figure(
         cols = max(1, int(grid_shape[1]))
     elif n_panels <= 2:
         rows, cols = 1, 1
-    elif n_panels <= 7:
+    elif n_panels <= 6:
         rows, cols = int(np.ceil(n_panels / 2)), 2
     else:
         rows, cols = int(np.ceil(n_panels / 3)), 3
