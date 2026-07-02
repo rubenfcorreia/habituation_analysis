@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import re
 import os
 import traceback
 from dataclasses import dataclass, replace
@@ -2356,6 +2357,7 @@ class StatisticsTab(QWidget):
         self._prompted_for_entry = False
         self._current_result = None
         self._current_paths: tuple[Path, Path, Path] | None = None
+        self._current_output_dir: Path | None = None
         self._plot_pages: list[tuple[str, Path]] = []
         self._plot_index = 0
 
@@ -2386,6 +2388,16 @@ class StatisticsTab(QWidget):
         self._plot_title_label = QLabel("No plot selected.", self)
         self._plot_title_label.setAlignment(Qt.AlignCenter)
         self._plot_title_label.setWordWrap(True)
+
+        self.viewer_mode_combo = ScrollableComboBox(self, visible_rows=4)
+        self.viewer_mode_combo.addItem("All sessions, include no_pupil", ("all", True))
+        self.viewer_mode_combo.addItem("All sessions, exclude no_pupil", ("all", False))
+        self.viewer_mode_combo.addItem("7 sessions, include no_pupil", ("le7", True))
+        self.viewer_mode_combo.addItem("7 sessions, exclude no_pupil", ("le7", False))
+        self.viewer_mode_combo.setToolTip(
+            "Choose which stats viewer pages are shown. This does not change the summary figure."
+        )
+        self.viewer_mode_combo.currentIndexChanged.connect(self._on_viewer_mode_changed)
 
         self.figure_label = QLabel("No statistics figure yet.", self)
         self.figure_label.setAlignment(Qt.AlignCenter)
@@ -2440,6 +2452,11 @@ class StatisticsTab(QWidget):
         layout.addWidget(self.log_toggle, alignment=Qt.AlignLeft)
         layout.addWidget(self.log_panel, stretch=1)
         layout.addWidget(self._plot_title_label)
+        viewer_row = QHBoxLayout()
+        viewer_row.addWidget(QLabel("Viewer mode", self))
+        viewer_row.addWidget(self.viewer_mode_combo)
+        viewer_row.addStretch(1)
+        layout.addLayout(viewer_row)
         layout.addWidget(self.figure_scroll, stretch=2)
 
         plot_nav = QHBoxLayout()
@@ -2477,14 +2494,90 @@ class StatisticsTab(QWidget):
         self._paths_label.setText("")
         self._current_result = None
         self._current_paths = None
+        self._current_output_dir = None
         self.summary_customize_button.setEnabled(False)
         self._set_plot_pages([])
 
     def _set_log_visible(self, visible: bool):
         self.log_panel.setVisible(bool(visible))
 
+    def _viewer_mode(self) -> tuple[str, bool]:
+        data = self.viewer_mode_combo.currentData()
+        if isinstance(data, tuple) and len(data) == 2:
+            subset, include_not_visible = data
+            return str(subset), bool(include_not_visible)
+        return "all", True
+
+    def _plot_page_variant_info(self, path: Path) -> tuple[str, str, bool | None]:
+        stem = Path(path).stem
+        match = re.match(r"^statistics_panel_\d+_(.+)$", stem)
+        slug = match.group(1) if match else stem
+        include_not_visible: bool | None = None
+        if slug.endswith("_le7"):
+            slug = slug[: -len("_le7")]
+            subset = "le7"
+        else:
+            subset = "all"
+        if slug.endswith("_with_not_visible"):
+            slug = slug[: -len("_with_not_visible")]
+            include_not_visible = True
+        elif slug.endswith("_without_not_visible"):
+            slug = slug[: -len("_without_not_visible")]
+            include_not_visible = False
+        return slug, subset, include_not_visible
+
+    def _choose_variant_for_mode(
+        self,
+        variants: list[tuple[str, Path, str, bool | None]],
+        subset_mode: str,
+        include_not_visible: bool,
+    ) -> tuple[str, Path]:
+        if not variants:
+            raise ValueError("No plot variants available")
+        subset_groups: dict[str, list[tuple[str, Path, str, bool | None]]] = {}
+        for variant in variants:
+            subset_groups.setdefault(variant[2], []).append(variant)
+        if subset_mode == "le7" and "le7" in subset_groups:
+            chosen_subset = "le7"
+        elif "all" in subset_groups:
+            chosen_subset = "all"
+        else:
+            chosen_subset = next(iter(subset_groups))
+        chosen_variants = subset_groups[chosen_subset]
+        flag_variants = [variant for variant in chosen_variants if variant[3] is not None]
+        if not flag_variants:
+            return chosen_variants[0][0], chosen_variants[0][1]
+        preferred = [variant for variant in flag_variants if variant[3] == include_not_visible]
+        if preferred:
+            return preferred[0][0], preferred[0][1]
+        return flag_variants[0][0], flag_variants[0][1]
+
+    def _filter_plot_pages_for_viewer(self, pages: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+        subset_mode, include_not_visible = self._viewer_mode()
+        summary_pages: list[tuple[str, Path]] = []
+        grouped: dict[str, list[tuple[str, Path, str, bool | None]]] = {}
+        order: list[str] = []
+        for title, path in pages:
+            path = Path(path)
+            if not path.exists():
+                continue
+            if path.stem == "statistics_summary":
+                summary_pages.append((title, path))
+                continue
+            base_key, subset_key, not_visible_key = self._plot_page_variant_info(path)
+            grouped.setdefault(base_key, [])
+            if base_key not in order:
+                order.append(base_key)
+            grouped[base_key].append((title, path, subset_key, not_visible_key))
+        filtered = list(summary_pages)
+        for base_key in order:
+            title, path = self._choose_variant_for_mode(grouped[base_key], subset_mode, include_not_visible)
+            filtered.append((title, path))
+        return filtered
+
     def _set_plot_pages(self, pages: list[tuple[str, Path]]):
-        self._plot_pages = [(title, Path(path)) for title, path in pages if Path(path).exists()]
+        filtered_pages = self._filter_plot_pages_for_viewer([(title, Path(path)) for title, path in pages])
+        self._plot_pages = filtered_pages
         self._plot_index = 0
         self._show_current_plot_page()
 
@@ -2499,6 +2592,11 @@ class StatisticsTab(QWidget):
             if summary_path.exists():
                 pages.append(("Statistics summary", summary_path))
         self._set_plot_pages(pages)
+
+    def _on_viewer_mode_changed(self, _index: int):
+        if self._current_output_dir is None:
+            return
+        self._load_plot_pages_from_output_dir(self._current_output_dir)
 
     def _show_current_plot_page(self):
         if not self._plot_pages:
@@ -2554,7 +2652,8 @@ class StatisticsTab(QWidget):
         self._status_label.setText(f"{prefix} {result.scope} / {result.animal_id}")
         self._paths_label.setText(f"Saved: {result_path}\nSVG: {svg_path}\nPNG: {png_path}")
         self.summary_edit.setPlainText(self._format_result_text(result))
-        self._load_plot_pages_from_output_dir(Path(result_path).parent)
+        self._current_output_dir = Path(result_path).parent
+        self._load_plot_pages_from_output_dir(self._current_output_dir)
 
     def _summary_panel_spec_items(self, result) -> list[tuple[str, str, dict]]:
         return list(statistics_summary_panel_specs(result))
@@ -2651,7 +2750,7 @@ class StatisticsTab(QWidget):
                     widget.deleteLater()
 
         def _make_combo(default_slug: str | None = None) -> QComboBox:
-            combo = QComboBox(grid_container)
+            combo = ScrollableComboBox(grid_container, visible_rows=12)
             combo.addItem("Empty", None)
             for slug, title, _config in specs:
                 combo.addItem(title, slug)
