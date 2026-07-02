@@ -19,7 +19,7 @@ from .data import (
     apply_time_mask,
 )
 from .plotting import poster_boxplot, save_figure, set_poster_style, scale_axes_text, style_axes
-
+from matplotlib.patches import Patch
 
 STATE_LABELS = ["small", "medium", "large", "extra_large", "not_visible"]
 STATE_COLORS = ["tab:green", "tab:purple", "tab:red", "tab:brown", "tab:gray"]
@@ -1107,6 +1107,7 @@ def _boxplot(
     xlabel: str,
     ylabel: str,
     sample_sizes: list[int] | None = None,
+    point_scale: float = 1.0,
 ) -> None:
     poster_boxplot(
         ax,
@@ -1121,6 +1122,7 @@ def _boxplot(
         show_points=True,
         show_summary_markers=True,
         show_legend=False,
+        point_scale=point_scale,
     )
     if ylabel == "Fraction":
         ax.set_ylim(0.0, 1.0)
@@ -1273,6 +1275,7 @@ def _plot_session_metric_boxplot(
     ylabel: str,
     color: str,
     xlabel: str = "Session",
+    point_scale: float = 1.0,
 ) -> None:
     data = [_finite_series(metric_values_by_session.get(session, [])) for session in sessions]
     counts = [int(arr.size) for arr in data]
@@ -1285,6 +1288,7 @@ def _plot_session_metric_boxplot(
         xlabel=xlabel,
         ylabel=ylabel,
         sample_sizes=counts,
+        point_scale=point_scale,
     )
     if ylabel == "Fraction":
         ax.set_ylim(0.0, 1.0)
@@ -1915,9 +1919,25 @@ def _build_panel_figure(result: StatisticsResult, config: dict, title: str) -> F
         ax = fig.subplots()
         metric = config["metric"]
         if metric == "locomotion":
-            _plot_session_metric_boxplot(ax, result, sessions, result.locomotion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:blue")
+            _plot_session_metric_boxplot(
+                ax,
+                result,
+                sessions,
+                result.locomotion_pct_by_session_values,
+                title=title,
+                ylabel="Fraction",
+                color="tab:blue",
+            )
         else:
-            _plot_session_metric_boxplot(ax, result, sessions, result.face_motion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:orange")
+            _plot_session_metric_boxplot(
+                ax,
+                result,
+                sessions,
+                result.face_motion_pct_by_session_values,
+                title=title,
+                ylabel="Fraction",
+                color="tab:orange",
+            )
         return fig
     if kind == "state_zscore_boxplot":
         fig = Figure(figsize=(10, 6), constrained_layout=True)
@@ -1928,7 +1948,15 @@ def _build_panel_figure(result: StatisticsResult, config: dict, title: str) -> F
             include_not_visible=bool(config.get("include_not_visible", True)),
         )
         colors = _state_colors_for_labels(states)
-        _boxplot(ax, state_data, states, colors=colors, title=title, xlabel="Pupil state", ylabel="Mean z-score")
+        _boxplot(
+            ax,
+            state_data,
+            states,
+            colors=colors,
+            title=title,
+            xlabel="Pupil state",
+            ylabel="Mean z-score",
+        )
         return fig
     if kind == "state_fraction":
         sessions = _session_subset_for_config(result, config.get("subset"))
@@ -2116,25 +2144,74 @@ def _summary_panel_text_scale(fig_width_cm: float, fig_height_cm: float, rows: i
     return float(np.clip(scale, 0.55, 1.20))
 
 
-def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: dict, title: str, *, sharex=None, sharey=None) -> None:
+def _draw_summary_panel(
+    fig: Figure,
+    subspec,
+    result: StatisticsResult,
+    config: dict,
+    title: str,
+    *,
+    sharex=None,
+    sharey=None,
+    point_scale: float = 1.0,
+) -> None:
     kind = config["kind"]
+
     if kind == "state_fraction_pie":
-        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(result.pupil_pct_by_session, result.pupil_pct_by_session_visible)
-        labels = list(reversed(STATE_LABELS)) if bool(config.get("include_not_visible", True)) else _state_labels_for_combined_plot()
-        key = "with_not_visible" if bool(config.get("include_not_visible", True)) else "without_not_visible"
+        fractions = result.pupil_state_fraction_overall or _build_overall_pupil_state_fractions(
+            result.pupil_pct_by_session,
+            result.pupil_pct_by_session_visible,
+        )
+        labels = (
+            list(reversed(STATE_LABELS))
+            if bool(config.get("include_not_visible", True))
+            else _state_labels_for_combined_plot()
+        )
+        key = (
+            "with_not_visible"
+            if bool(config.get("include_not_visible", True))
+            else "without_not_visible"
+        )
         ax = fig.add_subplot(subspec)
-        _plot_state_fraction_pie(ax, title=title, values=fractions.get(key, {}), labels=labels, sample_size=len(result.pupil_pct_by_session), sample_size_unit="sessions")
+        _plot_state_fraction_pie(
+            ax,
+            title=title,
+            values=fractions.get(key, {}),
+            labels=labels,
+            sample_size=len(result.pupil_pct_by_session),
+            sample_size_unit="sessions",
+        )
         return
 
     ax = fig.add_subplot(subspec, sharex=sharex, sharey=sharey)
     sessions = _session_subset_for_config(result, config.get("subset"))
+
     if kind == "session_boxplot":
         metric = config.get("metric", "locomotion")
         if metric == "locomotion":
-            _plot_session_metric_boxplot(ax, result, sessions, result.locomotion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:blue")
+            _plot_session_metric_boxplot(
+                ax,
+                result,
+                sessions,
+                result.locomotion_pct_by_session_values,
+                title=title,
+                ylabel="Fraction",
+                color="tab:blue",
+                point_scale=point_scale,
+            )
         else:
-            _plot_session_metric_boxplot(ax, result, sessions, result.face_motion_pct_by_session_values, title=title, ylabel="Fraction", color="tab:orange")
+            _plot_session_metric_boxplot(
+                ax,
+                result,
+                sessions,
+                result.face_motion_pct_by_session_values,
+                title=title,
+                ylabel="Fraction",
+                color="tab:orange",
+                point_scale=point_scale,
+            )
         return
+
     if kind == "state_zscore_boxplot":
         state_data, states = _state_zscore_boxplot_data(
             result,
@@ -2142,14 +2219,40 @@ def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: 
             include_not_visible=bool(config.get("include_not_visible", True)),
         )
         colors = _state_colors_for_labels(states)
-        _boxplot(ax, state_data, states, colors=colors, title=title, xlabel="Pupil state", ylabel="Mean z-score")
+        _boxplot(
+            ax,
+            state_data,
+            states,
+            colors=colors,
+            title=title,
+            xlabel="Pupil state",
+            ylabel="Mean z-score",
+            point_scale=point_scale,
+        )
         return
+
     if kind == "state_fraction":
-        _plot_state_fraction_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot(), include_not_visible=bool(config.get("include_not_visible", True)))
+        _plot_state_fraction_by_session(
+            ax,
+            result,
+            sessions,
+            title=title,
+            labels=config.get("labels", _state_labels_for_combined_plot()),
+            include_not_visible=bool(config.get("include_not_visible", True)),
+        )
         return
+    
     if kind == "state_fraction_stacked":
-        _plot_state_fraction_stacked_by_session(ax, result, sessions, title=title, labels=_state_labels_for_combined_plot(), include_not_visible=bool(config.get("include_not_visible", False)))
+        _plot_state_fraction_stacked_by_session(
+            ax,
+            result,
+            sessions,
+            title=title,
+            labels=config.get("labels", _state_labels_for_combined_plot()),
+            include_not_visible=bool(config.get("include_not_visible", False)),
+        )
         return
+    
     if kind == "single_state":
         _plot_single_state_fraction_by_session(
             ax,
@@ -2160,28 +2263,54 @@ def _draw_summary_panel(fig: Figure, subspec, result: StatisticsResult, config: 
             include_not_visible=bool(config.get("include_not_visible", True)),
         )
         return
+
     if kind == "lag":
         _plot_lag_by_session(ax, result, sessions, title=title)
         return
+
     if kind == "animal_progress":
         if config["metric"] == "locomotion":
-            _plot_animal_progress_lines(ax, result.locomotion_progress_by_animal_values, title=title, ylabel="Fraction", average_label="Average")
+            _plot_animal_progress_lines(
+                ax,
+                result.locomotion_progress_by_animal_values,
+                title=title,
+                ylabel="Fraction",
+                average_label="Average",
+            )
         else:
-            _plot_animal_progress_lines(ax, result.pupil_zscore_progress_by_animal_values, title=title, ylabel="Mean z-score", average_label="Average")
+            _plot_animal_progress_lines(
+                ax,
+                result.pupil_zscore_progress_by_animal_values,
+                title=title,
+                ylabel="Mean z-score",
+                average_label="Average",
+            )
         return
+
     if kind == "progress":
         series = result.progress_series.get(config["series_key"], {})
         title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
         _plot_progress_series(ax, series, title=title, xlabel="Progress (%)")
         return
+
     if kind == "progress_stacked":
         series = result.progress_series.get(config["series_key"], {})
         title = _format_progress_title(title, int(series.get("sample_size", 0)), series)
-        xlabel = "Progress (%)" if series.get("kind") != "absolute_window" else "Minutes into 30-minute window"
-        _plot_progress_stacked_area(ax, series, title=title, xlabel=xlabel, include_not_visible=bool(config.get("include_not_visible", False)))
+        xlabel = (
+            "Progress (%)"
+            if series.get("kind") != "absolute_window"
+            else "Minutes into 30-minute window"
+        )
+        _plot_progress_stacked_area(
+            ax,
+            series,
+            title=title,
+            xlabel=xlabel,
+            include_not_visible=bool(config.get("include_not_visible", False)),
+        )
         return
-    raise ValueError(f"Unknown summary panel kind: {kind}")
 
+    raise ValueError(f"Unknown summary panel kind: {kind}")
 
 def _build_summary_figure(
     result: StatisticsResult,
@@ -2192,6 +2321,7 @@ def _build_summary_figure(
 ) -> Figure:
     specs = _selected_summary_panel_specs(result, panel_keys)
     n_panels = max(1, len(specs))
+
     if grid_shape is not None:
         rows = max(1, int(grid_shape[0]))
         cols = max(1, int(grid_shape[1]))
@@ -2207,8 +2337,18 @@ def _build_summary_figure(
         fig_height = 5.8 * rows
     else:
         fig_width, fig_height = float(figure_size_cm[0]), float(figure_size_cm[1])
-    fig = Figure(figsize=(fig_width / 2.54, fig_height / 2.54), constrained_layout=True)
+
+    fig = Figure(
+        figsize=(fig_width / 2.54, fig_height / 2.54),
+        constrained_layout=True,
+    )
+
+    # Fixed scale for all summary panels.
+    # Do not include row_span/col_span here, otherwise panels spanning more
+    # squares will get larger text.
     summary_scale = _summary_panel_text_scale(fig_width, fig_height, rows, cols)
+    fixed_panel_scale = summary_scale
+
     grid = fig.add_gridspec(rows, cols, wspace=0.30, hspace=0.42)
     share_axes: dict[tuple[str, str], object] = {}
 
@@ -2219,34 +2359,65 @@ def _build_summary_figure(
         row = 0
         col = 0
         max_row = 0
+
         for slug, title, config in specs:
             row_span, col_span = _summary_panel_span(config["kind"])
             col_span = min(col_span, cols)
+
             if col + col_span > cols:
                 row += 1
                 col = 0
+
             placements.append((slug, title, config, row, col, row_span, col_span))
             max_row = max(max_row, row + row_span)
+
             col += col_span
             if col >= cols:
                 row += row_span
                 col = 0
+
         rows = max(rows, max_row, 1)
 
     for _, title, config, r, c, row_span, col_span in placements:
         kind = config["kind"]
+
         sharex_enabled, sharey_enabled = _summary_panel_axis_sharing(kind)
         sharex = share_axes.get((kind, "x")) if sharex_enabled else None
         sharey = share_axes.get((kind, "y")) if sharey_enabled else None
+
         subspec = grid[r:r + row_span, c:c + col_span]
-        _draw_summary_panel(fig, subspec, result, config, title, sharex=sharex, sharey=sharey)
-        panel_scale = _summary_panel_text_scale(fig_width, fig_height, rows, cols, row_span=row_span, col_span=col_span)
+
+        # Same text size for every panel, independent of how many squares it spans.
+        panel_scale = fixed_panel_scale
+
+        # Summary-only boxplot point scaling.
+        # Lower numerator = smaller raw points and mean/median markers.
+        point_scale = float(np.clip(0.35 / max(panel_scale, 1e-6), 0.20, 0.45))
+
+        _draw_summary_panel(
+            fig,
+            subspec,
+            result,
+            config,
+            title,
+            sharex=sharex,
+            sharey=sharey,
+            point_scale=point_scale,
+        )
+
         scale_axes_text(fig.axes[-1], scale=panel_scale)
+
         if sharex_enabled and (kind, "x") not in share_axes:
             share_axes[(kind, "x")] = fig.axes[-1]
         if sharey_enabled and (kind, "y") not in share_axes:
             share_axes[(kind, "y")] = fig.axes[-1]
-    fig.suptitle(f"Habituation statistics - {result.scope} / {result.animal_id}", y=1.02, fontsize=float(np.clip(24 * summary_scale, 12.0, 28.0)))
+
+    fig.suptitle(
+        f"Habituation statistics - {result.scope} / {result.animal_id}",
+        y=1.02,
+        fontsize=float(np.clip(24 * fixed_panel_scale, 12.0, 28.0)),
+    )
+
     return fig
 
 def save_statistics_summary_figure(

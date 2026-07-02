@@ -194,6 +194,7 @@ def poster_boxplot(
     violin_alpha: float = 0.28,
     box_alpha: float = 0.55,
     jitter_width: float = 0.11,
+    point_scale: float = 1.0,
 ) -> None:
     """
     Sleep-state-style boxplot:
@@ -232,6 +233,13 @@ def poster_boxplot(
         return
 
     rng = np.random.default_rng(seed)
+    try:
+        point_scale = float(point_scale)
+    except Exception:
+        point_scale = 1.0
+    if not np.isfinite(point_scale) or point_scale <= 0.0:
+        point_scale = 1.0
+    point_scale = float(np.clip(point_scale, 0.20, 0.90))
 
     finite_all = np.concatenate([arr for arr in arrays if arr.size])
     y_min = float(np.nanmin(finite_all))
@@ -289,7 +297,7 @@ def poster_boxplot(
             ax.scatter(
                 np.full(arr.size, pos, dtype=float) + jitter,
                 arr,
-                s=16,
+                s=11.0 * point_scale,
                 c=color,
                 alpha=0.55,
                 linewidths=0,
@@ -305,7 +313,7 @@ def poster_boxplot(
             ax.scatter(
                 [pos - 0.02],
                 [mean_val],
-                s=52,
+                s=34.0 * point_scale,
                 marker="o",
                 c="#111111",
                 edgecolors="white",
@@ -315,7 +323,7 @@ def poster_boxplot(
             ax.scatter(
                 [pos + 0.02],
                 [median_val],
-                s=52,
+                s=34.0 * point_scale,
                 marker="D",
                 c="#7a7a7a",
                 edgecolors="white",
