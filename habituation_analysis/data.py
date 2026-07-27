@@ -133,9 +133,22 @@ def apply_time_mask(values, mask: np.ndarray):
     return arr[:n][mask[:n]]
 
 
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "numpy._core" or module.startswith("numpy._core."):
+            module = "numpy.core" + module[len("numpy._core"):]
+        return super().find_class(module, name)
+
+
 def _load_pickle(path: Path):
     with path.open("rb") as f:
-        return pickle.load(f)
+        try:
+            return pickle.load(f)
+        except ModuleNotFoundError as exc:
+            if not str(getattr(exc, "name", "")).startswith("numpy._core"):
+                raise
+            f.seek(0)
+            return _NumpyCompatUnpickler(f).load()
 
 
 def _save_pickle(path: Path, data) -> None:
@@ -1140,8 +1153,7 @@ class HabituationStore:
         return bundle
 
     def _load_eye_pickle(self, path: Path) -> dict:
-        with path.open("rb") as f:
-            return pickle.load(f)
+        return _load_pickle(path)
 
     def _build_session_bundle(self, summary: SessionSummary, *, current_sig: dict) -> SessionBundle:
         if summary.right_pickle is None or not Path(summary.right_pickle).exists():
@@ -1298,8 +1310,7 @@ class HabituationStore:
         if wheel_path is None or not wheel_path.exists():
             return None
         try:
-            with wheel_path.open("rb") as f:
-                wheel = pickle.load(f)
+            wheel = _load_pickle(wheel_path)
         except Exception:
             return None
         if not isinstance(wheel, dict):
