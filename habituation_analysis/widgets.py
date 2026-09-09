@@ -9,7 +9,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtWidgets import QLabel, QPushButton, QSlider, QComboBox, QHBoxLayout, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QLabel, QPushButton, QSlider, QComboBox, QHBoxLayout, QVBoxLayout, QBoxLayout, QWidget, QSizePolicy
 
 
 class DraggableHLine:
@@ -106,7 +106,9 @@ class VideoPlayerWidget(QWidget):
         super().__init__(parent)
         self.video_label = QLabel("No video loaded")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(360, 240)
+        self.video_label.setMinimumSize(120, 90)
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_label.setStyleSheet("background: #111; color: #ddd;")
         self.video_label.setScaledContents(False)
         self.video_path: str | None = None
@@ -145,19 +147,26 @@ class VideoPlayerWidget(QWidget):
         self.current_label = QLabel("0.0 s")
         self.total_label = QLabel("/ 0.0 s")
 
-        controls = QHBoxLayout()
-        controls.addWidget(self.prev_btn)
-        controls.addWidget(self.play_btn)
-        controls.addWidget(self.next_btn)
-        controls.addWidget(QLabel("Speed"))
-        controls.addWidget(self.speed_combo)
-        controls.addWidget(self.current_label)
-        controls.addWidget(self.total_label)
+        self._controls_layout = QHBoxLayout()
+        self._controls_layout.addWidget(self.prev_btn)
+        self._controls_layout.addWidget(self.play_btn)
+        self._controls_layout.addWidget(self.next_btn)
+        self._controls_layout.addWidget(QLabel("Speed"))
+        self._controls_layout.addWidget(self.speed_combo)
+        self._controls_layout.addWidget(self.current_label)
+        self._controls_layout.addWidget(self.total_label)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.video_label, stretch=1)
         layout.addWidget(self.slider)
-        layout.addLayout(controls)
+        layout.addLayout(self._controls_layout)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        compact = self.width() < 380
+        direction = QBoxLayout.TopToBottom if compact else QBoxLayout.LeftToRight
+        if self._controls_layout.direction() != direction:
+            self._controls_layout.setDirection(direction)
 
     def close_video(self):
         self.pause()
@@ -368,8 +377,8 @@ class TracePanZoomCanvas(FigureCanvas):
     """Matplotlib canvas with shared x-axis zoom and drag-pan support."""
 
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(10, 11.0), constrained_layout=True)
-        grid = self.figure.add_gridspec(4, 1, height_ratios=[3.5, 2.2, 1.35, 0.55])
+        self.figure = Figure(figsize=(10, 7.5), constrained_layout=True)
+        grid = self.figure.add_gridspec(4, 1, height_ratios=[3.0, 1.8, 1.1, 0.65])
         self.pupil_ax = self.figure.add_subplot(grid[0])
         self.loc_ax = self.figure.add_subplot(grid[1], sharex=self.pupil_ax)
         self.face_ax = self.figure.add_subplot(grid[2], sharex=self.pupil_ax)

@@ -37,7 +37,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 from .data import MIN_STATISTICS_SESSIONS_PER_ANIMAL, HabituationStore, SessionSummary, analysis_cutoff_mask, apply_time_mask
-from .plotting import style_axes
+from .plotting import scale_axes_text, style_axes
 from .stats import (
     STATE_LABELS,
     animal_zscores,
@@ -176,6 +176,23 @@ class ScrollableComboBox(QComboBox):
 class TraceCanvas(TracePanZoomCanvas):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMinimumSize(700, 420)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def _apply_screen_text_scale(self):
+        width = max(1, self.width())
+        height = max(1, self.height())
+        scale = max(0.50, min(0.75, min(width / 1000.0, height / 700.0) * 0.55))
+        for axis in self._trace_axes:
+            scale_axes_text(axis, scale=scale)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_screen_text_scale()
+
+    def draw(self, *args, **kwargs):
+        self._apply_screen_text_scale()
+        return super().draw(*args, **kwargs)
 class LoadingWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(
@@ -604,19 +621,19 @@ class MetricsTab(QWidget):
         self.delete_btn.clicked.connect(self._delete_selected_interval)
         self.clear_btn.clicked.connect(self._clear_intervals)
         self.save_btn.clicked.connect(self._save_intervals)
-        self.calibration_group = QGroupBox("Extra-large calibration", self)
+        self.calibration_group = QGroupBox("Extra-large rule", self)
         calibration_layout = QVBoxLayout(self.calibration_group)
-        self.calibration_status_label = QLabel("No calibration suggestion available yet.", self.calibration_group)
+        self.calibration_status_label = QLabel("No calibration set.", self.calibration_group)
         self.calibration_status_label.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_status_label)
-        self.calibration_selection_label = QLabel("Selected period: none", self.calibration_group)
+        self.calibration_selection_label = QLabel("Selection: none", self.calibration_group)
         self.calibration_selection_label.setWordWrap(True)
         self.calibration_selection_label.setStyleSheet("color: #444444; font-size: 11px;")
         calibration_layout.addWidget(self.calibration_selection_label)
         selection_row = QHBoxLayout()
-        self.set_calibration_start_btn = QPushButton("Set calibration start", self.calibration_group)
+        self.set_calibration_start_btn = QPushButton("Set start", self.calibration_group)
         self.set_calibration_start_btn.clicked.connect(self._set_extra_large_calibration_start)
-        self.set_calibration_end_btn = QPushButton("Set calibration end", self.calibration_group)
+        self.set_calibration_end_btn = QPushButton("Set end", self.calibration_group)
         self.set_calibration_end_btn.clicked.connect(self._set_extra_large_calibration_end)
         self.clear_calibration_selection_btn = QPushButton("Clear selection", self.calibration_group)
         self.clear_calibration_selection_btn.clicked.connect(self._clear_extra_large_calibration_selection)
@@ -625,18 +642,18 @@ class MetricsTab(QWidget):
         selection_row.addWidget(self.clear_calibration_selection_btn)
         calibration_layout.addLayout(selection_row)
         calibration_button_row = QHBoxLayout()
-        self.goto_calibration_btn = QPushButton("Go to calibration", self.calibration_group)
+        self.goto_calibration_btn = QPushButton("Go to", self.calibration_group)
         self.goto_calibration_btn.clicked.connect(self._go_to_extra_large_calibration)
-        self.confirm_calibration_btn = QPushButton("Confirm calibration", self.calibration_group)
+        self.confirm_calibration_btn = QPushButton("Confirm", self.calibration_group)
         self.confirm_calibration_btn.clicked.connect(self._confirm_extra_large_calibration)
-        self.clear_calibration_btn = QPushButton("Clear calibration", self.calibration_group)
+        self.clear_calibration_btn = QPushButton("Clear", self.calibration_group)
         self.clear_calibration_btn.clicked.connect(self._clear_extra_large_calibration)
         calibration_button_row.addWidget(self.goto_calibration_btn)
         calibration_button_row.addWidget(self.confirm_calibration_btn)
         calibration_button_row.addWidget(self.clear_calibration_btn)
         calibration_button_row.addStretch(1)
         calibration_layout.addLayout(calibration_button_row)
-        calibration_hint = QLabel("The app suggests a calibration interval automatically from big detected pupil periods. You can also select a new calibration period from the video controls, then confirm it to activate the brightness-based extra-large rule.", self.calibration_group)
+        calibration_hint = QLabel("Choose a video interval to train the extra-large rule.", self.calibration_group)
         calibration_hint.setWordWrap(True)
         calibration_hint.setStyleSheet("color: #666666; font-size: 11px;")
         calibration_layout.addWidget(calibration_hint)
@@ -713,6 +730,7 @@ class MetricsTab(QWidget):
         self.locomotion_spin.valueChanged.connect(self._on_locomotion_threshold_changed)
         loc_layout.addRow("Threshold", self.locomotion_spin)
         left_panel = QWidget(self)
+        left_panel.setMinimumWidth(700)
         left_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout = QVBoxLayout(left_panel)
         self.metrics_summary_panel = QWidget(self)
@@ -755,10 +773,12 @@ class MetricsTab(QWidget):
         reference_hint.setWordWrap(True)
         reference_hint.setStyleSheet("color: #666666; font-size: 11px;")
         reference_layout.addWidget(reference_hint)
+        self.video_group = QGroupBox("Eye video", self)
+        video_layout = QVBoxLayout(self.video_group)
+        video_layout.addWidget(self.video_widget, stretch=1)
+        video_layout.addWidget(self.video_time_label)
         self.mask_group = QGroupBox("Not visible pupil intervals", self)
         mask_layout = QVBoxLayout(self.mask_group)
-        mask_layout.addWidget(self.video_widget)
-        mask_layout.addWidget(self.video_time_label)
         button_row = QHBoxLayout()
         button_row.addWidget(self.start_btn)
         button_row.addWidget(self.end_btn)
@@ -767,12 +787,26 @@ class MetricsTab(QWidget):
         mask_layout.addLayout(button_row)
         mask_layout.addWidget(self.interval_list, stretch=1)
         mask_layout.addWidget(self.save_btn)
+        self.video_group.setMinimumWidth(520)
+        self.video_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.mask_group.setMinimumWidth(300)
+        self.mask_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_controls_panel = QWidget(self)
-        right_controls_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        right_controls_panel.setMinimumWidth(520)
+        right_controls_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_controls_layout = QVBoxLayout(right_controls_panel)
         right_controls_layout.setContentsMargins(0, 0, 0, 0)
-        right_controls_layout.addWidget(self.calibration_group)
-        right_controls_layout.addWidget(self.mask_group, stretch=1)
+        right_controls_layout.addWidget(self.video_group, stretch=13)
+        lower_controls_splitter = QSplitter(Qt.Horizontal, right_controls_panel)
+        lower_controls_splitter.setChildrenCollapsible(False)
+        lower_controls_splitter.setOpaqueResize(True)
+        lower_controls_splitter.setHandleWidth(10)
+        lower_controls_splitter.addWidget(self.calibration_group)
+        lower_controls_splitter.addWidget(self.mask_group)
+        lower_controls_splitter.setStretchFactor(0, 1)
+        lower_controls_splitter.setStretchFactor(1, 1)
+        self._lower_controls_splitter = lower_controls_splitter
+        right_controls_layout.addWidget(lower_controls_splitter, stretch=7)
         index_group = QGroupBox("Experiment Index", self)
         index_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         index_layout = QVBoxLayout(index_group)
@@ -782,7 +816,8 @@ class MetricsTab(QWidget):
         reference_model_layout = QVBoxLayout(reference_model_group)
         reference_model_layout.addWidget(self.reference_sessions)
         right_column_panel = QWidget(self)
-        right_column_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        right_column_panel.setMinimumWidth(380)
+        right_column_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_column_layout = QVBoxLayout(right_column_panel)
         right_column_layout.setContentsMargins(0, 0, 0, 0)
         right_column_layout.addWidget(self.reference_group)
@@ -792,25 +827,66 @@ class MetricsTab(QWidget):
         right_panel = QSplitter(Qt.Horizontal, self)
         right_panel.setChildrenCollapsible(False)
         right_panel.setOpaqueResize(True)
-        right_panel.setHandleWidth(6)
+        right_panel.setHandleWidth(10)
         right_panel.addWidget(right_controls_panel)
         right_panel.addWidget(right_column_panel)
-        right_panel.setStretchFactor(0, 2)
-        right_panel.setStretchFactor(1, 3)
-        right_panel.setSizes([320, 760])
+        right_panel.setStretchFactor(0, 3)
+        right_panel.setStretchFactor(1, 2)
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.setChildrenCollapsible(False)
         splitter.setOpaqueResize(True)
-        splitter.setHandleWidth(8)
+        splitter.setHandleWidth(10)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        splitter.setSizes([1000, 1100])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
         layout = QVBoxLayout(self)
-        layout.addWidget(splitter)
+        self._metrics_scroll = QScrollArea(self)
+        self._metrics_scroll.setWidgetResizable(True)
+        self._metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._metrics_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._metrics_content = QWidget(self)
+        self._metrics_content.setMinimumWidth(1620)
+        self._metrics_content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        content_layout = QVBoxLayout(self._metrics_content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(splitter)
+        self._metrics_scroll.setWidget(self._metrics_content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._metrics_scroll)
+        self._metrics_splitter = splitter
+        self._right_panel_splitter = right_panel
+        self._setup_splitter_handles()
         self._set_threshold_control_values(self._percentile_cutoffs, self._threshold_values)
         self._on_percentile_lock_toggled(self.percentile_lock_check.isChecked())
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_responsive_layout()
+
+    def _apply_responsive_layout(self):
+        self._metrics_splitter.setOrientation(Qt.Horizontal)
+        self._right_panel_splitter.setOrientation(Qt.Horizontal)
+        self._lower_controls_splitter.setOrientation(Qt.Horizontal)
+        self._metrics_content.setMinimumWidth(max(1620, self.width()))
+
+    def _setup_splitter_handles(self):
+        style = "QSplitter::handle { background: #b8bec7; } QSplitter::handle:hover { background: #6f7b8a; } QSplitter::handle:pressed { background: #4c5968; }"
+        for splitter in (self._metrics_splitter, self._right_panel_splitter, self._lower_controls_splitter):
+            splitter.setStyleSheet(style)
+            splitter.setOpaqueResize(True)
+            splitter.setHandleWidth(10)
+            handle = splitter.handle(1)
+            if handle is not None:
+                handle.setCursor(Qt.SplitHCursor)
+
+    def _initialize_splitter_layout(self):
+        if self._metrics_splitter.width() <= 0 or self._right_panel_splitter.width() <= 0:
+            QtCore.QTimer.singleShot(50, self._initialize_splitter_layout)
+            return
+        self._metrics_splitter.setSizes([int(self._metrics_splitter.width() * 0.50), int(self._metrics_splitter.width() * 0.50)])
+        self._right_panel_splitter.setSizes([int(self._right_panel_splitter.width() * 0.60), int(self._right_panel_splitter.width() * 0.40)])
+        self._lower_controls_splitter.setSizes([int(self._lower_controls_splitter.width() * 0.50), int(self._lower_controls_splitter.width() * 0.50)])
+
     def set_selection(self, animal_id: str, exp_id: str, view_mode: str):
         changed = (animal_id != self.animal_id) or (exp_id != self.exp_id) or (view_mode != self.view_mode)
         self.animal_id = animal_id
@@ -1947,6 +2023,7 @@ class MetricsTab(QWidget):
             ax.legend(loc="upper right", frameon=False)
     def _update_video(self):
         show_video = self.view_mode == "Session"
+        self.video_group.setVisible(show_video)
         self.mask_group.setVisible(show_video)
         self.calibration_group.setVisible(show_video)
         if not show_video:
@@ -2027,14 +2104,11 @@ class MetricsTab(QWidget):
         self.refresh()
     def _format_extra_large_calibration_text(self, calibration: dict | None) -> str:
         if calibration is None:
-            return "No confirmed calibration. Select a period or use the suggestion, then confirm to train the extra-large similarity rule."
+            return "No calibration set. Choose an interval or use the suggestion, then confirm."
         start, end = calibration["interval"]
         parts = [f"Confirmed: {format_seconds(float(start))} -> {format_seconds(float(end))}"]
-        details = self._extra_large_calibration_details(calibration)
-        if details:
-            parts.append(details)
         if calibration.get("legacy", False):
-            parts.append("legacy calibration, please reconfirm")
+            parts.append("Legacy: reconfirm")
         return " | ".join(parts)
     def _calibration_selection_interval(self) -> tuple[float, float] | None:
         if self._calibration_selection_start is None or self._calibration_selection_end is None:
@@ -2169,7 +2243,7 @@ class MetricsTab(QWidget):
         if current_time is None or not np.isfinite(current_time):
             return
         self._calibration_selection_end = float(current_time)
-        message = f"Calibration end set at {format_seconds(float(self._calibration_selection_end))}. Refreshing calibration controls..."
+        message = f"End set at {format_seconds(float(self._calibration_selection_end))}. Refreshing."
         self.calibration_status_label.setText(message)
         window = self.window()
         if hasattr(window, "statusBar"):
@@ -2200,8 +2274,8 @@ class MetricsTab(QWidget):
             return
         if self.view_mode != "Session" or summary is None or payload is None or not payload.has_pupil or not payload.radius.size:
             self._calibration_suggestion = None
-            self.calibration_status_label.setText("No calibration suggestion available for this session.")
-            self.calibration_selection_label.setText("Selected period: none")
+            self.calibration_status_label.setText("No suggestion available.")
+            self.calibration_selection_label.setText("Selection: none")
             self.set_calibration_start_btn.setEnabled(False)
             self.set_calibration_end_btn.setEnabled(False)
             self.clear_calibration_selection_btn.setEnabled(False)
@@ -2233,42 +2307,54 @@ class MetricsTab(QWidget):
             start, end = selection["interval"]
             details = self._extra_large_calibration_details(selection)
             status_lines.append(
-                f"Selected: {format_seconds(float(start))} -> {format_seconds(float(end))}" + (f" | {details}" if details else "")
+                f"Selected: {format_seconds(float(start))} -> {format_seconds(float(end))}"
             )
             status_lines.append("This selection is not active until you confirm it.")
         elif suggestion is None:
-            status_lines.append("Suggested: no suitable big-detected interval was found.")
+            status_lines.append("No suitable interval found.")
         else:
             start, end = suggestion["interval"]
             details = self._extra_large_calibration_details(suggestion)
             status_lines.append(
-                f"Suggested: {format_seconds(float(start))} -> {format_seconds(float(end))}" + (f" | {details}" if details else "")
+                f"Suggested: {format_seconds(float(start))} -> {format_seconds(float(end))}"
             )
             if confirmed is not None and tuple(map(float, confirmed["interval"])) != tuple(map(float, suggestion["interval"])):
-                status_lines.append("The suggestion differs from the confirmed calibration. Confirm again to update it.")
+                status_lines.append("Suggestion differs from the current rule.")
             elif confirmed is None:
-                status_lines.append("This suggestion is not active until you confirm it.")
+                status_lines.append("Confirm to apply.")
         confirm_enabled = selection is not None or suggestion is not None
         self.calibration_status_label.setText("\n".join(status_lines))
+        technical_lines = []
+        for label, calibration in (("Confirmed", confirmed), ("Selected", selection), ("Suggested", suggestion)):
+            if calibration is None:
+                continue
+            interval = calibration.get("interval")
+            details = self._extra_large_calibration_details(calibration)
+            if interval is not None:
+                interval_text = f"{format_seconds(float(interval[0]))} -> {format_seconds(float(interval[1]))}"
+                technical_lines.append(f"{label}: {interval_text}" + (f" | {details}" if details else ""))
+        self.calibration_status_label.setToolTip("\n".join(technical_lines))
         if selection is not None:
             details = self._extra_large_calibration_details(selection)
             self.calibration_selection_label.setText(
-                f"Selected period: {format_seconds(float(selection['interval'][0]))} -> {format_seconds(float(selection['interval'][1]))}" + (f" | {details}" if details else "")
+                f"Selected: {format_seconds(float(selection['interval'][0]))} -> {format_seconds(float(selection['interval'][1]))}"
             )
         elif self._calibration_selection_start is not None and self._calibration_selection_end is None:
             self.calibration_selection_label.setText(
-                f"Selected period: start at {format_seconds(float(self._calibration_selection_start))}; end not set yet"
+                f"Start: {format_seconds(float(self._calibration_selection_start))}"
             )
         elif self._calibration_selection_start is None and self._calibration_selection_end is not None:
             self.calibration_selection_label.setText(
-                f"Selected period: end at {format_seconds(float(self._calibration_selection_end))}; start not set yet"
+                f"End: {format_seconds(float(self._calibration_selection_end))}"
             )
         elif selection_interval is not None:
             self.calibration_selection_label.setText(
-                f"Selected period: {format_seconds(float(selection_interval[0]))} -> {format_seconds(float(selection_interval[1]))} | ready to confirm similarity rule"
+                f"Selected: {format_seconds(float(selection_interval[0]))} -> {format_seconds(float(selection_interval[1]))} — ready to confirm"
             )
         else:
-            self.calibration_selection_label.setText("Selected period: none")
+            self.calibration_selection_label.setText("Selection: none")
+        selection_details = self._extra_large_calibration_details(selection) if selection is not None else ""
+        self.calibration_selection_label.setToolTip(selection_details)
         self.set_calibration_start_btn.setEnabled(True)
         self.set_calibration_end_btn.setEnabled(True)
         self.clear_calibration_selection_btn.setEnabled(
@@ -3465,7 +3551,7 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Habituation Analysis")
         self.resize(1720, 1080)
-        self.setMinimumSize(1280, 820)
+        self.setMinimumSize(900, 640)
         self.store = HabituationStore()
         self.index = self.store.load_index(prefer_cache=True)
         self.app_state = self.store.load_app_state()
@@ -3480,10 +3566,11 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
                 self._last_session_exp_id = default_exp
         self._updating_browser = False
         self._initializing = True
+        self._splitters_initialized = False
         self._worker: TaskThread | None = None
         self._stats_prompted_for_entry = False
         self.animal_combo = ScrollableComboBox(self, visible_rows=4)
-        self.animal_combo.setMinimumWidth(240)
+        self.animal_combo.setMinimumWidth(140)
         self.animal_combo.setMinimumContentsLength(12)
         self.animal_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         animal_view = self.animal_combo.view()
@@ -3500,15 +3587,19 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.prev_btn.clicked.connect(self._go_prev_session)
         self.next_btn.clicked.connect(self._go_next_session)
         self.update_btn.clicked.connect(self._update_dataset)
+        self._animal_label = QLabel("Animal", self)
+        self._exp_label = QLabel("ExpID", self)
         top_bar = QHBoxLayout()
-        top_bar.addWidget(QLabel("Animal", self))
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.addWidget(self._animal_label)
         top_bar.addWidget(self.animal_combo)
-        top_bar.addWidget(QLabel("ExpID", self))
+        top_bar.addWidget(self._exp_label)
         top_bar.addWidget(self.prev_btn)
         top_bar.addWidget(self.exp_combo, stretch=1)
         top_bar.addWidget(self.next_btn)
         top_bar.addWidget(self.update_btn)
         top_widget = QWidget(self)
+        top_widget.setMinimumWidth(1100)
         top_widget.setLayout(top_bar)
         self.tabs = QtWidgets.QTabWidget(self)
         self.metrics_tab = MetricsTab(self.store, self)
@@ -3517,7 +3608,13 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.statistics_tab, "Statistics")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         main_layout = QVBoxLayout()
-        main_layout.addWidget(top_widget)
+        top_scroll = QScrollArea(self)
+        top_scroll.setWidgetResizable(True)
+        top_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        top_scroll.setWidget(top_widget)
+        main_layout.addWidget(top_scroll)
         main_layout.addWidget(self.tabs, stretch=1)
         main_layout.addWidget(self.status_label)
         central = QWidget(self)
@@ -3538,6 +3635,12 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self._initializing = False
         self._sync_browser_state()
         self.statusBar().showMessage(f"Loaded {len(self.index.sessions)} sessions from cache/source trees")
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._splitters_initialized:
+            self._splitters_initialized = True
+            QtCore.QTimer.singleShot(0, self.metrics_tab._initialize_splitter_layout)
+
     def _animals_for_combo(self) -> list[str]:
         return ["All"] + self.store.animals()
     def _sessions_for_scope(self, animal_id: str) -> list[SessionSummary]:
