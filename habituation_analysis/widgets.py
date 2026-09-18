@@ -12,6 +12,9 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QLabel, QPushButton, QSlider, QComboBox, QHBoxLayout, QVBoxLayout, QBoxLayout, QWidget, QSizePolicy
 
 
+TRACE_RIGHT_PADDING_FRACTION = 0.03
+
+
 class DraggableHLine:
     """A draggable horizontal matplotlib line."""
 
@@ -418,22 +421,32 @@ class TracePanZoomCanvas(FigureCanvas):
             right = left + 1.0
         self._data_xlim = (left, right)
         if reset_view or self._view_xlim is None:
-            self._view_xlim = (left, right)
+            self._view_xlim = self._display_xlim()
         else:
             self._view_xlim = self._clamp_xlim(*self._view_xlim)
 
     def _effective_xlim(self) -> tuple[float, float] | None:
-        return self._view_xlim or self._data_xlim
+        return self._view_xlim or self._display_xlim()
+
+    def _display_xlim(self) -> tuple[float, float] | None:
+        if self._data_xlim is None:
+            return None
+        left, right = self._data_xlim
+        span = right - left
+        if not np.isfinite(left) or not np.isfinite(right) or span <= 0.0:
+            return self._data_xlim
+        return left, right + span * TRACE_RIGHT_PADDING_FRACTION
 
     def _clamp_xlim(self, left: float, right: float) -> tuple[float, float]:
-        if self._data_xlim is None:
+        display_xlim = self._display_xlim()
+        if display_xlim is None:
             return float(left), float(right)
-        data_left, data_right = self._data_xlim
+        data_left, data_right = display_xlim
         if not np.isfinite(data_left) or not np.isfinite(data_right) or data_right <= data_left:
             return float(left), float(right)
-        data_span = data_right - data_left
+        display_span = data_right - data_left
         span = max(float(right) - float(left), self._min_span)
-        if span >= data_span:
+        if span >= display_span:
             return float(data_left), float(data_right)
         left = min(max(float(left), data_left), data_right - span)
         right = left + span
@@ -452,7 +465,7 @@ class TracePanZoomCanvas(FigureCanvas):
     def reset_zoom(self):
         if self._data_xlim is None:
             return
-        self._view_xlim = self._data_xlim
+        self._view_xlim = self._display_xlim()
         self.apply_view()
 
     def zoom(self, factor: float):
