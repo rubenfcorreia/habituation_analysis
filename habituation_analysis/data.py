@@ -185,6 +185,10 @@ def _safe_exp_name(name: str) -> bool:
     return bool(SESSION_NAME_RE.match(name))
 
 
+def _is_test_experiment(exp_id: str) -> bool:
+    return any(part.casefold() == "test" for part in exp_id.split("_"))
+
+
 def resolve_locomotion_csv(remote_root: Path, animal_id: str, exp_id: str) -> Path | None:
     exp_dir = remote_root / animal_id / exp_id
     if not exp_dir.exists():
@@ -591,7 +595,13 @@ class HabituationStore:
         sessions: list[SessionSummary] = []
         for animal_dir in sorted([p for p in self.source_root.iterdir() if p.is_dir()]):
             animal_id = animal_dir.name
-            for exp_dir in sorted([p for p in animal_dir.iterdir() if p.is_dir() and _safe_exp_name(p.name)]):
+            for exp_dir in sorted(
+                [
+                    p
+                    for p in animal_dir.iterdir()
+                    if p.is_dir() and _safe_exp_name(p.name) and not _is_test_experiment(p.name)
+                ]
+            ):
                 exp_id = exp_dir.name
                 parts = exp_id.split("_")
                 date = parts[0] if parts else ""
