@@ -576,6 +576,11 @@ class MetricsTab(QWidget):
         self._scope_sessions: list[SessionSummary] = []
         self._current_session: SessionSummary | None = None
         self._current_payload: LoadedSession | None = None
+        self._session_payload_cache: dict[str, LoadedSession] = {}
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(40)
+        self._refresh_timer.timeout.connect(self.refresh)
         self._pending_mask_start: float | None = None
         self._calibration_selection_start: float | None = None
         self._calibration_selection_end: float | None = None
@@ -897,8 +902,46 @@ class MetricsTab(QWidget):
             self._calibration_selection_start = None
             self._calibration_selection_end = None
         self._reset_trace_view_pending = changed or not self._metrics_available()
+        if changed:
+            self._show_loading_state()
         if changed or not self._metrics_available():
-            self.refresh()
+            # Coalesce rapid next/previous or combo-box changes into one refresh.
+            self._refresh_timer.start()
+
+    def _show_loading_state(self):
+        """Invalidate the previous session view while the new session loads."""
+        self._current_session = None
+        self._current_payload = None
+        self._clear_threshold_lines()
+        self._clear_locomotion_threshold_line()
+        self._clear_cursor_lines()
+        for axis, title, ylabel in (
+            (self.canvas.pupil_ax, "Pupil dynamics", "z-scored radius"),
+            (self.canvas.loc_ax, "Locomotion", "Wheel speed"),
+            (self.canvas.face_ax, "Face motion", "Motion"),
+            (self.canvas.lock_ax, "Lock state", "Lock state"),
+        ):
+            axis.clear()
+            style_axes(axis, title=title, ylabel=ylabel)
+            axis.text(
+                0.5,
+                0.5,
+                f"Loading {self.exp_id}...",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=13,
+                fontweight="600",
+            )
+        self.canvas.draw_idle()
+        self.video_widget.pause()
+        self.video_widget.video_label.setText(f"Loading video for {self.exp_id}...")
+        self._session_label.setText(f"Loading expID: {self.exp_id}")
+
+    def clear_session_cache(self):
+        self._session_payload_cache.clear()
+        self._current_payload = None
+
     def refresh(self):
         self._scope_sessions = self._sessions_for_scope()
         self.experiment_index.refresh()
@@ -1564,13 +1607,16 @@ class MetricsTab(QWidget):
             return np.linspace(0.0, duration, n, endpoint=False, dtype=float)
         return np.arange(n, dtype=float)
     def _load_session_payload(self, summary: SessionSummary) -> LoadedSession:
+        cached = self._session_payload_cache.get(summary.exp_id)
+        if cached is not None:
+            return cached
         try:
             bundle = self.store.load_session_bundle(summary.exp_id)
             face_motion_t, face_motion = self.store.load_face_motion(summary.exp_id)
             if face_motion_t is None or face_motion is None:
                 face_motion_t = np.array([], dtype=float)
                 face_motion = np.array([], dtype=float)
-            return LoadedSession(
+            payload = LoadedSession(
                 summary=summary,
                 t=np.asarray(bundle.t, dtype=float),
                 frame_observed=np.asarray(bundle.frame_observed, dtype=bool),
@@ -1596,6 +1642,8 @@ class MetricsTab(QWidget):
                 source_signature=dict(bundle.source_signature),
                 has_pupil=True,
             )
+            self._session_payload_cache[summary.exp_id] = payload
+            return payload
         except Exception:
             try:
                 brake_t, brake_raw = self.store._load_lock_trace(summary.animal_id, summary.exp_id)
@@ -1613,7 +1661,7 @@ class MetricsTab(QWidget):
                 frame_t = np.asarray(locomotion_t, dtype=float)
             face_motion_t = np.array([], dtype=float)
             face_motion = np.array([], dtype=float)
-            return LoadedSession(
+            payload = LoadedSession(
                 summary=summary,
                 t=np.asarray(frame_t, dtype=float),
                 frame_observed=np.ones(np.asarray(frame_t, dtype=float).shape, dtype=bool),
@@ -1639,6 +1687,20 @@ class MetricsTab(QWidget):
                 source_signature={},
                 has_pupil=False,
             )
+            self._session_payload_cache[summary.exp_id] = payload
+            return payload
+
+    @staticmethod
+    def _display_series(x, y, *, max_points: int = 6000):
+        """Reduce plotted points only; analysis continues to use full arrays."""
+        x = np.asarray(x)
+        y = np.asarray(y)
+        n = min(x.size, y.size)
+        if n <= max_points:
+            return x[:n], y[:n]
+        indices = np.linspace(0, n - 1, max_points, dtype=np.int64)
+        return x[:n][indices], y[:n][indices]
+
     def _build_scope_trace(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[tuple[float, float, str]], list[str]]:
         if not self._scope_sessions:
             empty = np.array([], dtype=float)
@@ -1903,9 +1965,10 @@ class MetricsTab(QWidget):
 
                 z_plot[~np.isfinite(z_plot)] = np.nan
 
+                plot_t, plot_z = self._display_series(payload.t[: z_plot.size], z_plot)
                 pupil_ax.plot(
-                    payload.t[: z_plot.size],
-                    z_plot,
+                    plot_t,
+                    plot_z,
                     color="black",
                     linewidth=1.5,
                     label="pupil z-score",
@@ -1930,7 +1993,8 @@ class MetricsTab(QWidget):
                 loc_n = min(loc_t.size, payload.locomotion.size)
 
                 if loc_n:
-                    loc_ax.plot(loc_t[:loc_n], payload.locomotion[:loc_n], color="tab:blue", linewidth=1.5, label="locomotion")
+                    plot_t, plot_values = self._display_series(loc_t[:loc_n], payload.locomotion[:loc_n])
+                    loc_ax.plot(plot_t, plot_values, color="tab:blue", linewidth=1.5, label="locomotion")
 
                 loc_thr = float(self.store.settings.get("global", {}).get("locomotion_threshold", 0.35))
                 loc_ax.axhline(loc_thr, color="tab:red", linestyle="--", linewidth=1.5, label="threshold")
@@ -1942,7 +2006,8 @@ class MetricsTab(QWidget):
                 face_n = min(face_t.size, payload.face_motion.size)
 
                 if face_n:
-                    face_ax.plot(face_t[:face_n], payload.face_motion[:face_n], color="tab:purple", linewidth=1.2, label="face motion")
+                    plot_t, plot_values = self._display_series(face_t[:face_n], payload.face_motion[:face_n])
+                    face_ax.plot(plot_t, plot_values, color="tab:purple", linewidth=1.2, label="face motion")
             else:
                 face_ax.text(0.5, 0.5, "No face motion data", transform=face_ax.transAxes, ha="center", va="center")
 
@@ -1976,17 +2041,20 @@ class MetricsTab(QWidget):
             pupil_t, z, loc_t, loc, face_t, face, lock_t, lock, spans, labels = self._build_scope_trace()
 
             if pupil_t.size and z.size:
-                pupil_ax.plot(pupil_t[: z.size], z, color="black", linewidth=1.2)
+                plot_t, plot_z = self._display_series(pupil_t[: z.size], z)
+                pupil_ax.plot(plot_t, plot_z, color="black", linewidth=1.2)
             else:
                 pupil_ax.text(0.5, 0.5, "No pupil data to display", transform=pupil_ax.transAxes, ha="center", va="center")
 
             if loc_t.size and loc.size:
-                loc_ax.plot(loc_t[: loc.size], loc, color="tab:blue", linewidth=1.2)
+                plot_t, plot_values = self._display_series(loc_t[: loc.size], loc)
+                loc_ax.plot(plot_t, plot_values, color="tab:blue", linewidth=1.2)
             else:
                 loc_ax.text(0.5, 0.5, "No locomotion data to display", transform=loc_ax.transAxes, ha="center", va="center")
 
             if face_t.size and face.size:
-                face_ax.plot(face_t[: face.size], face, color="tab:purple", linewidth=1.1)
+                plot_t, plot_values = self._display_series(face_t[: face.size], face)
+                face_ax.plot(plot_t, plot_values, color="tab:purple", linewidth=1.1)
             else:
                 face_ax.text(0.5, 0.5, "No face motion data to display", transform=face_ax.transAxes, ha="center", va="center")
 
@@ -2046,7 +2114,12 @@ class MetricsTab(QWidget):
         self._current_payload = raw_payload
         payload = self._analysis_payload(raw_payload, summary)
         if summary.has_right_video and summary.right_video and Path(summary.right_video).exists():
-            self.video_widget.set_video(summary.right_video, self.store.load_frame_timestamps(summary.exp_id), overlay=raw_payload.video_overlay())
+            if self.video_widget.video_path != summary.right_video:
+                self.video_widget.set_video(
+                    summary.right_video,
+                    self.store.load_frame_timestamps(summary.exp_id),
+                    overlay=raw_payload.video_overlay(),
+                )
             self.mask_group.setEnabled(bool(payload.has_pupil))
             if payload.t.size:
                 self._set_cursor_position(float(self.video_widget.current_time()))
@@ -3877,6 +3950,7 @@ class HabituationMainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"{message} ({fraction * 100.0:.0f}%)")
     def _on_dataset_result(self, index):
         self.index = index
+        self.metrics_tab.clear_session_cache()
         self.update_btn.setEnabled(True)
         self._populate_browser(initial=False)
         self._sync_browser_state()

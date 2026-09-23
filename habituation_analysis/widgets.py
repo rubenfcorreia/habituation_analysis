@@ -125,6 +125,11 @@ class VideoPlayerWidget(QWidget):
         self._speed_options = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
+        self._seek_timer = QTimer(self)
+        self._seek_timer.setSingleShot(True)
+        self._seek_timer.setInterval(30)
+        self._seek_timer.timeout.connect(self._apply_pending_seek)
+        self._pending_seek: int | None = None
 
         self.play_btn = QPushButton("Play")
         self.play_btn.setCheckable(True)
@@ -249,7 +254,16 @@ class VideoPlayerWidget(QWidget):
         self.frame_changed.emit(frame_index)
         self.time_changed.emit(self.current_time())
 
+    def _apply_pending_seek(self):
+        if self._pending_seek is None:
+            return
+        frame_index = self._pending_seek
+        self._pending_seek = None
+        self.seek(frame_index)
+
     def pause(self):
+        self._seek_timer.stop()
+        self._pending_seek = None
         self._playing = False
         self.play_btn.blockSignals(True)
         self.play_btn.setChecked(False)
@@ -289,8 +303,12 @@ class VideoPlayerWidget(QWidget):
         self._apply_playback_speed()
 
     def _slider_changed(self, value: int):
-        if value != self._frame_index:
-            self.seek(int(value))
+        if value == self._frame_index:
+            return
+        # Seeking a long video can require an OpenCV decode. Coalesce slider
+        # events so dragging does not decode every intermediate position.
+        self._pending_seek = int(value)
+        self._seek_timer.start()
 
     def _draw_series(self, frame, xs, ys, color, *, point_radius=4, thickness=2, connect=False, closed=False):
         xs = np.asarray(xs, dtype=float)
